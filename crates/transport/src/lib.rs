@@ -89,11 +89,13 @@ pub async fn connect(
 pub async fn relay(a: BoxStream, b: BoxStream, idle: Duration) -> Result<u64> {
     let (ar, aw) = tokio::io::split(a);
     let (br, bw) = tokio::io::split(b);
-    let activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let activity = std::sync::atomic::AtomicU64::new(0);
+    let started = Instant::now();
     async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         mut r: R,
         mut w: W,
-        activity: Arc<std::sync::Mutex<Instant>>,
+        activity: &std::sync::atomic::AtomicU64,
+        started: Instant,
         idle: Duration,
     ) -> std::io::Result<u64> {
         let mut buf = vec![0u8; 16 * 1024];
@@ -101,27 +103,38 @@ pub async fn relay(a: BoxStream, b: BoxStream, idle: Duration) -> Result<u64> {
         loop {
             let n = r.read(&mut buf).await?;
             if n == 0 {
-                w.shutdown().await?;
+                timeout(idle, w.shutdown()).await.map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "peer shutdown stalled")
+                })??;
                 return Ok(total);
             }
-            *activity.lock().unwrap() = Instant::now();
+            activity.store(
+                started.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             timeout(idle, w.write_all(&buf[..n])).await.map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "peer stopped reading")
             })??;
-            *activity.lock().unwrap() = Instant::now();
+            activity.store(
+                started.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             total += n as u64;
         }
     }
     let guard = async {
         loop {
             tokio::time::sleep(idle).await;
-            if activity.lock().unwrap().elapsed() >= idle {
+            let elapsed = started.elapsed().as_millis() as u64;
+            if elapsed.saturating_sub(activity.load(std::sync::atomic::Ordering::Relaxed))
+                >= idle.as_millis() as u64
+            {
                 return Err(anyhow::anyhow!("stream idle timeout"));
             }
         }
     };
     tokio::select! {
-        result = async { let (a,b) = tokio::try_join!(pump(ar,bw,activity.clone(),idle),pump(br,aw,activity.clone(),idle))?; Ok(a+b) } => result,
+        result = async { let (a,b) = tokio::try_join!(pump(ar,bw,&activity,started,idle),pump(br,aw,&activity,started,idle))?; Ok(a+b) } => result,
         result = guard => result,
     }
 }

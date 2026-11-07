@@ -28,6 +28,12 @@ fn idle_ms() -> u64 {
 fn health_ms() -> u64 {
     5_000
 }
+fn idle_pool() -> usize {
+    128
+}
+fn pool_timeout_ms() -> u64 {
+    30_000
+}
 fn socket() -> PathBuf {
     "/run/prost/admin.sock".into()
 }
@@ -84,6 +90,10 @@ pub struct Upstream {
     pub health_interval_ms: u64,
     #[serde(default)]
     pub http2: bool,
+    #[serde(default = "idle_pool")]
+    pub pool_max_idle_per_host: usize,
+    #[serde(default = "pool_timeout_ms")]
+    pub pool_idle_timeout_ms: u64,
 }
 fn balance() -> String {
     "round_robin".into()
@@ -202,6 +212,10 @@ impl Config {
             ensure!(
                 u.connect_timeout_ms > 0 && u.idle_timeout_ms > 0 && u.health_interval_ms >= 100,
                 "invalid timeouts"
+            );
+            ensure!(
+                u.pool_max_idle_per_host <= 4096 && u.pool_idle_timeout_ms > 0,
+                "invalid upstream pool limits"
             );
             let mut names = HashSet::new();
             let mut sum = 0u64;

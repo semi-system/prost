@@ -18,8 +18,15 @@ enum Command {
         config: PathBuf,
     },
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(32)
+        .thread_name("prost-worker")
+        .build()?
+        .block_on(run())
+}
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(

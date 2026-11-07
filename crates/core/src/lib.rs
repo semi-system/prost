@@ -30,6 +30,9 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+static FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+static FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+
 pub use prost_config;
 pub use prost_plugin;
 
@@ -84,9 +87,18 @@ struct PreparedUpstream {
     client: HttpClient,
     healthy: Vec<AtomicBool>,
     counter: AtomicU64,
+    targets: Vec<prost_http::Target>,
 }
 impl PreparedUpstream {
     fn select(&self) -> Result<(usize, &str)> {
+        if self.config.endpoints.len() == 1 {
+            let endpoint = &self.config.endpoints[0];
+            ensure!(
+                endpoint.enabled && self.healthy[0].load(Ordering::Relaxed),
+                "no healthy endpoints"
+            );
+            return Ok((0, &endpoint.address));
+        }
         let total: u64 = self
             .config
             .endpoints
@@ -112,8 +124,30 @@ struct PreparedListener {
     config: Listener,
     tls: Option<Arc<rustls::ServerConfig>>,
     capacity: Arc<Semaphore>,
-    plugins: Vec<PreparedPlugin>,
-    routes: Vec<Vec<PreparedPlugin>>,
+    plugins: Arc<Vec<PreparedPlugin>>,
+    routes: Vec<Arc<Vec<PreparedPlugin>>>,
+    route_order: Vec<usize>,
+    default_upstream: Option<Arc<PreparedUpstream>>,
+    route_upstreams: Vec<Arc<PreparedUpstream>>,
+    has_hooks: bool,
+}
+struct ConnectionInfo {
+    peer: SocketAddr,
+    peer_text: String,
+    forwarded_for: HeaderValue,
+    forwarded_proto: HeaderValue,
+    _lease: ConnectionLease,
+}
+struct ConnectionLease {
+    _global: OwnedSemaphorePermit,
+    _local: OwnedSemaphorePermit,
+    _plugins: Vec<OwnedSemaphorePermit>,
+    active: prometheus::IntGauge,
+}
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.active.dec();
+    }
 }
 struct Binding {
     cancel: CancellationToken,
@@ -230,6 +264,11 @@ fn prepare(
                 client,
                 healthy: u.endpoints.iter().map(|_| AtomicBool::new(true)).collect(),
                 counter: AtomicU64::new(0),
+                targets: u
+                    .endpoints
+                    .iter()
+                    .map(|e| prost_http::Target::new(&e.address, u.tls.is_some()))
+                    .collect::<Result<_>>()?,
             }),
         );
     }
@@ -237,7 +276,13 @@ fn prepare(
     for l in &config.listeners {
         let previous_l = previous.and_then(|s| s.listeners.get(&l.id));
         if let Some(old) = previous_l {
-            if serde_json::to_value(&old.config)? == serde_json::to_value(l)? {
+            let upstreams_unchanged = previous.is_some_and(|s| {
+                s.upstreams
+                    .iter()
+                    .all(|(name, u)| upstreams.get(name).is_some_and(|new| Arc::ptr_eq(u, new)))
+            });
+            if upstreams_unchanged && serde_json::to_value(&old.config)? == serde_json::to_value(l)?
+            {
                 listeners.insert(l.id.clone(), old.clone());
                 continue;
             }
@@ -251,21 +296,54 @@ fn prepare(
             .as_ref()
             .map(|t| prost_transport::server_tls(t, l.protocol == Protocol::Http))
             .transpose()?;
-        let plugins = l
-            .plugins
-            .iter()
-            .map(|p| registry.prepare(p))
-            .collect::<Result<_>>()?;
+        let plugins = if let Some(old) = previous_l.filter(|old| {
+            serde_json::to_value(&old.config.plugins).ok() == serde_json::to_value(&l.plugins).ok()
+        }) {
+            old.plugins.clone()
+        } else {
+            Arc::new(
+                l.plugins
+                    .iter()
+                    .map(|p| registry.prepare(p))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        let has_hooks = plugins.iter().any(PreparedPlugin::has_hooks);
         let routes = l
             .routes
             .iter()
-            .map(|r| {
-                r.plugins
-                    .iter()
-                    .map(|p| registry.prepare(p))
-                    .collect::<Result<Vec<_>>>()
+            .enumerate()
+            .map(|(i, r)| {
+                if let Some(old) = previous_l.filter(|old| {
+                    old.config.routes.get(i).is_some_and(|old_r| {
+                        serde_json::to_value(&old_r.plugins).ok()
+                            == serde_json::to_value(&r.plugins).ok()
+                    })
+                }) {
+                    return Ok(old.routes[i].clone());
+                }
+                Ok(Arc::new(
+                    r.plugins
+                        .iter()
+                        .map(|p| registry.prepare(p))
+                        .collect::<Result<Vec<_>>>()?,
+                ))
             })
             .collect::<Result<_>>()?;
+        let mut route_order: Vec<usize> = (0..l.routes.len()).collect();
+        route_order.sort_by_key(|i| {
+            (
+                std::cmp::Reverse(l.routes[*i].priority),
+                std::cmp::Reverse(l.routes[*i].path_prefix.len()),
+                *i,
+            )
+        });
+        let default_upstream = l.upstream.as_ref().map(|name| upstreams[name].clone());
+        let route_upstreams = l
+            .routes
+            .iter()
+            .map(|r| upstreams[&r.upstream].clone())
+            .collect();
         listeners.insert(
             l.id.clone(),
             Arc::new(PreparedListener {
@@ -274,6 +352,10 @@ fn prepare(
                 capacity,
                 plugins,
                 routes,
+                route_order,
+                default_upstream,
+                route_upstreams,
+                has_hooks,
             }),
         );
     }
@@ -455,15 +537,14 @@ impl RunningProxy {
                 let local = match listener.capacity.clone().try_acquire_owned() { Ok(v)=>v,Err(_)=>continue };
                 let plugin_permits = match connection_permits(&listener.plugins) { Ok(v)=>v,Err(_)=>continue };
                 p.metrics.connections.inc();
+                let lease = ConnectionLease { _global:global, _local:local, _plugins:plugin_permits, active:p.metrics.connections.clone() };
                 let p2 = p.clone();
                 let id = id.clone();
                 p.tasks.spawn(async move {
-                    let (_global,_local,_plugins) = (global,local,plugin_permits);
                     let result = tokio::select! {
                         _ = p2.force.cancelled() => Ok(()),
-                        r = p2.connection(id,stream,peer,snapshot,listener) => r,
+                        r = p2.connection(id,stream,peer,snapshot,listener,lease) => r,
                     };
-                    p2.metrics.connections.dec();
                     if let Err(e) = result { p2.metrics.errors.inc(); tracing::debug!(error=%e,%peer,"connection ended with error"); }
                 });
             }
@@ -476,6 +557,7 @@ impl RunningProxy {
         peer: SocketAddr,
         snapshot: Arc<Snapshot>,
         listener: Arc<PreparedListener>,
+        lease: ConnectionLease,
     ) -> Result<()> {
         prost_transport::configure_socket(&stream)?;
         let mut io: prost_transport::BoxStream = Box::new(stream);
@@ -501,7 +583,9 @@ impl RunningProxy {
             headers: BTreeMap::new(),
             config: serde_json::Value::Null,
         };
-        invoke(&listener.plugins, &mut event, None).await?;
+        if listener.has_hooks {
+            invoke(&listener.plugins, &mut event, None).await?;
+        }
         if listener.config.protocol == Protocol::Tcp {
             event.hook = "upstream".into();
             invoke(&listener.plugins, &mut event, None).await?;
@@ -530,13 +614,26 @@ impl RunningProxy {
             invoke(&listener.plugins, &mut event, None).await?;
             return result.map(|_| ());
         }
+        let info = Arc::new(ConnectionInfo {
+            peer,
+            peer_text: event.peer,
+            forwarded_for: HeaderValue::from_str(&peer.ip().to_string())?,
+            forwarded_proto: HeaderValue::from_static(if listener.tls.is_some() {
+                "https"
+            } else {
+                "http"
+            }),
+            _lease: lease,
+        });
+        let id: Arc<str> = id.into();
         drop(snapshot);
         drop(listener);
         let p = self.clone();
         let service = service_fn(move |request| {
             let p = p.clone();
             let id = id.clone();
-            async move { Ok::<_, Infallible>(p.handle_http(id, peer, request).await) }
+            let info = info.clone();
+            async move { Ok::<_, Infallible>(p.handle_http(id, info, request).await) }
         });
         let mut builder = auto::Builder::new(TokioExecutor::new());
         builder
@@ -560,8 +657,8 @@ impl RunningProxy {
     }
     async fn handle_http(
         self: Arc<Self>,
-        id: String,
-        peer: SocketAddr,
+        id: Arc<str>,
+        info: Arc<ConnectionInfo>,
         mut request: Request<Incoming>,
     ) -> Response<Body> {
         self.metrics.requests.inc();
@@ -569,28 +666,39 @@ impl RunningProxy {
         let snapshot = self.snapshot();
         let result = async {
             let permit = self.requests.clone().try_acquire_owned().context("request capacity")?;
-            let l = snapshot.listeners.get(&id).context("listener removed")?;
-            let host = request.uri().host().map(str::to_string).or_else(|| request.headers().get(header::HOST).and_then(|v| v.to_str().ok()).map(|s| s.split(':').next().unwrap_or(s).to_string())).unwrap_or_default();
-            let route = prost_http::select_route(&l.config.routes,&host,request.uri().path());
-            let route_index = route.and_then(|r| l.config.routes.iter().position(|x| std::ptr::eq(x,r)));
-            let upstream = route.map(|r|r.upstream.clone()).or_else(|| l.config.upstream.clone());
-            if upstream.is_none() { return Ok(prost_http::response(404,"no matching route\n")); }
-            if !l.config.trusted_proxies.iter().any(|cidr| cidr.contains(&peer.ip())) {
+            let l = snapshot.listeners.get(id.as_ref()).context("listener removed")?;
+            let route_index = if l.route_order.is_empty() { None } else {
+                let host = request_host(&request);
+                l.route_order.iter().copied().find(|i| {
+                    let r = &l.config.routes[*i];
+                    r.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(host)) && request.uri().path().starts_with(&r.path_prefix)
+                })
+            };
+            let selected = route_index.map(|i| &l.route_upstreams[i]).or(l.default_upstream.as_ref());
+            let Some(selected) = selected else { return Ok(prost_http::response(404,"no matching route\n")); };
+            if !l.config.trusted_proxies.iter().any(|cidr| cidr.contains(&info.peer.ip())) {
                 let names: Vec<_> = request.headers().keys().filter(|n| n.as_str() == "forwarded" || n.as_str().starts_with("x-forwarded-")).cloned().collect();
                 for name in names { request.headers_mut().remove(name); }
             }
-            request.headers_mut().append("x-forwarded-for",HeaderValue::from_str(&peer.ip().to_string())?);
-            request.headers_mut().insert("x-forwarded-proto",HeaderValue::from_static(if l.tls.is_some() {"https"}else{"http"}));
-            let mut event = Event { abi_version:1, hook:"request_headers".into(), peer:peer.to_string(), upstream, headers:BTreeMap::new(),config:serde_json::Value::Null };
+            request.headers_mut().append(FORWARDED_FOR.clone(),info.forwarded_for.clone());
+            request.headers_mut().insert(FORWARDED_PROTO.clone(),info.forwarded_proto.clone());
             let route_plugins = route_index.map(|i|l.routes[i].as_slice());
-            invoke(&l.plugins,&mut event,Some(request.headers_mut())).await?;
-            if let Some(plugins) = route_plugins { invoke(plugins,&mut event,Some(request.headers_mut())).await?; }
-            event.hook = "upstream".into();
-            invoke(&l.plugins,&mut event,None).await?;
-            if let Some(plugins) = route_plugins { invoke(plugins,&mut event,None).await?; }
-            let u = snapshot.upstreams.get(event.upstream.as_ref().context("no upstream")?).context("plugin selected unknown upstream")?;
-            let (index,address) = u.select()?;
-            let mut outcome = match prost_http::forward(request,address,&u.config,&u.client,vec![permit],snapshot.clone()).await {
+            let has_hooks = l.has_hooks || route_plugins.is_some_and(|plugins| plugins.iter().any(PreparedPlugin::has_hooks));
+            let mut event = if has_hooks {
+                let upstream = route_index.map(|i|l.config.routes[i].upstream.clone()).or_else(||l.config.upstream.clone());
+                let mut event = Event { abi_version:1, hook:"request_headers".into(), peer:info.peer_text.clone(), upstream, headers:BTreeMap::new(),config:serde_json::Value::Null };
+                invoke(&l.plugins,&mut event,Some(request.headers_mut())).await?;
+                if let Some(plugins) = route_plugins { invoke(plugins,&mut event,Some(request.headers_mut())).await?; }
+                event.hook = "upstream".into();
+                invoke(&l.plugins,&mut event,None).await?;
+                if let Some(plugins) = route_plugins { invoke(plugins,&mut event,None).await?; }
+                Some(event)
+            } else { None };
+            let u = if let Some(event) = &event {
+                snapshot.upstreams.get(event.upstream.as_ref().context("no upstream")?).context("plugin selected unknown upstream")?
+            } else { selected };
+            let (index,_) = u.select()?;
+            let mut outcome = match prost_http::forward(request,&u.targets[index],&u.config,&u.client,permit,prost_http::KeepAlive::new(snapshot.clone(),info),has_hooks).await {
                 Ok(v)=>v, Err(e)=>{u.healthy[index].store(false,Ordering::Relaxed); return Err(e);}
             };
             if let Some(tunnel) = outcome.tunnel.take() {
@@ -600,26 +708,28 @@ impl RunningProxy {
                     tokio::select! { _ = force.cancelled() => { tunnel.abort(); let _ = tunnel.await; }, _ = &mut tunnel => {} }
                 });
             }
-            event.hook = "response_headers".into();
-            invoke(&l.plugins,&mut event,Some(outcome.response.headers_mut())).await?;
-            if let Some(plugins) = route_plugins { invoke(plugins,&mut event,Some(outcome.response.headers_mut())).await?; }
-            let upgraded = outcome.response.status() == 101;
-            prost_http::sanitize(outcome.response.headers_mut(),upgraded,false);
-            let completion=outcome.completion;
-            let listener=l.clone();
-            let generation=snapshot.clone();
-            let p=self.clone();
-            self.tasks.spawn(async move {
-                let _generation=generation;
-                tokio::select!{_=p.force.cancelled()=>return,_=completion=>{}}
-                event.hook="end".into();
-                let result=async {
-                    invoke(&listener.plugins,&mut event,None).await?;
-                    if let Some(i)=route_index {invoke(&listener.routes[i],&mut event,None).await?;}
-                    Ok::<_,anyhow::Error>(())
-                }.await;
-                if let Err(e)=result {p.metrics.errors.inc();tracing::warn!(error=%e,"end hook failed");}
-            });
+            if let Some(mut event) = event.take() {
+                event.hook = "response_headers".into();
+                invoke(&l.plugins,&mut event,Some(outcome.response.headers_mut())).await?;
+                if let Some(plugins) = route_plugins { invoke(plugins,&mut event,Some(outcome.response.headers_mut())).await?; }
+                let upgraded = outcome.response.status() == 101;
+                prost_http::sanitize(outcome.response.headers_mut(),upgraded,false);
+                let completion=outcome.completion.take().expect("plugin completion enabled");
+                let listener=l.clone();
+                let generation=snapshot.clone();
+                let p=self.clone();
+                self.tasks.spawn(async move {
+                    let _generation=generation;
+                    tokio::select!{_=p.force.cancelled()=>return,_=completion=>{}}
+                    event.hook="end".into();
+                    let result=async {
+                        invoke(&listener.plugins,&mut event,None).await?;
+                        if let Some(i)=route_index {invoke(&listener.routes[i],&mut event,None).await?;}
+                        Ok::<_,anyhow::Error>(())
+                    }.await;
+                    if let Err(e)=result {p.metrics.errors.inc();tracing::warn!(error=%e,"end hook failed");}
+                });
+            }
             Ok::<_,anyhow::Error>(outcome.response)
         }.await;
         match result {
@@ -707,12 +817,32 @@ fn connection_permits(plugins: &[PreparedPlugin]) -> Result<Vec<OwnedSemaphorePe
         .filter_map(|p| p.acquire_connection().transpose())
         .collect()
 }
+fn request_host(request: &Request<Incoming>) -> &str {
+    let host = request
+        .uri()
+        .host()
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+        })
+        .unwrap_or("");
+    if let Some(bracketed) = host.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or(bracketed)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    }
+}
 async fn invoke(
     plugins: &[PreparedPlugin],
     event: &mut Event,
     mut headers: Option<&mut http::HeaderMap>,
 ) -> Result<()> {
     for p in plugins {
+        if !p.has_hooks() {
+            continue;
+        }
         if let Some(h) = &headers {
             event.headers = h
                 .iter()

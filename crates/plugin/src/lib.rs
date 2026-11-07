@@ -77,6 +77,9 @@ pub enum PreparedPlugin {
     Wasm(Arc<Wasm>),
 }
 impl PreparedPlugin {
+    pub fn has_hooks(&self) -> bool {
+        !matches!(self, Self::Limit(_))
+    }
     pub fn acquire_connection(&self) -> Result<Option<OwnedSemaphorePermit>> {
         match self {
             Self::Limit(s) => Ok(Some(

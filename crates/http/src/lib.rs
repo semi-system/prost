@@ -1,7 +1,9 @@
 use anyhow::{ensure, Result};
-use bytes::Bytes;
+mod body;
+pub use body::{Body, KeepAlive};
+use body::{Completion, Guard};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, Uri};
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper::body::Body as _;
 use hyper::body::Incoming;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -12,8 +14,18 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::OwnedSemaphorePermit;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
-pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming>;
+static FORWARDED_HOP_HEADERS: [HeaderName; 9] = [
+    header::CONNECTION,
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    header::PROXY_AUTHENTICATE,
+    header::PROXY_AUTHORIZATION,
+    header::TE,
+    header::TRAILER,
+    header::TRANSFER_ENCODING,
+    header::UPGRADE,
+];
 
 pub fn client(upstream: &Upstream, tls: Arc<rustls::ClientConfig>) -> Result<HttpClient> {
     let mut connector = HttpConnector::new();
@@ -40,25 +52,18 @@ pub fn client(upstream: &Upstream, tls: Arc<rustls::ClientConfig>) -> Result<Htt
     };
     let mut builder = Client::builder(hyper_util::rt::TokioExecutor::new());
     builder
-        .pool_max_idle_per_host(16)
-        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(upstream.pool_max_idle_per_host)
+        .pool_idle_timeout(Duration::from_millis(upstream.pool_idle_timeout_ms))
         .retry_canceled_requests(false);
     if upstream.http2 {
         builder.http2_only(true);
     }
     Ok(builder.build(connector))
 }
-pub fn boxed(body: Incoming) -> Body {
-    body.map_err(|e| Box::new(e) as Error).boxed_unsync()
-}
 pub fn response(status: u16, text: &'static str) -> Response<Body> {
     Response::builder()
         .status(status)
-        .body(
-            Full::new(Bytes::from_static(text.as_bytes()))
-                .map_err(|e| match e {})
-                .boxed_unsync(),
-        )
+        .body(Body::text(text))
         .unwrap()
 }
 
@@ -69,6 +74,7 @@ pub fn sanitize(headers: &mut HeaderMap, upgrade: bool, request: bool) {
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|s| s.split(','))
+        .filter(|s| !s.trim().eq_ignore_ascii_case("keep-alive"))
         .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
         .collect();
     for name in nominated {
@@ -81,18 +87,8 @@ pub fn sanitize(headers: &mut HeaderMap, upgrade: bool, request: bool) {
             .get(header::TE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("trailers"));
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ] {
-        if upgrade && name == "upgrade" {
+    for name in &FORWARDED_HOP_HEADERS {
+        if upgrade && name == header::UPGRADE {
             continue;
         }
         headers.remove(name);
@@ -119,30 +115,39 @@ pub fn select_route<'a>(routes: &'a [Route], host: &str, path: &str) -> Option<&
 pub struct Outcome {
     pub response: Response<Body>,
     pub tunnel: Option<tokio::task::JoinHandle<()>>,
-    pub completion: tokio::sync::oneshot::Receiver<()>,
+    pub completion: Option<tokio::sync::oneshot::Receiver<()>>,
 }
-struct Completion(Option<tokio::sync::oneshot::Sender<()>>);
-impl Completion {
-    fn finish(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
-    }
+pub struct Target {
+    scheme: http::uri::Scheme,
+    authority: http::uri::Authority,
 }
-impl Drop for Completion {
-    fn drop(&mut self) {
-        self.finish();
+impl Target {
+    pub fn new(endpoint: &str, tls: bool) -> Result<Self> {
+        Ok(Self {
+            scheme: if tls {
+                http::uri::Scheme::HTTPS
+            } else {
+                http::uri::Scheme::HTTP
+            },
+            authority: endpoint.parse()?,
+        })
     }
 }
 pub async fn forward(
     mut request: Request<Incoming>,
-    endpoint: &str,
+    target: &Target,
     upstream: &Upstream,
     client: &HttpClient,
-    permits: Vec<OwnedSemaphorePermit>,
-    keepalive: Arc<dyn Send + Sync>,
+    permit: OwnedSemaphorePermit,
+    keepalive: KeepAlive,
+    notify_completion: bool,
 ) -> Result<Outcome> {
-    let (done, completion) = tokio::sync::oneshot::channel();
+    let (done, completion) = if notify_completion {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     ensure!(
         request.method() != http::Method::CONNECT,
         "CONNECT unsupported"
@@ -158,23 +163,17 @@ pub async fn forward(
         None
     };
     sanitize(request.headers_mut(), upgrade, true);
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let uri: Uri = format!(
-        "{}://{}{}",
-        if upstream.tls.is_some() {
-            "https"
-        } else {
-            "http"
-        },
-        endpoint,
-        path
-    )
-    .parse()?;
-    *request.uri_mut() = uri;
+    let mut parts = http::uri::Parts::default();
+    parts.scheme = Some(target.scheme.clone());
+    parts.authority = Some(target.authority.clone());
+    parts.path_and_query = Some(
+        request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/")),
+    );
+    *request.uri_mut() = Uri::from_parts(parts)?;
     *request.version_mut() = if upstream.http2 {
         http::Version::HTTP_2
     } else {
@@ -192,8 +191,8 @@ pub async fn forward(
         let downstream = downstream_upgrade.unwrap();
         let idle = Duration::from_millis(upstream.idle_timeout_ms);
         let tunnel = tokio::spawn(async move {
-            let _completion = Completion(Some(done));
-            let (_permits, _keepalive) = (permits, keepalive);
+            let _completion = Completion(done);
+            let (_permit, _keepalive) = (permit, keepalive);
             if let (Ok(a), Ok(b)) = tokio::join!(downstream, server) {
                 let _ = prost_transport::relay(
                     Box::new(TokioIo::new(a)),
@@ -204,76 +203,57 @@ pub async fn forward(
             }
         });
         return Ok(Outcome {
-            response: response.map(boxed),
+            response: response.map(Body::incoming),
             tunnel: Some(tunnel),
             completion,
         });
     }
-    let (parts, incoming) = response.into_parts();
+    let (parts, mut incoming) = response.into_parts();
+    // One non-blocking poll only: never wait for a streaming producer. When a
+    // small HTTP/1 body already arrived with its headers, return its Bytes
+    // directly and let Hyper coalesce headers/data in the downstream write.
+    let prefix = if parts.version != http::Version::HTTP_2
+        && incoming
+            .size_hint()
+            .exact()
+            .is_some_and(|n| n > 0 && n <= 16384)
+    {
+        std::future::poll_fn(
+            |cx| match std::pin::Pin::new(&mut incoming).poll_frame(cx) {
+                std::task::Poll::Ready(Some(frame)) => std::task::Poll::Ready(frame.map(Some)),
+                std::task::Poll::Ready(None) | std::task::Poll::Pending => {
+                    std::task::Poll::Ready(Ok(None))
+                }
+            },
+        )
+        .await?
+    } else {
+        None
+    };
+    let guard = Guard {
+        permit: Some(permit),
+        keepalive: Some(keepalive),
+        completion: Completion(done),
+    };
+    let body = if incoming.is_end_stream() && prefix.as_ref().is_some_and(|frame| frame.is_data()) {
+        Body::buffered(
+            prefix.unwrap().into_data().expect("data frame checked"),
+            guard,
+        )
+    } else {
+        Body::stream(
+            incoming,
+            prefix,
+            Duration::from_millis(upstream.idle_timeout_ms),
+            guard,
+        )
+    };
     Ok(Outcome {
-        response: Response::from_parts(
-            parts,
-            GuardBody {
-                inner: boxed(incoming),
-                _permits: permits,
-                _keepalive: keepalive,
-                completion: Completion(Some(done)),
-                idle: Box::pin(tokio::time::sleep(Duration::from_millis(
-                    upstream.idle_timeout_ms,
-                ))),
-                timeout: Duration::from_millis(upstream.idle_timeout_ms),
-            }
-            .boxed_unsync(),
-        ),
+        response: Response::from_parts(parts, body),
         tunnel: None,
         completion,
     })
 }
 
-struct GuardBody {
-    inner: Body,
-    _permits: Vec<OwnedSemaphorePermit>,
-    _keepalive: Arc<dyn Send + Sync>,
-    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
-    timeout: Duration,
-    completion: Completion,
-}
-impl hyper::body::Body for GuardBody {
-    type Data = Bytes;
-    type Error = Error;
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Error>>> {
-        use std::{future::Future, task::Poll};
-        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(frame) => {
-                if frame.is_none() || matches!(&frame, Some(Err(_))) {
-                    self.completion.finish();
-                }
-                let timeout = self.timeout;
-                self.idle
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + timeout);
-                Poll::Ready(frame)
-            }
-            Poll::Pending => {
-                if self.idle.as_mut().poll(cx).is_ready() {
-                    Poll::Ready(Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "body idle timeout",
-                    )
-                    .into())))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
+#[cfg(test)]
+mod tests;

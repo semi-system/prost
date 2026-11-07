@@ -145,3 +145,6 @@ Kết quả đo 10.000 request, 100 client đồng thời trên MVP debug:
 
 Đối chiếu cùng môi trường với nginx và Apache2, có cả Prost release và hai bộ
 phát tải: [docs/proxy-comparison-10000.md](docs/proxy-comparison-10000.md).
+
+Phân tích cơ chế nginx, đối chiếu code Prost và đo thêm mức tái sử dụng TCP:
+[docs/nginx-performance-research.md](docs/nginx-performance-research.md).

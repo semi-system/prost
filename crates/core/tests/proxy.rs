@@ -26,6 +26,284 @@ struct Server {
     address: SocketAddr,
     task: JoinHandle<()>,
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_small_and_split_bodies_are_complete() -> Result<()> {
+    let backend = http_server("ready").await;
+    let fixture = Fixture::new(Protocol::Http, backend.address);
+    let p = fixture.start().await;
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let address = fixture.address();
+        tasks.push(tokio::spawn(async move {
+            let io = TcpStream::connect(address).await?;
+            let (mut client, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+            let driver = tokio::spawn(connection);
+            for n in 0..10 {
+                let split = (n + index) % 2 == 0;
+                let response = client
+                    .send_request(
+                        Request::builder()
+                            .uri(if split { "/split" } else { "/" })
+                            .header("host", "localhost")
+                            .body(Full::new(Bytes::new()))?,
+                    )
+                    .await?;
+                assert_eq!(
+                    response.into_body().collect().await?.to_bytes(),
+                    if split { "onetwo" } else { "ready" }
+                );
+            }
+            drop(client);
+            driver.abort();
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+    for task in tasks {
+        timeout(Duration::from_secs(5), task).await???;
+    }
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn upgraded_connections_hold_admission_until_tunnel_closes() -> Result<()> {
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let address = l.local_addr()?;
+    let task = tokio::spawn(async move {
+        while let Ok((io, _)) = l.accept().await {
+            tokio::spawn(async move {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(io).await {
+                    while let Some(Ok(message)) = ws.next().await {
+                        if ws.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let server = Server { address, task };
+    let mut fixture = Fixture::new(Protocol::Http, server.address);
+    fixture.config.runtime.max_connections = 1;
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/", fixture.address())).await?;
+    ws.send(tokio_tungstenite::tungstenite::Message::text("held"))
+        .await?;
+    assert_eq!(ws.next().await.unwrap()?.into_text()?, "held");
+    assert_eq!(p.metrics.connections.get(), 1);
+    assert!(timeout(
+        Duration::from_secs(2),
+        tokio_tungstenite::connect_async(format!("ws://{}/", fixture.address()))
+    )
+    .await?
+    .is_err());
+    drop(ws);
+    timeout(Duration::from_secs(2), async {
+        while p.metrics.connections.get() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn compiled_routes_preserve_precedence_and_refresh_upstream_bindings() -> Result<()> {
+    let a = http_server("a").await;
+    let b = http_server("b").await;
+    let mut fixture = Fixture::new(Protocol::Http, a.address);
+    fixture
+        .config
+        .upstreams
+        .insert("other".into(), fixture.config.upstreams["main"].clone());
+    fixture.config.upstreams.get_mut("other").unwrap().endpoints[0].address = b.address.to_string();
+    let route = |host: Option<&str>, prefix: &str, priority, upstream: &str| prost_config::Route {
+        host: host.map(str::to_owned),
+        path_prefix: prefix.into(),
+        priority,
+        upstream: upstream.into(),
+        plugins: vec![],
+    };
+    fixture.config.listeners[0].routes = vec![
+        route(None, "/api", 0, "main"),
+        route(Some("example.com"), "/api/long", 0, "other"),
+        route(None, "/api/high", 10, "other"),
+    ];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(connection);
+    for (path, host, expected) in [
+        ("/api/long/x", "EXAMPLE.COM:8080", "b"),
+        ("/api/long/x", "other.test", "a"),
+        ("/api/high/x", "other.test", "b"),
+        ("/", "other.test", "a"),
+    ] {
+        let response = client
+            .send_request(
+                Request::builder()
+                    .uri(path)
+                    .header("host", host)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        assert_eq!(response.into_body().collect().await?.to_bytes(), expected);
+    }
+    let mut config = p.snapshot().config.clone();
+    config.upstreams.get_mut("other").unwrap().endpoints[0].address = a.address.to_string();
+    p.apply(config.encode()?, 0).await?;
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/api/high/x")
+                .header("host", "example.com")
+                .body(Full::new(Bytes::new()))?,
+        )
+        .await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "a");
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_response_timeout_releases_request_capacity() -> Result<()> {
+    let backend = http_server("ready").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    fixture.config.runtime.max_requests = 1;
+    fixture
+        .config
+        .upstreams
+        .get_mut("main")
+        .unwrap()
+        .idle_timeout_ms = 100;
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    async fn get(address: SocketAddr, path: &str) -> Result<hyper::Response<Incoming>> {
+        let io = TcpStream::connect(address).await?;
+        let (mut client, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        tokio::spawn(connection);
+        Ok(client
+            .send_request(
+                Request::builder()
+                    .uri(path)
+                    .header("host", "localhost")
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?)
+    }
+    let slow = get(fixture.address(), "/slow").await?;
+    let blocked = get(fixture.address(), "/").await?;
+    assert_eq!(blocked.status(), 503);
+    blocked.into_body().collect().await?;
+    assert!(timeout(Duration::from_secs(2), slow.into_body().collect())
+        .await?
+        .is_err());
+    let response = get(fixture.address(), "/").await?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "ready");
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_end_hook_waits_for_body_and_survives_fast_path_changes() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Recorder(Arc<AtomicUsize>);
+    impl prost_core::prost_plugin::NativePlugin for Recorder {
+        fn on_event(
+            &self,
+            event: &prost_core::prost_plugin::Event,
+        ) -> Result<prost_core::prost_plugin::Action> {
+            if event.hook == "end" {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Default::default())
+        }
+    }
+    let backend = http_server("body").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    fixture.config.listeners[0].routes = vec![prost_config::Route {
+        host: None,
+        path_prefix: "/".into(),
+        priority: 0,
+        upstream: "main".into(),
+        plugins: vec![prost_config::Plugin {
+            name: "recorder".into(),
+            module: None,
+            config: Default::default(),
+        }],
+    }];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut registry = prost_core::prost_plugin::PluginRegistry::new()?;
+    registry.register("recorder".into(), Arc::new(Recorder(count.clone())));
+    let p = ProxyBuilder::new(&fixture.path)?
+        .plugins(registry)
+        .start()
+        .await?;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(connection);
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/slow")
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))?,
+        )
+        .await?;
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "late");
+    timeout(Duration::from_secs(2), async {
+        while count.load(Ordering::Relaxed) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_limit_is_not_reset_by_upstream_update() -> Result<()> {
+    let a = echo().await;
+    let b = echo().await;
+    let mut fixture = Fixture::new(Protocol::Tcp, a.address);
+    fixture.config.listeners[0].plugins = vec![prost_config::Plugin {
+        name: "connection_limit".into(),
+        module: None,
+        config: std::collections::BTreeMap::from([("max_connections".into(), 1.into())]),
+    }];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let mut old = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut old, b"held").await?;
+    let mut config = p.snapshot().config.clone();
+    config.upstreams.get_mut("main").unwrap().endpoints[0].address = b.address.to_string();
+    p.apply(config.encode()?, 0).await?;
+    let mut second = TcpStream::connect(fixture.address()).await?;
+    let mut byte = [0];
+    assert!(matches!(
+        timeout(Duration::from_secs(2), second.read(&mut byte)).await?,
+        Ok(0) | Err(_)
+    ));
+    roundtrip(&mut old, b"still held").await?;
+    drop(old);
+    drop(second);
+    p.shutdown().await;
+    Ok(())
+}
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
@@ -66,12 +344,38 @@ async fn http_server(label: &'static str) -> Server {
                             StreamBody::new(futures_util::stream::iter(frames))
                                 .map_err(|e| match e {})
                                 .boxed_unsync()
+                        } else if request.uri().path() == "/split" {
+                            let first = futures_util::stream::once(async {
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"one")))
+                            });
+                            let second = futures_util::stream::once(async {
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"two")))
+                            });
+                            StreamBody::new(first.chain(second)).boxed_unsync()
+                        } else if request.uri().path() == "/slow" {
+                            StreamBody::new(futures_util::stream::once(async {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"late")))
+                            }))
+                            .boxed_unsync()
                         } else {
                             Full::new(Bytes::from_static(label.as_bytes()))
                                 .map_err(|e| match e {})
                                 .boxed_unsync()
                         };
+                    let path = request.uri().path();
                     let mut response = Response::new(body);
+                    if path == "/slow" {
+                        response
+                            .headers_mut()
+                            .insert("content-length", http::HeaderValue::from_static("4"));
+                    }
+                    if path == "/split" {
+                        response
+                            .headers_mut()
+                            .insert("content-length", http::HeaderValue::from_static("6"));
+                    }
                     response.headers_mut().insert(
                         "content-type",
                         http::HeaderValue::from_static("application/grpc"),
