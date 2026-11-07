@@ -1,20 +1,34 @@
 """End-to-end CLI smoke against the running Docker Compose demo (run in WSL)."""
 import json
+import argparse
+from pathlib import Path
 import socket
 import subprocess
 import time
 import urllib.request
 
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--compose-file",action="append")
+parser.add_argument("--project-name")
+parser.add_argument("--http-url",default="http://127.0.0.1:8080/")
+parser.add_argument("--tcp-port",type=int,default=9000)
+options=parser.parse_args()
+compose=["docker","compose"]
+for path in options.compose_file or [str(Path(__file__).resolve().parent.parent/"compose.yaml")]:
+    compose += ["-f",path]
+if options.project_name:
+    compose += ["-p",options.project_name]
+
 
 def ctl(*args):
     result = subprocess.run(
-        ["docker", "compose", "exec", "-T", "prost", "prostctl", *args],
+        [*compose, "exec", "-T", "prost", "prostctl", *args],
         check=True, text=True, capture_output=True)
     return json.loads(result.stdout)
 
 
 def http_status():
-    with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as response:
+    with urllib.request.urlopen(options.http_url, timeout=3) as response:
         return json.load(response)["backend"]
 
 
@@ -37,7 +51,7 @@ generation = state["generation"]
 ctl("validate", "--file", "/examples/green.toml")
 assert ctl("status")["generation"] == generation
 
-with socket.create_connection(("127.0.0.1", 9000), timeout=3) as old:
+with socket.create_connection(("127.0.0.1", options.tcp_port), timeout=3) as old:
     old.sendall(b"before")
     assert old.recv(6) == b"before"
     result = ctl("apply", "--file", "/examples/green.toml",
@@ -57,7 +71,7 @@ ctl("upstream", "enable", "web/green")
 wait_backend("green")
 
 generation = ctl("status")["generation"]
-subprocess.run(["docker", "compose", "restart", "prost"], check=True)
+subprocess.run([*compose, "restart", "prost"], check=True)
 wait_backend("green")
 assert ctl("status")["generation"] == generation
 print("PASS: HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")

@@ -1,4 +1,11 @@
 use anyhow::{bail, ensure, Context, Result};
+mod headers;
+mod native;
+pub use headers::{
+    HeaderContext, REQUEST_HEADERS as NEEDS_REQUEST_HEADERS, REQUEST_ID as NEEDS_REQUEST_ID,
+    UPSTREAM_HEADERS as NEEDS_UPSTREAM_HEADERS,
+};
+pub use native::{FilterCall, FilterDecision, FilterHook, NativeFilter};
 use prost_config::Plugin;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
@@ -28,25 +35,65 @@ pub trait NativePlugin: Send + Sync {
     fn on_event(&self, event: &Event) -> Result<Action>;
 }
 pub struct PluginRegistry {
-    pub engine: Engine,
+    engine: once_cell::sync::OnceCell<Engine>,
     capacity: Arc<Semaphore>,
     native: BTreeMap<String, Arc<dyn NativePlugin>>,
+    filters: BTreeMap<String, Arc<dyn NativeFilter>>,
 }
 impl PluginRegistry {
     pub fn new() -> Result<Self> {
-        let mut c = wasmtime::Config::new();
-        c.consume_fuel(true);
-        c.max_wasm_stack(256 * 1024);
         Ok(Self {
-            engine: Engine::new(&c)?,
+            engine: once_cell::sync::OnceCell::new(),
             capacity: Arc::new(Semaphore::new(32)),
             native: BTreeMap::new(),
+            filters: BTreeMap::new(),
+        })
+    }
+    pub fn engine(&self) -> Result<&Engine> {
+        self.engine.get_or_try_init(|| {
+            let mut config = wasmtime::Config::new();
+            config.consume_fuel(true);
+            config.max_wasm_stack(256 * 1024);
+            Engine::new(&config)
         })
     }
     pub fn register(&mut self, name: String, plugin: Arc<dyn NativePlugin>) {
         self.native.insert(name, plugin);
     }
+    pub fn register_filter(&mut self, name: String, filter: Arc<dyn NativeFilter>) {
+        self.filters.insert(name, filter);
+    }
     pub fn prepare(&self, p: &Plugin) -> Result<PreparedPlugin> {
+        let plugin = self.prepare_inner(p)?;
+        Ok(if let Some(hooks) = &p.hooks {
+            PreparedPlugin::Filtered(
+                Arc::new(plugin),
+                hooks.iter().fold(0, |mask, hook| mask | hook_bit(hook)),
+            )
+        } else {
+            plugin
+        })
+    }
+    fn prepare_inner(&self, p: &Plugin) -> Result<PreparedPlugin> {
+        let value = || serde_json::to_value(&p.config);
+        match p.name.as_str() {
+            "headers" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(headers::Headers::new(
+                    value()?,
+                )?)))
+            }
+            "ip_acl" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(native::IpAccess::new(
+                    value()?,
+                )?)))
+            }
+            "rate_limit" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(native::RateLimit::new(
+                    value()?,
+                )?)))
+            }
+            _ => {}
+        }
         if p.name == "connection_limit" {
             let n = p.config["max_connections"]
                 .as_integer()
@@ -56,12 +103,15 @@ impl PluginRegistry {
         if let Some(native) = self.native.get(&p.name) {
             return Ok(PreparedPlugin::Native(native.clone()));
         }
+        if let Some(filter) = self.filters.get(&p.name) {
+            return Ok(PreparedPlugin::Fast(filter.clone()));
+        }
         ensure!(p.name == "wasm", "unknown plugin {}", p.name);
-        let module =
-            Module::from_file(&self.engine, p.module.as_ref().context("module required")?)?;
+        let engine = self.engine()?;
+        let module = Module::from_file(engine, p.module.as_ref().context("module required")?)?;
         let config = serde_json::to_value(&p.config)?;
         let prepared = Wasm {
-            engine: self.engine.clone(),
+            engine: engine.clone(),
             module,
             config,
             capacity: self.capacity.clone(),
@@ -72,16 +122,148 @@ impl PluginRegistry {
     }
 }
 pub enum PreparedPlugin {
+    Fast(Arc<dyn NativeFilter>),
+    Filtered(Arc<PreparedPlugin>, u8),
     Limit(Arc<Semaphore>),
     Native(Arc<dyn NativePlugin>),
     Wasm(Arc<Wasm>),
 }
+fn hook_bit(hook: &str) -> u8 {
+    match hook {
+        "connection" => 1,
+        "upstream" => 2,
+        "request_headers" => 4,
+        "response_headers" => 8,
+        "end" => 16,
+        _ => 0,
+    }
+}
 impl PreparedPlugin {
+    pub fn copy_header_inputs(
+        &self,
+        upstream: bool,
+        source: &http::HeaderMap,
+        target: &mut http::HeaderMap,
+    ) {
+        match self {
+            Self::Filtered(inner, _) => {
+                if self.has_hooks() {
+                    inner.copy_header_inputs(upstream, source, target)
+                }
+            }
+            Self::Fast(p) => {
+                for name in p.header_inputs(upstream) {
+                    if !target.contains_key(name) {
+                        for value in source.get_all(name).iter() {
+                            target.append(name.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pub fn context_needs(&self) -> u8 {
+        match self {
+            Self::Filtered(inner, _) => inner.context_needs(),
+            Self::Fast(p) => p.context_needs(),
+            _ => 0,
+        }
+    }
+    pub fn parent_override(&self) -> Option<(u8, bool)> {
+        match self {
+            Self::Filtered(inner, _) => inner.parent_override(),
+            Self::Fast(p) => p.parent_override(),
+            _ => None,
+        }
+    }
+    pub fn filter_call(
+        &self,
+        call: &FilterCall<'_>,
+        headers: Option<&mut http::HeaderMap>,
+    ) -> Result<FilterDecision> {
+        match self {
+            Self::Filtered(inner, _) => inner.filter_call(call, headers),
+            Self::Fast(p) => p.filter_with_context(call, headers),
+            _ => Ok(FilterDecision::Continue),
+        }
+    }
+    pub fn trailers(
+        &self,
+        status: u16,
+        ctx: Option<&HeaderContext>,
+        headers: &http::HeaderMap,
+    ) -> Result<Option<http::HeaderMap>> {
+        if !self.has_hook("response_headers") {
+            return Ok(None);
+        }
+        match self {
+            Self::Filtered(inner, _) => inner.trailers(status, ctx, headers),
+            Self::Fast(p) => p.trailers(status, ctx, headers),
+            _ => Ok(None),
+        }
+    }
+    pub fn has_event_hooks(&self) -> bool {
+        match self {
+            Self::Filtered(inner, _) => self.has_hooks() && inner.has_event_hooks(),
+            Self::Fast(_) | Self::Limit(_) => false,
+            _ => true,
+        }
+    }
+    pub fn is_filter(&self) -> bool {
+        match self {
+            Self::Filtered(inner, _) => inner.is_filter(),
+            Self::Fast(_) => true,
+            _ => false,
+        }
+    }
+    pub fn filter(
+        &self,
+        hook: &str,
+        peer: std::net::IpAddr,
+        headers: Option<&mut http::HeaderMap>,
+    ) -> Result<FilterDecision> {
+        let mut plugin = self;
+        while let Self::Filtered(inner, _) = plugin {
+            plugin = inner;
+        }
+        if let (Self::Fast(filter), Some(hook)) = (plugin, FilterHook::from_str(hook)) {
+            filter.filter(hook, peer, headers)
+        } else {
+            Ok(FilterDecision::Continue)
+        }
+    }
     pub fn has_hooks(&self) -> bool {
-        !matches!(self, Self::Limit(_))
+        [
+            "connection",
+            "upstream",
+            "request_headers",
+            "response_headers",
+            "end",
+        ]
+        .iter()
+        .any(|hook| self.has_hook(hook))
+    }
+    pub fn has_hook(&self, hook: &str) -> bool {
+        let mut plugin = self;
+        while let Self::Filtered(inner, hooks) = plugin {
+            if hooks & hook_bit(hook) == 0 {
+                return false;
+            }
+            plugin = inner;
+        }
+        match plugin {
+            Self::Fast(filter) => FilterHook::from_str(hook).is_some_and(|h| filter.applies_to(h)),
+            Self::Limit(_) => false,
+            _ => true,
+        }
     }
     pub fn acquire_connection(&self) -> Result<Option<OwnedSemaphorePermit>> {
-        match self {
+        let mut plugin = self;
+        while let Self::Filtered(inner, _) = plugin {
+            plugin = inner;
+        }
+        match plugin {
             Self::Limit(s) => Ok(Some(
                 s.clone()
                     .try_acquire_owned()
@@ -91,8 +273,16 @@ impl PreparedPlugin {
         }
     }
     pub async fn invoke(&self, event: &Event) -> Result<Action> {
-        match self {
-            Self::Limit(_) => Ok(Action::default()),
+        let mut plugin = self;
+        while let Self::Filtered(inner, hooks) = plugin {
+            if hooks & hook_bit(&event.hook) == 0 {
+                return Ok(Action::default());
+            }
+            plugin = inner;
+        }
+        match plugin {
+            Self::Filtered(_, _) => unreachable!("filters unwrapped"),
+            Self::Limit(_) | Self::Fast(_) => Ok(Action::default()),
             Self::Native(p) => p.on_event(event),
             Self::Wasm(w) => {
                 let permit = w

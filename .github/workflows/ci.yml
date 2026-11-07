@@ -17,9 +17,28 @@ jobs:
         run: |
           docker compose up -d --build
           python3 scripts/smoke.py
+      - name: Advanced protocol smoke
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nghttp2-client
+          docker tag prost:mvp prost:advanced-release
+          python3 scripts/prepare-advanced-bench.py
+          docker compose -f benchmarks/advanced/compose.yaml build backend
+          python3 scripts/advanced-bench.py --rounds 1 --scale 0.02 --output-dir test-results/advanced-ci
+          python3 scripts/advanced-backpressure.py --clients 4 --seconds 2 --output test-results/advanced-ci/backpressure.json
       - name: Logs
         if: failure()
-        run: docker compose logs
+        run: |
+          docker compose logs
+          docker compose -f benchmarks/advanced/compose.yaml logs
+      - name: Protocol reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: advanced-protocol-reports
+          path: test-results/advanced-ci
       - name: Stop demo
         if: always()
-        run: docker compose down
+        run: |
+          docker compose -f benchmarks/advanced/compose.yaml down -v
+          docker compose down

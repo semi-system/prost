@@ -15,6 +15,36 @@ use tokio::sync::OwnedSemaphorePermit;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming>;
+thread_local! { static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub fn set_worker_slot(slot: usize) {
+    WORKER_SLOT.with(|current| current.set(slot));
+}
+pub struct ClientPool {
+    clients: Vec<HttpClient>,
+}
+impl ClientPool {
+    pub fn new(
+        upstream: &Upstream,
+        tls: Arc<rustls::ClientConfig>,
+        workers: usize,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=32).contains(&workers),
+            "invalid client pool worker count"
+        );
+        let mut clients = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let mut config = upstream.clone();
+            config.pool_max_idle_per_host = upstream.pool_max_idle_per_host / workers
+                + usize::from(index < upstream.pool_max_idle_per_host % workers);
+            clients.push(client(&config, tls.clone())?);
+        }
+        Ok(Self { clients })
+    }
+    pub fn current(&self) -> &HttpClient {
+        WORKER_SLOT.with(|slot| &self.clients[slot.get() % self.clients.len()])
+    }
+}
 static FORWARDED_HOP_HEADERS: [HeaderName; 9] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
@@ -55,6 +85,12 @@ pub fn client(upstream: &Upstream, tls: Arc<rustls::ClientConfig>) -> Result<Htt
         .pool_max_idle_per_host(upstream.pool_max_idle_per_host)
         .pool_idle_timeout(Duration::from_millis(upstream.pool_idle_timeout_ms))
         .retry_canceled_requests(false);
+    let h2 = &upstream.http2_settings;
+    builder
+        .http2_initial_stream_window_size(h2.initial_stream_window_size)
+        .http2_initial_connection_window_size(h2.initial_connection_window_size)
+        .http2_max_concurrent_streams(h2.max_concurrent_streams)
+        .http2_adaptive_window(h2.adaptive_window);
     if upstream.http2 {
         builder.http2_only(true);
     }

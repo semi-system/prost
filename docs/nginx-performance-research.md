@@ -1,5 +1,8 @@
 # nginx tối ưu ở đâu, và Prost đang trả thêm chi phí gì?
 
+Tài liệu ghi nhận code **trước đợt tối ưu**. Một số điểm dưới đây đã được xử lý;
+xem [performance-optimization.md](performance-optimization.md) để đối chiếu.
+
 Đối chiếu nginx **release-1.28.0**, commit
 `481d28cb4e04c8096b9b6134856891dc52ecc68f`, với code và dependency trong
 `Cargo.lock` của Prost. Nghiên cứu ngày 2026-11-07, chưa thay thuật toán proxy.

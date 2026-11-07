@@ -42,6 +42,39 @@ services:
       - ./prost.toml:/etc/prost/seed.toml:ro
     ports:
       - "127.0.0.1:18084:8080"
+  prost-local:
+    image: prost:bench-release
+    container_name: prost-bench-local
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ./prost-local.toml:/etc/prost/seed.toml:ro
+    ports:
+      - "127.0.0.1:18085:8080"
+  prost-shared:
+    image: prost:bench-release
+    container_name: prost-bench-shared
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ./prost-shared.toml:/etc/prost/seed.toml:ro
+    ports:
+      - "127.0.0.1:18086:8080"
+  prost-pgo:
+    image: prost:bench-pgo
+    container_name: prost-bench-pgo
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ./prost-local.toml:/etc/prost/seed.toml:ro
+    ports:
+      - "127.0.0.1:18087:8080"
   nginx:
     image: nginx:stable-bookworm
     container_name: prost-bench-nginx
@@ -51,6 +84,24 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "127.0.0.1:18081:8080"
+  nginx-tuned:
+    image: nginx:stable-bookworm
+    container_name: prost-bench-nginx-tuned
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ./nginx-pool128.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18089:8080"
+  nginx-reuseport:
+    image: nginx:stable-bookworm
+    container_name: prost-bench-nginx-reuseport
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ./nginx-reuseport.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18091:8080"
   apache:
     image: httpd:2.4-bookworm
     container_name: prost-bench-apache

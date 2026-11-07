@@ -10,3 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 wasmtime.workspace = true
+once_cell.workspace = true
+http.workspace = true
+ipnet.workspace = true
+httpdate.workspace = true

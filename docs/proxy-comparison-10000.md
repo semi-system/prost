@@ -1,5 +1,8 @@
 # So sánh Prost, nginx và Apache2 — 2026-11-07
 
+Số liệu lịch sử **trước tối ưu**. Xem báo cáo tối ưu mới tại
+[performance-optimization.md](performance-optimization.md).
+
 Đã chạy trực tiếp trong Docker Engine trên WSL2, cùng máy Intel i7-10700,
 16 logical CPU. Đây là kết quả của các config được lưu trong `benchmarks/`,
 không phải kết luận cho mọi cấu hình production.

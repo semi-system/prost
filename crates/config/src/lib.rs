@@ -61,6 +61,8 @@ pub struct Runtime {
     pub max_connections: usize,
     pub max_requests: usize,
     pub drain_seconds: u64,
+    pub worker_local: bool,
+    pub io_workers: usize,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -71,6 +73,8 @@ impl Default for Runtime {
             max_connections: max_conn(),
             max_requests: max_req(),
             drain_seconds: 30,
+            worker_local: true,
+            io_workers: 0,
         }
     }
 }
@@ -94,6 +98,62 @@ pub struct Upstream {
     pub pool_max_idle_per_host: usize,
     #[serde(default = "pool_timeout_ms")]
     pub pool_idle_timeout_ms: u64,
+    #[serde(default)]
+    pub health_check: HealthCheck,
+    #[serde(default)]
+    pub http2_settings: Http2Settings,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HealthCheck {
+    /// None checks TCP/TLS connectivity; Some performs GET and checks response status.
+    pub path: Option<String>,
+    pub host: Option<String>,
+    pub expected_status: u16,
+    pub timeout_ms: u64,
+    pub fall: u32,
+    pub rise: u32,
+}
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            path: None,
+            host: None,
+            expected_status: 200,
+            timeout_ms: 5000,
+            fall: 1,
+            rise: 1,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Http2Settings {
+    pub initial_stream_window_size: u32,
+    pub initial_connection_window_size: u32,
+    pub max_concurrent_streams: u32,
+    pub adaptive_window: bool,
+}
+impl Default for Http2Settings {
+    fn default() -> Self {
+        Self {
+            initial_stream_window_size: 65535,
+            initial_connection_window_size: 1048576,
+            max_concurrent_streams: 128,
+            adaptive_window: false,
+        }
+    }
+}
+impl Http2Settings {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (65535..=16777216).contains(&self.initial_stream_window_size)
+                && (65535..=16777216).contains(&self.initial_connection_window_size)
+                && (1..=4096).contains(&self.max_concurrent_streams),
+            "invalid HTTP/2 settings"
+        );
+        Ok(())
+    }
 }
 fn balance() -> String {
     "round_robin".into()
@@ -108,7 +168,7 @@ pub struct Endpoint {
     #[serde(default = "yes")]
     pub enabled: bool,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTls {
     pub server_name: String,
@@ -145,6 +205,8 @@ pub struct Listener {
     pub plugins: Vec<Plugin>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    #[serde(default)]
+    pub http2_settings: Http2Settings,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -168,6 +230,8 @@ pub struct Plugin {
     pub name: String,
     #[serde(default)]
     pub module: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Vec<String>>,
     #[serde(default)]
     pub config: BTreeMap<String, toml::Value>,
 }
@@ -193,6 +257,7 @@ impl Config {
             self.runtime.drain_seconds > 0 && self.runtime.drain_seconds <= 3600,
             "invalid drain_seconds"
         );
+        ensure!(self.runtime.io_workers <= 32, "io_workers must be 0..32");
         ensure!(
             self.runtime.admin_socket.is_absolute() && self.runtime.artifact_dir.is_absolute(),
             "runtime paths must be absolute"
@@ -217,6 +282,31 @@ impl Config {
                 u.pool_max_idle_per_host <= 4096 && u.pool_idle_timeout_ms > 0,
                 "invalid upstream pool limits"
             );
+            u.http2_settings.validate()?;
+            let h = &u.health_check;
+            ensure!(
+                (1..=100).contains(&h.fall)
+                    && (1..=100).contains(&h.rise)
+                    && (1..=60000).contains(&h.timeout_ms)
+                    && (200..=599).contains(&h.expected_status),
+                "invalid health check policy"
+            );
+            if let Some(path) = &h.path {
+                ensure!(
+                    path.starts_with('/')
+                        && path.len() <= 4096
+                        && !path.bytes().any(|b| b <= 32 || b == 127),
+                    "invalid health check path"
+                );
+            }
+            if let Some(host) = &h.host {
+                ensure!(
+                    !host.is_empty()
+                        && host.len() <= 255
+                        && !host.bytes().any(|b| b <= 32 || b >= 127),
+                    "invalid health check host"
+                );
+            }
             let mut names = HashSet::new();
             let mut sum = 0u64;
             for e in &u.endpoints {
@@ -243,6 +333,7 @@ impl Config {
             }
         }
         for l in &self.listeners {
+            l.http2_settings.validate()?;
             valid_id(&l.id)?;
             ensure!(ids.insert(&l.id), "duplicate listener id");
             ensure!(
@@ -255,6 +346,12 @@ impl Config {
                 "listener limits exceeded"
             );
             if l.protocol == Protocol::Tcp {
+                ensure!(
+                    !l.plugins
+                        .iter()
+                        .any(|p| matches!(p.name.as_str(), "headers" | "rate_limit")),
+                    "HTTP filter on TCP listener"
+                );
                 ensure!(
                     l.upstream.is_some() && l.routes.is_empty(),
                     "TCP requires upstream and no routes"
@@ -300,7 +397,22 @@ fn valid_id(s: &str) -> Result<()> {
 fn validate_plugins(plugins: &[Plugin]) -> Result<()> {
     ensure!(plugins.len() <= 64, "too many plugins");
     for p in plugins {
+        if let Some(hooks) = &p.hooks {
+            let mut seen = HashSet::new();
+            ensure!(
+                hooks.len() <= 5
+                    && hooks.iter().all(|hook| matches!(
+                        hook.as_str(),
+                        "connection" | "upstream" | "request_headers" | "response_headers" | "end"
+                    ) && seen.insert(hook)),
+                "invalid or duplicate plugin hook"
+            );
+        }
         if p.name == "connection_limit" {
+            ensure!(
+                p.hooks.is_none(),
+                "connection_limit does not accept hook filters"
+            );
             ensure!(p.module.is_none(), "native plugin cannot have module");
             let n = p
                 .config

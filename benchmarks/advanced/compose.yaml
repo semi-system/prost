@@ -1,0 +1,39 @@
+name: prost-advanced-benchmark
+services:
+  backend:
+    image: prost:advanced-backend
+    build: .
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      GOMAXPROCS: 2
+    volumes:
+      - ../../test-results/advanced-fixtures/certs:/certs:ro
+    ports:
+      - "127.0.0.1:19080:8080"
+      - "127.0.0.1:19443:8443"
+  prost:
+    image: ${PROST_ADVANCED_IMAGE:-prost:advanced-release}
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ../../test-results/advanced-fixtures/${PROST_ADVANCED_CONFIG:-prost.toml}:/etc/prost/seed.toml:ro
+      - ../../test-results/advanced-fixtures/certs:/certs:ro
+      - ../../examples/add-header.wat:/plugins/add-header.wat:ro
+    ports:
+      - "127.0.0.1:19081:8080"
+      - "127.0.0.1:19444:8443"
+      - "127.0.0.1:19446:8444"
+  nginx:
+    image: nginx:stable-bookworm
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ../../test-results/advanced-fixtures/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../../test-results/advanced-fixtures/certs:/certs:ro
+    ports:
+      - "127.0.0.1:19082:8080"
+      - "127.0.0.1:19445:8443"
+      - "127.0.0.1:19447:8444"

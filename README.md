@@ -4,8 +4,9 @@ MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix
 `prostctl`**, không polling, không watcher, không restart worker.
 
 Đã triển khai TCP relay, TLS hai phía, HTTP/1.1–HTTP/2, HTTPS, WebSocket,
-gRPC streaming/trailers, weighted round-robin, TCP/TLS health check, plugin native
-và WASM. Đây là MVP để chạy thử; benchmark, soak dài và đánh giá bảo mật để sau.
+gRPC streaming/trailers, weighted round-robin, TCP/TLS/HTTP health check, cấu hình
+flow control HTTP/2, plugin native và WASM. Đây là MVP để chạy thử; soak dài và
+đánh giá production vẫn còn cần thực hiện.
 
 ## Build và test bằng Docker trong WSL
 
@@ -31,7 +32,8 @@ sudo sh scripts/docker-dev.sh cargo build --workspace --locked
 Registry và `target` ở Docker named volumes trên filesystem Linux, không build
 vào `/mnt/d`. `Dockerfile.dev` cung cấp Rust, rustfmt và clippy.
 `build.cmd` gọi PowerShell với execution policy chỉ áp dụng cho process hiện tại,
-không thay chính sách hệ thống. Image MVP dùng build debug để lặp nhanh.
+không thay chính sách hệ thống. `Dockerfile` mặc định build **release** với LTO;
+muốn image debug dùng `docker build --build-arg CARGO_PROFILE=dev -t prost:debug .`.
 
 ## Demo HTTP và TCP
 
@@ -111,6 +113,33 @@ Với gRPC upstream, thêm `http2 = true` vào `[upstreams.web]`.
 Với HTTPS, thêm block `listeners.tls` như ví dụ IMAPS. Muốn TLS tới upstream,
 thêm `upstreams.<name>.tls` với `server_name` và CA tùy chọn.
 
+Pool HTTP upstream mặc định giữ tối đa 128 connection idle/host, timeout 30 giây.
+Có thể thay đổi khi apply config:
+
+```toml
+[upstreams.web]
+pool_max_idle_per_host = 128
+pool_idle_timeout_ms = 30000
+```
+
+Đây là giới hạn connection **idle**, không phải active. Giảm giá trị nếu có
+nhiều upstream và cần tiết kiệm file descriptor/RAM.
+
+Mặc định, mỗi I/O worker có runtime đơn luồng và pool riêng; tổng idle budget
+vẫn được chia trong giới hạn trên. Linux dùng `SO_REUSEPORT` để phân phối
+connection đến worker. Có thể cấu hình lúc startup:
+
+```toml
+[runtime]
+worker_local = true
+io_workers = 2
+```
+
+`io_workers = 0` tự chọn theo runtime gọi (tối đa 8); giá trị explicit tối đa 32.
+`worker_local = false` dùng lại runtime chia sẻ. Hai tùy chọn này cần restart;
+route/upstream/certificate/plugin vẫn apply khi đang chạy. Histogram latency
+được gộp theo worker mỗi 64 mẫu hoặc 250 ms và flush khi shutdown; không bỏ mẫu.
+
 Plugin inline, theo thứ tự khai báo:
 
 ```toml
@@ -148,3 +177,15 @@ phát tải: [docs/proxy-comparison-10000.md](docs/proxy-comparison-10000.md).
 
 Phân tích cơ chế nginx, đối chiếu code Prost và đo thêm mức tái sử dụng TCP:
 [docs/nginx-performance-research.md](docs/nginx-performance-research.md).
+
+Kết quả sau tối ưu, gồm bản baseline release và nginx đo lại cùng lượt:
+[docs/performance-optimization.md](docs/performance-optimization.md).
+
+Đối chiếu PGO với nginx cùng ngân sách pool, giới hạn kết luận và lệnh tái hiện:
+[docs/pgo-performance.md](docs/pgo-performance.md).
+
+Health check ứng dụng, ngưỡng lỗi/phục hồi và HTTP/2 settings:
+[docs/advanced-features.md](docs/advanced-features.md).
+
+Bộ native header/ACL/rate/connection filters và ví dụ config inline:
+[docs/native-filters.md](docs/native-filters.md).

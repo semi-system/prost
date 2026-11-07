@@ -1,0 +1,2 @@
+FROM prost-dev
+RUN rustup component add llvm-tools-preview

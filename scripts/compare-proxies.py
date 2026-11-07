@@ -20,6 +20,11 @@ TARGETS = {
     "nginx": (18081, "prost-bench-nginx", "nginx official optimized binary"),
     "apache": (18082, "prost-bench-apache", "Apache httpd official optimized binary, event MPM"),
     "prost-baseline": (18084, "prost-bench-baseline", "Prost release before optimization"),
+    "prost-local": (18085, "prost-bench-local", "Prost dedicated current-thread I/O workers"),
+    "prost-shared": (18086, "prost-bench-shared", "Prost shared multi-thread I/O runtime"),
+    "prost-pgo": (18087, "prost-bench-pgo", "Prost PGO, trained on small HTTP responses"),
+    "nginx-tuned": (18089, "prost-bench-nginx-tuned", "nginx, matched 128-idle pool budget"),
+    "nginx-reuseport": (18091, "prost-bench-nginx-reuseport", "nginx, 128-idle pool and reuseport"),
 }
 
 
@@ -62,7 +67,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--keep-running", action="store_true")
     parser.add_argument("--driver", choices=["asyncio", "ab"], default="asyncio")
-    parser.add_argument("--targets", nargs="+", choices=list(TARGETS), default=[name for name in TARGETS if name != "prost-baseline"])
+    parser.add_argument("--targets", nargs="+", choices=list(TARGETS), default=[name for name in TARGETS if name not in ("prost-baseline","prost-local","prost-shared","prost-pgo","nginx-tuned","nginx-reuseport")])
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--requests", type=int, default=10000)
     args = parser.parse_args()
@@ -85,9 +90,9 @@ def main():
                 compose("up", "-d", "--no-deps", "--force-recreate", "--renew-anon-volumes", name)
                 ready(port)
                 if name not in metadata:
-                    version_command = ["nginx", "-v"] if name == "nginx" else ["httpd", "-v"] if name == "apache" else ["prost", "--version"]
+                    version_command = ["nginx", "-v"] if name.startswith("nginx") else ["httpd", "-v"] if name == "apache" else ["prost", "--version"]
                     metadata[name] = subprocess.run(["docker", "exec", container, *version_command], capture_output=True, text=True, check=True).stdout
-                    if name == "nginx":
+                    if name.startswith("nginx"):
                         metadata[name] = subprocess.run(["docker", "exec", container, *version_command], capture_output=True, text=True, check=True).stderr
                 report = load(port, container, label, output / f"{name}-round-{round_number + 1}.json", driver=args.driver, requests=args.requests)
                 results[name].append(report)

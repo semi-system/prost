@@ -6,7 +6,7 @@ It does not replace or edit the normal demo's managed config.
 
 All proxy containers and the common static backend have a 2-CPU quota and
 256 MiB memory limit. Containers share a Docker bridge in WSL2. All tests use
-10,000 GET requests at concurrency 100, plaintext keep-alive, no cache,
+10,000 GET requests by default (configurable with `--requests`) at concurrency 100, plaintext keep-alive, no cache,
 no access log, no WASM or TLS, and the same 34-byte JSON body. The backend
 itself is a separate nginx returning that fixed payload; it is not the Python
 demo backend used by the earlier MVP measurement. A direct-backend control is
@@ -15,10 +15,16 @@ as though only the proxy changed.
 
 Proxy settings are comparable rather than byte-for-byte identical:
 
-- Prost: 2 Tokio workers, existing 16-idle-connection pool, 5 s connect and 60 s
+- Prost: 2 Tokio workers, configurable idle pool (now 128/host; original baseline
+  used 16), 5 s connect and 60 s
   upstream timeout. Benchmark config has no plugins.
 - nginx: 2 workers, HTTP/1.1 upstream keep-alive, 16 idle connections per worker,
   request/response buffering disabled, automatic upstream retry disabled.
+- Optional `nginx-tuned`: 64 idle connections per worker (128 total), matching
+  Prost's aggregate budget. `nginx-reuseport` additionally enables reuseport.
+- Prost defaults to dedicated current-thread I/O workers and per-worker pools;
+  `prost-shared` selects the shared runtime for comparison. `prost-pgo` uses the
+  opt-in workload-trained image built with `scripts/build-pgo.py`.
 - Apache: minimal module set, event MPM, 2 child processes with 64 threads each,
   upstream connection reuse, `smax=16` per process and 30 s TTL. Apache's
   pool/thread model differs from nginx and Prost; this is not a default
@@ -56,10 +62,19 @@ Build the base MVP image first if needed, then build release and compare:
 
 ```sh
 sudo docker build -t prost:mvp .
+sudo python3 scripts/build-release-benchmark.py --profile dev
 sudo python3 scripts/build-release-benchmark.py
 sudo python3 scripts/compare-proxies.py --rounds 3
 # Independent C load generator, requires apache2-utils in WSL:
 sudo python3 scripts/compare-proxies.py --rounds 3 --driver ab
+# Selected proxies and a separate result directory:
+sudo python3 scripts/compare-proxies.py --driver ab --targets prost-release nginx \
+  --output-dir test-results/my-comparison
+# PGO vs matched-pool nginx, including its reuseport variant:
+sudo python3 scripts/build-pgo.py
+sudo python3 scripts/compare-proxies.py --rounds 5 --requests 100000 --driver ab \
+  --targets prost-pgo nginx-tuned nginx-reuseport \
+  --output-dir test-results/my-pgo-comparison
 ```
 
 Scripts are run from the repository root. Cargo release output and registry use
@@ -67,7 +82,8 @@ the Linux Docker volumes from normal development. Image digests/IDs, limits,
 versions, latency/resource samples and summary are written under
 `test-results/comparison/` and `test-results/comparison-ab/` (ignored by Git).
 Competitor configs are checked in
-beside this README. The runner stops benchmark containers afterward; the regular
+beside this README. Each round gets fresh anonymous state volumes. The runner
+stops benchmark containers afterward; the regular
 demo stays running. To remove benchmark containers/networks and their disposable
 anonymous volumes afterward:
 

@@ -1090,6 +1090,7 @@ dependencies = [
  "bytes",
  "fs2",
  "futures-util",
+ "getrandom 0.3.4",
  "http",
  "http-body-util",
  "hyper",
@@ -1103,6 +1104,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "sha2",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1134,6 +1136,10 @@ name = "prost-plugin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http",
+ "httpdate",
+ "ipnet",
+ "once_cell",
  "prost-config",
  "serde",
  "serde_json",

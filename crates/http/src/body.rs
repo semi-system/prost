@@ -68,6 +68,7 @@ pin_project! {
         Static { #[pin] inner: Full<Bytes> },
         Incoming { #[pin] inner: Incoming },
         Buffered { #[pin] inner: Full<Bytes>, guard: Guard },
+        Trailers { inner: Pin<Box<Body>>, trailers: Option<http::HeaderMap>, finished: bool, guard: Option<Guard> },
         Stream {
             #[pin] inner: Incoming,
             #[pin] idle: Option<Sleep>,
@@ -79,6 +80,28 @@ pin_project! {
     }
 }
 impl Body {
+    /// Optional wrapper allocated only when a native trailer rule is active.
+    pub fn with_trailers(mut self, trailers: http::HeaderMap) -> Self {
+        let guard = match &mut self.inner {
+            Kind::Buffered { guard, .. } | Kind::Stream { guard, .. } => Some(std::mem::replace(
+                guard,
+                Guard {
+                    permit: None,
+                    keepalive: None,
+                    completion: Completion(None),
+                },
+            )),
+            _ => None,
+        };
+        Self {
+            inner: Kind::Trailers {
+                inner: Box::pin(self),
+                trailers: Some(trailers),
+                finished: false,
+                guard,
+            },
+        }
+    }
     pub(crate) fn text(text: &'static str) -> Self {
         Self {
             inner: Kind::Static {
@@ -125,6 +148,48 @@ impl HttpBody for Body {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         match self.project().inner.project() {
+            KindProj::Trailers {
+                inner,
+                trailers,
+                finished,
+                guard,
+            } => {
+                if *finished {
+                    return Poll::Ready(None);
+                }
+                match inner.as_mut().poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_trailers() {
+                        Ok(mut original) => {
+                            if let Some(extra) = trailers.take() {
+                                for (name, value) in extra.iter() {
+                                    original.append(name.clone(), value.clone());
+                                }
+                            }
+                            *finished = true;
+                            if let Some(g) = guard {
+                                g.finish();
+                            }
+                            Poll::Ready(Some(Ok(Frame::trailers(original))))
+                        }
+                        Err(data) => Poll::Ready(Some(Ok(data))),
+                    },
+                    Poll::Ready(None) => {
+                        *finished = true;
+                        if let Some(g) = guard {
+                            g.finish();
+                        }
+                        Poll::Ready(trailers.take().map(|h| Ok(Frame::trailers(h))))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        *finished = true;
+                        if let Some(g) = guard {
+                            g.finish();
+                        }
+                        Poll::Ready(Some(Err(e)))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
             KindProj::Static { inner } => inner
                 .poll_frame(cx)
                 .map(|frame| frame.map(|r| r.map_err(|e| match e {}))),
@@ -182,6 +247,7 @@ impl HttpBody for Body {
     }
     fn is_end_stream(&self) -> bool {
         match &self.inner {
+            Kind::Trailers { finished, .. } => *finished,
             Kind::Static { inner } | Kind::Buffered { inner, .. } => inner.is_end_stream(),
             Kind::Incoming { inner } => inner.is_end_stream(),
             Kind::Stream { inner, prefix, .. } => prefix.is_none() && inner.is_end_stream(),
@@ -189,6 +255,7 @@ impl HttpBody for Body {
     }
     fn size_hint(&self) -> SizeHint {
         match &self.inner {
+            Kind::Trailers { .. } => SizeHint::default(),
             Kind::Static { inner } | Kind::Buffered { inner, .. } => inner.size_hint(),
             Kind::Incoming { inner } => inner.size_hint(),
             Kind::Stream { inner, prefix, .. } => {

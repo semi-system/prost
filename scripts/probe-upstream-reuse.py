@@ -4,12 +4,16 @@ Uses the benchmark backend's stub_status; does not change application code.
 Requires the release benchmark image and ApacheBench in WSL.
 """
 import http.client
+import argparse
 import json
 from pathlib import Path
 import runpy
 import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--output",type=Path,default=ROOT / "test-results/comparison/upstream-reuse.json")
+args=parser.parse_args()
 benchmark = runpy.run_path(str(ROOT / "scripts/compare-proxies.py"))
 compose, ready = benchmark["compose"], benchmark["ready"]
 targets = benchmark["TARGETS"]
@@ -58,8 +62,7 @@ try:
             results.append(result)
             print(json.dumps({k: v for k, v in result.items() if k != "raw_ab_output"}), flush=True)
             compose("stop", name)
-    directory = ROOT / "test-results/comparison"
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "upstream-reuse.json").write_text(json.dumps(results, indent=2) + "\n")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(results, indent=2) + "\n")
 finally:
     compose("stop")
