@@ -1,0 +1,31 @@
+[package]
+name = "prost-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
+fs2.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+prometheus.workspace = true
+prost-config = { path = "../config" }
+prost-transport = { path = "../transport" }
+prost-http = { path = "../http" }
+prost-plugin = { path = "../plugin" }
+rustls.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+rcgen = "0.13"
+bytes.workspace = true
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", features = ["sink"] }

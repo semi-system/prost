@@ -1,0 +1,51 @@
+name: prost-benchmark
+services:
+  backend:
+    image: nginx:stable-bookworm
+    container_name: prost-bench-backend
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ./backend.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18090:8080"
+  prost-debug:
+    image: prost:mvp
+    container_name: prost-bench-debug
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ./prost.toml:/etc/prost/seed.toml:ro
+    ports:
+      - "127.0.0.1:18080:8080"
+  prost-release:
+    image: prost:bench-release
+    container_name: prost-bench-release
+    cpus: 2
+    mem_limit: 256m
+    environment:
+      TOKIO_WORKER_THREADS: 2
+    volumes:
+      - ./prost.toml:/etc/prost/seed.toml:ro
+    ports:
+      - "127.0.0.1:18083:8080"
+  nginx:
+    image: nginx:stable-bookworm
+    container_name: prost-bench-nginx
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:18081:8080"
+  apache:
+    image: httpd:2.4-bookworm
+    container_name: prost-bench-apache
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ./httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+    ports:
+      - "127.0.0.1:18082:8080"

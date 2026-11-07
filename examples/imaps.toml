@@ -1,0 +1,23 @@
+schema_version = 1
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+
+[upstreams.mail]
+[[upstreams.mail.endpoints]]
+id = "mail-1"
+address = "mail.internal:143"
+
+[[listeners]]
+id = "imaps"
+address = "0.0.0.0:993"
+protocol = "tcp"
+upstream = "mail"
+[listeners.tls]
+certificate = "/etc/prost/certs/mail.crt"
+private_key = "/etc/prost/certs/mail.key"
+
+# To encrypt upstream separately, use its TLS port and add:
+# [upstreams.mail.tls]
+# server_name = "mail.internal"
+# ca_certificate = "/etc/prost/certs/internal-ca.crt"

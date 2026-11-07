@@ -1,0 +1,25 @@
+name: MVP
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build developer image
+        run: docker build -f Dockerfile.dev -t prost-dev .
+      - name: Format
+        run: sh scripts/docker-dev.sh cargo fmt --all -- --check
+      - name: Clippy
+        run: sh scripts/docker-dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: sh scripts/docker-dev.sh cargo test --workspace --locked
+      - name: Demo
+        run: |
+          docker compose up -d --build
+          python3 scripts/smoke.py
+      - name: Logs
+        if: failure()
+        run: docker compose logs
+      - name: Stop demo
+        if: always()
+        run: docker compose down

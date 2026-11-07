@@ -1,0 +1,32 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "green"
+address = "green:8080"
+
+[upstreams.echo]
+[[upstreams.echo.endpoints]]
+id = "green"
+address = "green:9000"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+
+[[listeners.plugins]]
+name = "connection_limit"
+config = { max_connections = 1000 }
+
+[[listeners]]
+id = "echo"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "echo"

@@ -1,0 +1,14 @@
+[package]
+name = "prost-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+prost-config = { path = "../config" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true

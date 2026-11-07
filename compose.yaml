@@ -1,0 +1,30 @@
+services:
+  prost:
+    image: prost:mvp
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - prost-state:/var/lib/prost
+      - ./examples:/examples:ro
+    depends_on:
+      - blue
+      - green
+    stop_grace_period: 35s
+  blue:
+    image: python:3.13-alpine
+    environment:
+      LABEL: blue
+    command: ["python", "/app/backend.py"]
+    volumes:
+      - ./examples/backend.py:/app/backend.py:ro
+  green:
+    image: python:3.13-alpine
+    environment:
+      LABEL: green
+    command: ["python", "/app/backend.py"]
+    volumes:
+      - ./examples/backend.py:/app/backend.py:ro
+volumes:
+  prost-state:
