@@ -28,20 +28,33 @@ CASES = {
     # route, frontend protocol, requests, connections, streams/connection, body bytes
     "h1_1m": ("/bytes/1048576", "h1", 2000, 32, 1, 1048576),
     "tls_h1_64k": ("/bytes/65536", "tls-h1", 10000, 100, 1, 65536),
-    "h2_64k": ("/bytes/65536", "h2", 20000, 8, 16, 65536),
-    "double_tls_h2_64k": ("/bytes/65536", "double-tls", 10000, 8, 16, 65536),
-    "h2_upload_1m": ("/upload", "h2", 1000, 8, 8, 72),
-    "h2_stream_256k": ("/stream", "h2", 1000, 8, 8, 262144),
-    "grpc_stream": ("/grpc", "h2", 2000, 8, 8, 262224),
-    "route1000_64k": ("/route/0999/item", "h2", 10000, 8, 16, 65536),
+    "h2_64k": ("/bytes/65536", "h2", 20000, 32, 4, 65536),
+    "double_tls_h2_64k": ("/bytes/65536", "double-tls", 10000, 32, 4, 65536),
+    "h2_upload_1m": ("/upload", "h2", 1000, 16, 4, 72),
+    "h2_stream_256k": ("/stream", "h2", 1000, 16, 4, 262144),
+    "grpc_stream": ("/grpc", "h2", 2000, 16, 4, 262224),
+    "route1000_64k": ("/route/0999/item", "h2", 10000, 32, 4, 65536),
     "wasm_header_64k": ("/wasm", "h2", 10000, 4, 4, 65536),
-    "native_header_64k": ("/native", "h2", 10000, 4, 4, 65536),
+    "native_header_64k": ("/native", "h2", 10000, 32, 4, 65536),
     "wasm_header_34": ("/wasm-small", "h2", 20000, 4, 4, 34),
-    "native_header_34": ("/native-small", "h2", 20000, 4, 4, 34),
-    "native_chain_34": ("/chain-small", "h2", 20000, 4, 4, 34),
-    "native_full_34": ("/full-small", "h2", 20000, 4, 4, 34),
-    "native_trailer_64k": ("/native-trailer", "h2", 10000, 4, 4, 65536),
+    "native_header_34": ("/native-small", "h2", 20000, 32, 4, 34),
+    "native_chain_34": ("/chain-small", "h2", 20000, 32, 4, 34),
+    "native_full_34": ("/full-small", "h2", 20000, 32, 4, 34),
+    "native_trailer_64k": ("/native-trailer", "h2", 10000, 32, 4, 65536),
+    "native_map_34": ("/map-small", "h2", 20000, 32, 4, 34),
+    "native_map_regex_34": ("/map-regex-small", "h2", 20000, 32, 4, 34),
+    "native_keyed_rate_34": ("/keyed-small", "h2", 20000, 32, 4, 34),
 }
+
+
+def case_headers(case):
+    if case == "native_map_34":
+        return ["origin: https://app.example"]
+    if case == "native_map_regex_34":
+        return ["origin: https://tenant.example"]
+    if case == "native_keyed_rate_34":
+        return ["x-api-key: benchmark"]
+    return []
 
 
 def run(*args, **kwargs):
@@ -63,18 +76,29 @@ def url_for(target, case):
     return f"{'http' if protocol == 'h1' else 'https'}://127.0.0.1:{plain if protocol == 'h1' else double if protocol == 'double-tls' else tls}{path}"
 
 
-def curl(target, case):
+def curl(target, case, headers_file=None):
     command = ["curl", "--silent", "--show-error", "--fail", "--max-time", "30", "--cacert", str(FIXTURES / "certs/cert.pem"),
                "--http1.1" if CASES[case][1] in ("h1", "tls-h1") else "--http2"]
     if case == "grpc_stream":
         command += ["-H", "content-type: application/grpc", "-H", "te: trailers", "--data-binary", f"@{GRPC_REQUEST}"]
     if case == "h2_upload_1m":
         command += ["--data-binary", f"@{FIXTURES / 'upload.bin'}"]
+    if headers_file:
+        command += ["-D",str(headers_file)]
+    for header in case_headers(case):
+        command += ["-H", header]
     return run(*command, url_for(target, case), capture_output=True).stdout
 
 
 def preflight(target, case):
-    data = curl(target, case)
+    with tempfile.TemporaryDirectory(prefix="prost-protocol-check-") as temp:
+        header_path=Path(temp)/"headers.txt"
+        data = curl(target, case,header_path)
+        headers=header_path.read_bytes().lower()
+    if target!="backend":
+        expected=b"http/2.0" if case=="grpc_stream" else b"http/1.1"
+        if b"x-upstream-http-version: "+expected not in headers:
+            raise RuntimeError(f"{target}/{case}: unexpected backend protocol: {headers!r}")
     size = CASES[case][-1]
     if len(data) != size:
         raise RuntimeError(f"{target}/{case}: body size {len(data)} != {size}")
@@ -93,6 +117,11 @@ def preflight(target, case):
         expected = (b"0123456789abcdef" * math.ceil(size / 16))[:size]
     if data != expected:
         raise RuntimeError(f"{target}/{case}: byte integrity failed")
+    if case.startswith("native_map_") and target != "backend":
+        origin = case_headers(case)[0].split(": ", 1)[1].encode()
+        if any(field not in headers for field in [b"access-control-allow-origin: " + origin,
+                   b"x-seen-origin: " + origin, b"cache-control: max-age=3600"]):
+            raise RuntimeError(f"{target}/{case}: map/filter/expiry failed: {headers!r}")
     if case.startswith(("wasm_header", "native_header", "native_chain", "native_full", "native_trailer")) and target != "backend":
         dump = run("curl", "--silent", "--show-error", "--fail", "--http2", "--cacert", str(FIXTURES / "certs/cert.pem"),
                    "-D", "-", "-o", "/dev/null", url_for(target, case), capture_output=True).stdout.lower()
@@ -102,7 +131,7 @@ def preflight(target, case):
             raise RuntimeError(f"{target}: native trailer missing")
         if case == "native_full_34":
             ids = re.findall(rb"x-request-id: ([0-9a-f]{32})", dump)
-            if len(ids) != 1 or b"x-seen-id: " + ids[0] not in dump or b"cache-control: max-age=3600" not in dump or b"x-status: 200" not in dump:
+            if len(ids) != 1 or b"x-seen-id: " + ids[0] not in dump or b"cache-control: max-age=3600" not in dump or b"x-status: 200" not in dump or b"x-client-agent: curl/" not in dump or b"x-content-type: application/octet-stream" not in dump:
                 raise RuntimeError(f"{target}: dynamic headers/expiry failed: {dump!r}")
 
 
@@ -118,6 +147,8 @@ def command(target, case, count, logfile=None):
         args += ["-H", "content-type: application/grpc", "-H", "te: trailers", "-d", str(GRPC_REQUEST)]
     if logfile:
         args += [f"--log-file={logfile}"]
+    for header in case_headers(case):
+        args += ["-H", header]
     return args + [url_for(target, case)]
 
 
@@ -213,11 +244,15 @@ def main():
     global UPLOAD, GRPC_REQUEST
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--cases", nargs="+", choices=CASES)
     parser.add_argument("--scale", type=float, default=1)
-    parser.add_argument("--prost-config", choices=["prost.toml","prost-native.toml"], default="prost.toml")
+    parser.add_argument("--prost-config", choices=["prost.toml","prost-native.toml"], default="prost-native.toml")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "test-results/advanced")
     args = parser.parse_args()
+    if args.cases is None:
+        args.cases=[name for name in CASES if args.prost_config!="prost-native.toml" or not name.startswith("wasm_")]
+    if args.prost_config=="prost-native.toml" and any(name.startswith("wasm_") for name in args.cases):
+        parser.error("WASM cases need --prost-config prost.toml and a WASM-enabled image")
     os.environ["PROST_ADVANCED_CONFIG"] = args.prost_config
     if args.rounds < 1 or args.scale <= 0:
         parser.error("rounds and scale must be positive")
@@ -239,7 +274,7 @@ def main():
     for path in [ROOT/"Cargo.toml", ROOT/"Cargo.lock"] + sorted((ROOT/"crates").rglob("*.rs")) + sorted((ROOT/"crates").rglob("Cargo.toml")):
         source.update(str(path.relative_to(ROOT)).encode())
         source.update(path.read_bytes())
-    metadata = {"kernel": platform.release(), "source_sha256":source.hexdigest(),
+    metadata = {"kernel": platform.release(), "source_sha256":source.hexdigest(), "versions":{},
                 "cpu":next((line.split(":",1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), "unknown"),
                 "h2load": run("h2load", "--version", capture_output=True, text=True).stdout.strip(),
                 "rounds": args.rounds, "cases": {k:CASES[k] for k in args.cases}, "scale": args.scale,
@@ -257,6 +292,9 @@ def main():
             for target in targets:
                 compose("up", "-d", "--no-deps", "--force-recreate", "--renew-anon-volumes", target)
                 ready(target)
+                if target not in metadata["versions"]:
+                    version = ["nginx","-v"] if target=="nginx" else ["prost","--version"]
+                    metadata["versions"][target]=run("docker","exec",container_name(target),*version,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True).stdout.strip()
                 cases = args.cases[round_number % len(args.cases):]+args.cases[:round_number % len(args.cases)]
                 for case in cases:
                     results.append(measure(target, case, output / f"{case}-{target}-round-{round_number+1}.json", args.scale))

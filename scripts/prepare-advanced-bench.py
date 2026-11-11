@@ -38,6 +38,7 @@ for name, port, tls, h2 in [("plain", 8080, False, False), ("secure", 8443, True
 [upstreams.{name}]
 http2 = {str(h2).lower()}
 pool_max_idle_per_host = 128
+http1_max_buf_size = 65536
 health_interval_ms = 5000
 [upstreams.{name}.health_check]
 path = "/ready"
@@ -87,6 +88,20 @@ upstream = "plain"
 [[listeners.routes.plugins]]
 name = "headers"
 config = { response = { set = { x-prost-plugin = "wasm" } }, trailers = [ {name="x-end",value="done",always=true} ] }
+[[listeners.routes]]
+path_prefix = "/map"
+priority = 200
+upstream = "plain"
+[[listeners.routes.plugins]]
+name = "headers"
+config = { maps = { matched_origin = { source = "$http_origin", default = "", entries = [{ pattern = "https://app.example", value = "$http_origin" }, { kind = "regex", pattern = '^https://[a-z]+[.]example$', value = "$http_origin" }] }, map_ttl = { source = "$matched_origin", default = "1h", entries = [{ pattern = "", value = "off" }] } }, request = { set = { x-test-plugin = "$matched_origin" } }, response = { add = [{ name = "access-control-allow-origin", value = "$matched_origin", always = true, when = { source = "$matched_origin", not_empty = true } }, { name = "x-seen-origin", value = "$upstream_http_x_seen_plugin" }] }, expires = "$map_ttl" }
+[[listeners.routes]]
+path_prefix = "/keyed"
+priority = 200
+upstream = "plain"
+[[listeners.routes.plugins]]
+name = "rate_limit"
+config = { requests_per_second = 1000000, burst = 1000000, key = "$http_x_api_key", max_keys = 4096, idle_timeout_ms = 60000 }
 '''
         for i in range(1000):
             prost += f'[[listeners.routes]]\npath_prefix = "/route/{i:04d}/"\nupstream = "plain"\n'
@@ -108,8 +123,16 @@ http {
   http2_max_concurrent_streams 128;
   http2_body_preread_size 1m;
   limit_req_zone benchmark zone=bench_rate:1m rate=1000000r/s;
+  limit_req_zone $http_x_api_key zone=keyed_rate:1m rate=1000000r/s;
+  map $http_origin $matched_origin {
+    default "";
+    "https://app.example" $http_origin;
+    ~^https://[a-z]+[.]example$ $http_origin;
+  }
+  map $matched_origin $map_ttl { default 1h; "" off; }
   upstream plain { server backend:8080; keepalive 64; keepalive_requests 100000; keepalive_timeout 30s; }
   upstream secure { server backend:8443; keepalive 64; keepalive_requests 100000; keepalive_timeout 30s; }
+  upstream rpc { server backend:8443; keepalive 64; keepalive_requests 100000; keepalive_timeout 30s; }
   ssl_certificate /certs/cert.pem;
   ssl_certificate_key /certs/key.pem;
   ssl_protocols TLSv1.2 TLSv1.3;
@@ -131,7 +154,7 @@ http {
     http2 on;
     location / { proxy_pass http://plain; }
     location /grpc {
-      grpc_pass grpcs://backend:8443;
+      grpc_pass grpcs://rpc;
       grpc_ssl_verify on;
       grpc_ssl_trusted_certificate /certs/cert.pem;
       grpc_ssl_server_name on;
@@ -157,6 +180,18 @@ http {
       proxy_pass http://plain;
     }
     location /native-trailer { add_header x-prost-plugin wasm always; add_trailer x-end done always; proxy_pass http://plain; }
+    location /map {
+      proxy_set_header Connection "";
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header x-test-plugin $matched_origin;
+      add_header access-control-allow-origin $matched_origin always;
+      add_header x-seen-origin $upstream_http_x_seen_plugin;
+      expires $map_ttl;
+      proxy_pass http://plain;
+    }
+    location /keyed { limit_req zone=keyed_rate burst=999999 nodelay; limit_req_status 429; proxy_pass http://plain; }
 '''
 for i in range(1000):
     nginx += f'    location /route/{i:04d}/ {{ proxy_pass http://plain; }}\n'

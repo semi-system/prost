@@ -3,6 +3,9 @@ name = "prost-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+[features]
+default = []
+wasm = ["prost-core/wasm"]
 [[bin]]
 name = "prost"
 path = "src/prost.rs"

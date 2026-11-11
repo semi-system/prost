@@ -10,6 +10,7 @@ use prost_config::Plugin;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+#[cfg(feature = "wasm")]
 use wasmtime::{Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,7 +36,9 @@ pub trait NativePlugin: Send + Sync {
     fn on_event(&self, event: &Event) -> Result<Action>;
 }
 pub struct PluginRegistry {
+    #[cfg(feature = "wasm")]
     engine: once_cell::sync::OnceCell<Engine>,
+    #[cfg(feature = "wasm")]
     capacity: Arc<Semaphore>,
     native: BTreeMap<String, Arc<dyn NativePlugin>>,
     filters: BTreeMap<String, Arc<dyn NativeFilter>>,
@@ -43,12 +46,15 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            #[cfg(feature = "wasm")]
             engine: once_cell::sync::OnceCell::new(),
+            #[cfg(feature = "wasm")]
             capacity: Arc::new(Semaphore::new(32)),
             native: BTreeMap::new(),
             filters: BTreeMap::new(),
         })
     }
+    #[cfg(feature = "wasm")]
     pub fn engine(&self) -> Result<&Engine> {
         self.engine.get_or_try_init(|| {
             let mut config = wasmtime::Config::new();
@@ -107,25 +113,32 @@ impl PluginRegistry {
             return Ok(PreparedPlugin::Fast(filter.clone()));
         }
         ensure!(p.name == "wasm", "unknown plugin {}", p.name);
-        let engine = self.engine()?;
-        let module = Module::from_file(engine, p.module.as_ref().context("module required")?)?;
-        let config = serde_json::to_value(&p.config)?;
-        let prepared = Wasm {
-            engine: engine.clone(),
-            module,
-            config,
-            capacity: self.capacity.clone(),
-        };
-        // Instantiate and verify ABI without allowing any host imports or WASI.
-        prepared.check()?;
-        Ok(PreparedPlugin::Wasm(Arc::new(prepared)))
+        #[cfg(not(feature = "wasm"))]
+        bail!("WASM support is not enabled; rebuild with --features prost-cli/wasm");
+        #[cfg(feature = "wasm")]
+        {
+            let engine = self.engine()?;
+            let module = Module::from_file(engine, p.module.as_ref().context("module required")?)?;
+            let config = serde_json::to_value(&p.config)?;
+            let prepared = Wasm {
+                engine: engine.clone(),
+                module,
+                config,
+                capacity: self.capacity.clone(),
+            };
+            // Instantiate and verify ABI without allowing any host imports or WASI.
+            prepared.check()?;
+            Ok(PreparedPlugin::Wasm(Arc::new(prepared)))
+        }
     }
 }
+#[derive(Clone)]
 pub enum PreparedPlugin {
     Fast(Arc<dyn NativeFilter>),
     Filtered(Arc<PreparedPlugin>, u8),
     Limit(Arc<Semaphore>),
     Native(Arc<dyn NativePlugin>),
+    #[cfg(feature = "wasm")]
     Wasm(Arc<Wasm>),
 }
 fn hook_bit(hook: &str) -> u8 {
@@ -284,6 +297,7 @@ impl PreparedPlugin {
             Self::Filtered(_, _) => unreachable!("filters unwrapped"),
             Self::Limit(_) | Self::Fast(_) => Ok(Action::default()),
             Self::Native(p) => p.on_event(event),
+            #[cfg(feature = "wasm")]
             Self::Wasm(w) => {
                 let permit = w
                     .capacity
@@ -302,12 +316,14 @@ impl PreparedPlugin {
         }
     }
 }
+#[cfg(feature = "wasm")]
 pub struct Wasm {
     engine: Engine,
     module: Module,
     config: serde_json::Value,
     capacity: Arc<Semaphore>,
 }
+#[cfg(feature = "wasm")]
 impl Wasm {
     fn instantiate(&self) -> Result<(Store<StoreLimits>, Instance)> {
         let limits = StoreLimitsBuilder::new()

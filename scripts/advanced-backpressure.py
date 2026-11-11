@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import runpy
 import ssl
@@ -136,8 +137,10 @@ def main():
     parser.add_argument("--clients", type=int, default=32)
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--no-updates", action="store_true", help="same slow-reader workload for both proxies")
+    parser.add_argument("--prost-config",choices=["prost.toml","prost-native.toml"],default="prost-native.toml")
     parser.add_argument("--output", type=Path, default=ROOT/"test-results/advanced-backpressure.json")
     args = parser.parse_args()
+    os.environ["PROST_ADVANCED_CONFIG"]=args.prost_config
     if not (1 <= args.clients <= 128 and 2 <= args.seconds <= 300):
         parser.error("clients must be 1..128 and seconds 2..300")
     results = []

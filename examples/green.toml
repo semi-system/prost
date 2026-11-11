@@ -25,6 +25,10 @@ upstream = "web"
 name = "connection_limit"
 config = { max_connections = 1000 }
 
+[[listeners.plugins]]
+name = "headers"
+config = { response = { set = { x-proxy = "prost" } } }
+
 [[listeners]]
 id = "echo"
 address = "0.0.0.0:9000"

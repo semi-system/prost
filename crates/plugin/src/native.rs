@@ -3,11 +3,7 @@ use anyhow::{ensure, Result};
 use http::HeaderMap;
 use ipnet::IpNet;
 use serde::Deserialize;
-use std::{
-    net::IpAddr,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::net::IpAddr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FilterHook {
@@ -118,101 +114,5 @@ impl NativeFilter for IpAccess {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RateConfig {
-    requests_per_second: u64,
-    burst: u64,
-}
-pub(crate) struct RateLimit {
-    started: Instant,
-    next: AtomicU64,
-    spacing: u64,
-    allowance: u64,
-}
-impl RateLimit {
-    pub fn new(value: serde_json::Value) -> Result<Self> {
-        let config: RateConfig = serde_json::from_value(value)?;
-        ensure!(
-            (1..=1_000_000).contains(&config.requests_per_second)
-                && (1..=1_000_000).contains(&config.burst),
-            "invalid rate limit"
-        );
-        let spacing = 1_000_000_000u64.div_ceil(config.requests_per_second);
-        Ok(Self {
-            started: Instant::now(),
-            next: AtomicU64::new(0),
-            spacing,
-            allowance: spacing * (config.burst - 1),
-        })
-    }
-    fn admit(&self, now: u64) -> Option<u64> {
-        let mut previous = self.next.load(Ordering::Relaxed);
-        loop {
-            let available = now.saturating_add(self.allowance);
-            if previous > available {
-                return Some((previous - available).div_ceil(1_000_000_000).max(1));
-            }
-            let next = previous.max(now).saturating_add(self.spacing);
-            match self.next.compare_exchange_weak(
-                previous,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return None,
-                Err(actual) => previous = actual,
-            }
-        }
-    }
-}
-impl NativeFilter for RateLimit {
-    fn applies_to(&self, hook: FilterHook) -> bool {
-        hook == FilterHook::RequestHeaders
-    }
-    fn filter(
-        &self,
-        _: FilterHook,
-        _: IpAddr,
-        _: Option<&mut HeaderMap>,
-    ) -> Result<FilterDecision> {
-        Ok(
-            match self.admit(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64) {
-                None => FilterDecision::Continue,
-                Some(seconds) => FilterDecision::Reject {
-                    status: 429,
-                    retry_after: Some(seconds),
-                },
-            },
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn gcra_burst_refill_and_shared_budget() -> Result<()> {
-        let rate = std::sync::Arc::new(RateLimit::new(
-            serde_json::json!({"requests_per_second":10,"burst":4}),
-        )?);
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let rate = rate.clone();
-                std::thread::spawn(move || rate.admit(0).is_none())
-            })
-            .collect();
-        assert_eq!(
-            threads
-                .into_iter()
-                .filter_map(|t| t.join().ok())
-                .filter(|ok| *ok)
-                .count(),
-            4
-        );
-        assert!(rate.admit(99_999_999).is_some());
-        assert!(rate.admit(100_000_000).is_none());
-        assert!(rate.admit(100_000_000).is_some());
-        Ok(())
-    }
-}
+mod rate;
+pub(crate) use rate::RateLimit;

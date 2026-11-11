@@ -3,6 +3,9 @@ name = "prost-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+[features]
+default = []
+wasm = ["prost-plugin/wasm"]
 [dependencies]
 anyhow.workspace = true
 arc-swap.workspace = true

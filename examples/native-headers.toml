@@ -1,0 +1,44 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "blue"
+address = "blue:8080"
+
+[upstreams.echo]
+[[upstreams.echo.endpoints]]
+id = "blue"
+address = "blue:9000"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+
+[[listeners.plugins]]
+name = "connection_limit"
+config = { max_connections = 1000 }
+
+[[listeners.plugins]]
+name = "headers"
+config = { request = { set = { x-request-id = "$request_id" }, remove = ["x-debug"] }, response = { remove = ["server", "x-powered-by"], add = [{name = "x-proxy", value = "prost", always = true}, {name = "x-request-id", value = "$request_id", always = true}, {name = "x-status", value = "$status", always = true}] }, expires = "off", trailers = [{name = "x-proxy-end", value = "$status", always = true}] }
+
+[[listeners.routes]]
+path_prefix = "/assets/"
+upstream = "web"
+
+[[listeners.routes.plugins]]
+name = "headers"
+config = { inherit = "merge", trailer_inherit = "merge", expires = "modified +1h", response = { append = { vary = ["Origin"] } } }
+
+[[listeners]]
+id = "echo"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "echo"

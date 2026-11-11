@@ -1,0 +1,40 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "blue"
+address = "blue:8080"
+
+[upstreams.echo]
+[[upstreams.echo.endpoints]]
+id = "blue"
+address = "blue:9000"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+
+[[listeners.plugins]]
+name = "rate_limit"
+config = { requests_per_second = 1, burst = 2, key = "$http_x_api_key", max_keys = 4096, idle_timeout_ms = 60000 }
+
+[[listeners.plugins]]
+name = "headers"
+[listeners.plugins.config]
+maps = { allowed_origin = { source = "$http_origin", default = "", entries = [{ pattern = "https://app.example", value = "$http_origin" }, { kind = "regex", pattern = '^https://[a-z]+\.example$', value = "$http_origin" }] }, ttl = { source = "$allowed_origin", default = "off", entries = [{ kind = "prefix", pattern = "https://", value = "1h" }] } }
+request = { set = { x-request-id = "$request_id" } }
+response = { add = [{ name = "x-proxy", value = "prost", always = true }, { name = "access-control-allow-origin", value = "$allowed_origin", always = true, when = { source = "$allowed_origin", not_empty = true } }, { name = "vary", value = "Origin", always = true }], rules = [{ action = "set", name = "x-policy", value = "trusted-origin", when = { source = "$allowed_origin", not_empty = true } }, { action = "remove", name = "x-powered-by", when = { source = "$status", matches = "^[45]" } }] }
+expires = "$ttl"
+
+[[listeners]]
+id = "echo"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "echo"

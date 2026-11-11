@@ -19,6 +19,7 @@ var block = []byte(strings.Repeat("0123456789abcdef", 1024))
 var uploadHash = sha256.Sum256(bytes.Repeat(block, 64))
 
 func serve(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("x-upstream-http-version", r.Proto)
     if value := r.Header.Get("x-test-plugin"); value != "" { w.Header().Set("x-seen-plugin", value) }
     if r.URL.Path == "/ready" { w.Write([]byte("ready")); return }
     if r.URL.Path == "/upload" {

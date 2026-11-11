@@ -1,5 +1,60 @@
 # HTTP proxy comparison
 
+Heavy native workloads use the separate project in `advanced/`:
+
+```sh
+sudo docker build -t prost:native .
+sudo docker tag prost:native prost:advanced-release
+sudo python3 scripts/prepare-advanced-bench.py
+sudo docker compose -f benchmarks/advanced/compose.yaml build backend
+sudo python3 scripts/advanced-bench.py --rounds 3 \
+  --output-dir test-results/native-heavy
+sudo python3 scripts/advanced-backpressure.py --no-updates \
+  --output test-results/native-slow-readers.json
+sudo python3 scripts/advanced-backpressure.py \
+  --output test-results/native-live-updates.json
+```
+
+Requires `nghttp2-client`, `curl`, and `openssl` in WSL. The default is a native
+config and excludes WASM cases. HTTP/2 uses 32 connections × 4 streams for most
+cases (128 in flight); uploads and delayed streams use 16 × 4. Both proxies get
+the same client settings, 2-CPU quota, 256 MiB, pool 128, TLS certificate and
+backend. Prost's upstream HTTP/1 buffer is capped at 64 KiB. nginx uses
+reuseport, 64 KiB streaming buffers, 1 MiB body preread, and separate keep-alive
+pools for HTTP, HTTPS and gRPC;
+request/response buffering and response cache are off. Request logs and upload
+payloads are kept on Linux while measuring, then reports are copied to the repo.
+
+The suite validates byte integrity, upload hashes, dynamic header values,
+expires, and native/gRPC trailers before load. Every measured request must have
+the expected upstream HTTP version (asserted in preflight),
+status 200 and the expected total body bytes; failures are preserved. Cgroup
+metrics include all proxy processes/threads. Reports include image IDs, config
+hashes, source hash, raw request timings, direct-backend controls and samples.
+
+For an explicitly enabled WASM image, pass `--prost-config prost.toml` and select
+WASM cases. Those cases have a lower concurrency to respect the instance budget;
+do not present their throughput as an identical-concurrency native comparison.
+
+Focused native-policy comparison (same setup, 360,000 measured requests per
+proxy with the defaults below):
+
+```sh
+sudo python3 scripts/advanced-bench.py --rounds 3 \
+  --cases native_header_34 native_full_34 native_chain_34 native_map_34 native_map_regex_34 native_keyed_rate_34 \
+  --output-dir test-results/native-policies-final
+```
+
+Map cases forward a nonempty Origin header, use exact or regex matching, rewrite
+an upstream request header, check the echoed value, add the allowed origin and
+set dynamic expires. nginx uses its native map/headers modules for the same
+result. The keyed-limit case uses one nonempty hot API key shared by all 128
+in-flight requests at a very high rate/burst; it measures admission overhead,
+not key-cardinality capacity or rejection throughput. nginx uses limit_req with
+nodelay; no request is intentionally delayed or rejected by either proxy.
+Key isolation, rejection, bounded capacity and idle cleanup are functional tests.
+Saved measurements and limits: [native-policies-benchmark.md](../docs/native-policies-benchmark.md).
+
 This isolated Compose project compares the current Prost debug and release
 binaries with the official nginx and Apache HTTP Server (httpd/Apache2) images.
 It does not replace or edit the normal demo's managed config.

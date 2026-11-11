@@ -34,6 +34,9 @@ fn idle_pool() -> usize {
 fn pool_timeout_ms() -> u64 {
     30_000
 }
+fn http1_buffer() -> usize {
+    64 * 1024
+}
 fn socket() -> PathBuf {
     "/run/prost/admin.sock".into()
 }
@@ -98,6 +101,8 @@ pub struct Upstream {
     pub pool_max_idle_per_host: usize,
     #[serde(default = "pool_timeout_ms")]
     pub pool_idle_timeout_ms: u64,
+    #[serde(default = "http1_buffer")]
+    pub http1_max_buf_size: usize,
     #[serde(default)]
     pub health_check: HealthCheck,
     #[serde(default)]
@@ -224,7 +229,7 @@ pub struct Route {
 fn root() -> String {
     "/".into()
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plugin {
     pub name: String,
@@ -281,6 +286,10 @@ impl Config {
             ensure!(
                 u.pool_max_idle_per_host <= 4096 && u.pool_idle_timeout_ms > 0,
                 "invalid upstream pool limits"
+            );
+            ensure!(
+                (8192..=1024 * 1024).contains(&u.http1_max_buf_size),
+                "HTTP/1 upstream buffer must be 8192..1048576 bytes"
             );
             u.http2_settings.validate()?;
             let h = &u.health_check;

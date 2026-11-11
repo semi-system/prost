@@ -27,6 +27,78 @@ struct Server {
     task: JoinHandle<()>,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_pool_connections_close_without_another_request() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let signal = closed.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((io, _)) = listener.accept().await {
+            let closed = signal.clone();
+            tokio::spawn(async move {
+                let served = Arc::new(AtomicBool::new(false));
+                let request_seen = served.clone();
+                let service = service_fn(move |_: Request<Incoming>| {
+                    request_seen.store(true, Ordering::Relaxed);
+                    async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"idle"))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(io), service)
+                    .await;
+                if served.load(Ordering::Relaxed) {
+                    closed.notify_one();
+                }
+            });
+        }
+    });
+    let _server = Server { address, task };
+    let mut fixture = Fixture::new(Protocol::Http, address);
+    let upstream = fixture.config.upstreams.get_mut("main").unwrap();
+    upstream.pool_idle_timeout_ms = 50;
+    upstream.health_interval_ms = 60000;
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/")
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))?,
+        )
+        .await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "idle");
+    timeout(Duration::from_secs(2), closed.notified()).await?;
+    assert_eq!(p.metrics.requests.get(), 1);
+    let mut invalid = p.snapshot().config.clone();
+    invalid
+        .upstreams
+        .get_mut("main")
+        .unwrap()
+        .http1_max_buf_size = 4096;
+    assert!(p.apply(invalid.encode()?, 0).await.is_err());
+    assert_eq!(p.snapshot().config.generation, 0);
+    let response = client
+        .send_request(
+            Request::builder()
+                .uri("/")
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))?,
+        )
+        .await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "idle");
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
 fn builtin(name: &str, config: serde_json::Value) -> Result<prost_config::Plugin> {
     Ok(serde_json::from_value(
         serde_json::json!({"name":name,"config":config}),
@@ -150,6 +222,7 @@ async fn native_header_inheritance_and_always_on_local_rejections() -> Result<()
                 Request::builder()
                     .uri(path)
                     .header("host", "localhost")
+                    .header("te", "trailers")
                     .body(Full::new(Bytes::new()))?,
             )
             .await?;
@@ -189,7 +262,7 @@ async fn native_header_inheritance_and_always_on_local_rejections() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_headers_hot_update_and_wasm_ordering() -> Result<()> {
+async fn native_headers_hot_update_and_plugin_ordering() -> Result<()> {
     let backend = http_server("native").await;
     let mut fixture = Fixture::new(Protocol::Http, backend.address);
     let headers = builtin(
@@ -221,15 +294,18 @@ async fn native_headers_hot_update_and_wasm_ordering() -> Result<()> {
         assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
         assert_eq!(response.into_body().collect().await?.to_bytes(), "native");
         if expected == "before" {
-            let wasm = fixture.dir.path().join("headers.wat");
-            std::fs::write(&wasm, include_str!("../../../examples/add-header.wat"))?;
             let mut config = p.snapshot().config.clone();
-            config.listeners[0].plugins.push(prost_config::Plugin {
-                name: "wasm".into(),
-                module: Some(wasm),
-                hooks: Some(vec!["response_headers".into()]),
-                config: Default::default(),
-            });
+            #[cfg(feature = "wasm")]
+            {
+                let wasm = fixture.dir.path().join("headers.wat");
+                std::fs::write(&wasm, include_str!("../../../examples/add-header.wat"))?;
+                config.listeners[0].plugins.push(prost_config::Plugin {
+                    name: "wasm".into(),
+                    module: Some(wasm),
+                    hooks: Some(vec!["response_headers".into()]),
+                    config: Default::default(),
+                });
+            }
             config.listeners[0].plugins.push(builtin(
                 "headers",
                 serde_json::json!({"response":{"set":{"x-prost-plugin":"after"}}}),
@@ -249,6 +325,27 @@ async fn native_headers_hot_update_and_wasm_ordering() -> Result<()> {
     assert_eq!(p.snapshot().config.generation, 1);
     drop(client);
     driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[cfg(not(feature = "wasm"))]
+#[tokio::test]
+async fn wasm_disabled_rejects_apply_without_changing_generation() -> Result<()> {
+    let backend = http_server("native").await;
+    let fixture = Fixture::new(Protocol::Http, backend.address);
+    let p = fixture.start().await;
+    let module = fixture.dir.path().join("module.wat");
+    std::fs::write(&module, include_str!("../../../examples/add-header.wat"))?;
+    let original = std::fs::read(&fixture.path)?;
+    let mut config = p.snapshot().config.clone();
+    config.listeners[0].plugins.push(serde_json::from_value(
+        serde_json::json!({"name":"wasm","module":module}),
+    )?);
+    let error = p.apply(config.encode()?, 0).await.unwrap_err();
+    assert!(format!("{error:#}").contains("WASM support is not enabled"));
+    assert_eq!(p.snapshot().config.generation, 0);
+    assert_eq!(std::fs::read(&fixture.path)?, original);
     p.shutdown().await;
     Ok(())
 }
@@ -316,6 +413,173 @@ async fn native_acl_http_ignores_spoofed_forwarded_address_and_tcp_closes() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mapped_headers_apply_on_live_h1_h2_and_invalid_update_rolls_back() -> Result<()> {
+    let backend = http_server("mapped").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    let rules = serde_json::json!({
+        "maps": {
+            "policy": {"source":"$http_origin", "default":"", "entries":[
+                {"pattern":"https://app.example", "value":"trusted"},
+                {"pattern":"^https://([a-z]+)\\.example$", "kind":"regex", "value":"tenant-$1"}
+            ]},
+            "ttl": {"source":"$policy", "default":"off", "entries":[
+                {"pattern":"trusted", "value":"1h"}
+            ]}
+        },
+        "request":{"set":{"x-test-plugin":"$policy"}},
+        "response":{
+            "add":[{"name":"x-policy","value":"$policy","always":true,
+                "when":{"source":"$policy","not_empty":true}}],
+            "rules":[{"name":"x-seen","action":"set","value":"$upstream_http_x_seen_plugin",
+                "when":{"source":"$status","equals":"200"}}]
+        },
+        "expires":"$ttl"
+    });
+    fixture.config.listeners[0].plugins = vec![builtin("headers", rules.clone())?];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    for (origin, policy, expiry) in [
+        ("https://app.example", "trusted", true),
+        ("https://bob.example", "tenant-bob", false),
+        ("https://other.invalid", "", false),
+    ] {
+        let response = client
+            .send_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "localhost")
+                    .header("origin", origin)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-seen"], policy);
+        assert_eq!(
+            response.headers().contains_key("x-policy"),
+            !policy.is_empty()
+        );
+        assert_eq!(response.headers().contains_key("expires"), expiry);
+        if expiry {
+            assert_eq!(response.headers()["cache-control"], "max-age=3600");
+        }
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "mapped");
+    }
+    let durable = std::fs::read(&fixture.path)?;
+    let mut invalid = p.snapshot().config.clone();
+    let mut cyclic = rules.clone();
+    cyclic["maps"]["policy"]["source"] = serde_json::json!("$ttl");
+    invalid.listeners[0].plugins[0] = builtin("headers", cyclic)?;
+    assert!(p.apply(invalid.encode()?, 0).await.is_err());
+    assert_eq!(std::fs::read(&fixture.path)?, durable);
+    assert_eq!(p.snapshot().config.generation, 0);
+    let mut bad_regex = rules.clone();
+    bad_regex["maps"]["policy"]["entries"][1]["pattern"] = serde_json::json!("[");
+    invalid.listeners[0].plugins[0] = builtin("headers", bad_regex)?;
+    assert!(p.apply(invalid.encode()?, 0).await.is_err());
+    assert_eq!(std::fs::read(&fixture.path)?, durable);
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut h2, h2conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let h2driver = tokio::spawn(h2conn);
+    let mut next = p.snapshot().config.clone();
+    let mut v2 = rules;
+    v2["maps"]["policy"]["entries"][0]["value"] = serde_json::json!("v2");
+    next.listeners[0].plugins[0] = builtin("headers", v2)?;
+    p.apply(next.encode()?, 0).await?;
+    let request = || {
+        Request::builder()
+            .uri("http://localhost/")
+            .header("origin", "https://app.example")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    for response in [
+        client.send_request(request()).await?,
+        h2.send_request(request()).await?,
+    ] {
+        assert_eq!(response.headers()["x-policy"], "v2");
+        assert_eq!(response.headers()["x-seen"], "v2");
+        assert!(!response.headers().contains_key("expires"));
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "mapped");
+    }
+    drop(client);
+    drop(h2);
+    driver.abort();
+    h2driver.abort();
+    p.shutdown().await;
+    // Committed maps are part of the managed TOML and remain valid at restart.
+    drop(p);
+    let restarted = fixture.start().await;
+    assert_eq!(restarted.snapshot().config.generation, 1);
+    restarted.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_rate_limit_shares_workers_and_survives_neighbor_update() -> Result<()> {
+    let backend = http_server("keyed").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    fixture.config.runtime.io_workers = 2;
+    fixture.config.listeners[0].plugins = vec![
+        builtin(
+            "rate_limit",
+            serde_json::json!({"requests_per_second":1,"burst":1,
+            "key":"$http_x_api_key","max_keys":64,"idle_timeout_ms":60000}),
+        )?,
+        builtin(
+            "headers",
+            serde_json::json!({"response":{"set":{"x-policy":"v1"}}}),
+        )?,
+    ];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    async fn request(address: SocketAddr, key: &str) -> Result<(u16, String)> {
+        let io = TcpStream::connect(address).await?;
+        let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let driver = tokio::spawn(conn);
+        let response = client
+            .send_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "localhost")
+                    .header("x-api-key", key)
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        let status = response.status().as_u16();
+        let policy = response.headers()["x-policy"].to_str()?.to_owned();
+        response.into_body().collect().await?;
+        drop(client);
+        driver.abort();
+        Ok((status, policy))
+    }
+    let concurrent =
+        futures_util::future::join_all((0..16).map(|_| request(fixture.address(), "alice"))).await;
+    let statuses: Vec<_> = concurrent.into_iter().collect::<Result<Vec<_>>>()?;
+    assert_eq!(statuses.iter().filter(|(s, _)| *s == 200).count(), 1);
+    assert_eq!(statuses.iter().filter(|(s, _)| *s == 429).count(), 15);
+    assert_eq!(request(fixture.address(), "bob").await?.0, 200);
+    let mut next = p.snapshot().config.clone();
+    next.listeners[0].plugins[1] = builtin(
+        "headers",
+        serde_json::json!({"response":{"set":{"x-policy":"v2"}}}),
+    )?;
+    p.apply(next.encode()?, 0).await?;
+    assert_eq!(
+        request(fixture.address(), "alice").await?,
+        (429, "v2".into())
+    );
+    assert_eq!(request(fixture.address(), "bob").await?.0, 429);
+    assert_eq!(request(fixture.address(), "carol").await?.0, 200);
+    assert_eq!(p.metrics.errors.get(), 0);
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> {
     let backend = http_server("limited").await;
     let mut fixture = Fixture::new(Protocol::Http, backend.address);
@@ -324,9 +588,13 @@ async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> 
         "rate_limit",
         serde_json::json!({"requests_per_second":1,"burst":1}),
     )?);
+    fixture.config.listeners[0].plugins.push(builtin(
+        "headers",
+        serde_json::json!({"response":{"set":{"x-policy":"v1"}}}),
+    )?);
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
-    async fn request(address: SocketAddr, status: u16) -> Result<()> {
+    async fn request(address: SocketAddr, status: u16) -> Result<String> {
         let io = TcpStream::connect(address).await?;
         let (mut client, connection) =
             hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
@@ -343,10 +611,11 @@ async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> 
         if status == 429 {
             assert_eq!(response.headers()["retry-after"], "1");
         }
+        let policy = response.headers()["x-policy"].to_str()?.to_owned();
         response.into_body().collect().await?;
         drop(client);
         driver.abort();
-        Ok(())
+        Ok(policy)
     }
     request(fixture.address(), 200).await?;
     request(fixture.address(), 429).await?;
@@ -357,6 +626,13 @@ async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> 
         .pool_max_idle_per_host = 32;
     p.apply(next.encode()?, 0).await?;
     request(fixture.address(), 429).await?;
+    let mut next = p.snapshot().config.clone();
+    next.listeners[0].plugins[1] = builtin(
+        "headers",
+        serde_json::json!({"response":{"set":{"x-policy":"v2"}}}),
+    )?;
+    p.apply(next.encode()?, 1).await?;
+    assert_eq!(request(fixture.address(), 429).await?, "v2");
     tokio::time::sleep(Duration::from_millis(1100)).await;
     request(fixture.address(), 200).await?;
     assert_eq!(p.metrics.errors.get(), 0);
@@ -774,6 +1050,10 @@ async fn connection_limit_is_not_reset_by_upstream_update() -> Result<()> {
         hooks: None,
         config: std::collections::BTreeMap::from([("max_connections".into(), 1.into())]),
     }];
+    fixture.config.listeners[0].plugins.push(builtin(
+        "ip_acl",
+        serde_json::json!({"deny":["192.0.2.0/24"]}),
+    )?);
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let mut old = TcpStream::connect(fixture.address()).await?;
@@ -781,6 +1061,10 @@ async fn connection_limit_is_not_reset_by_upstream_update() -> Result<()> {
     let mut config = p.snapshot().config.clone();
     config.upstreams.get_mut("main").unwrap().endpoints[0].address = b.address.to_string();
     p.apply(config.encode()?, 0).await?;
+    let mut config = p.snapshot().config.clone();
+    config.listeners[0].plugins[1] =
+        builtin("ip_acl", serde_json::json!({"deny":["198.51.100.0/24"]}))?;
+    p.apply(config.encode()?, 1).await?;
     let mut second = TcpStream::connect(fixture.address()).await?;
     let mut byte = [0];
     assert!(matches!(
@@ -892,8 +1176,17 @@ async fn http_server(label: &'static str) -> Server {
     Server { address, task }
 }
 fn free_address() -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    // Keep reserved fixture ports outside Linux's ephemeral range. Backend
+    // listeners using :0 must not take a port between config creation and bind.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(10000);
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(port < 32768, "test port range exhausted");
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if std::net::TcpListener::bind(address).is_ok() {
+            return address;
+        }
+    }
 }
 struct Fixture {
     dir: TempDir,
@@ -1218,6 +1511,83 @@ async fn tls_upstream_verified_and_bad_certificate_rejected() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn https_upstream_protocol_and_alpn_follow_config_after_apply() -> Result<()> {
+    let unused = echo().await;
+    let mut fixture = Fixture::new(Protocol::Http, unused.address);
+    let tls = certificate(fixture.dir.path())?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(prost_transport::server_tls(&tls, true)?);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        while let Ok((io, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(io) = acceptor.accept(io).await {
+                    let h2 = io.get_ref().1.alpn_protocol() == Some(b"h2");
+                    let service = service_fn(move |request: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header(
+                                    "x-version",
+                                    if request.version() == http::Version::HTTP_2 {
+                                        "h2"
+                                    } else {
+                                        "h1"
+                                    },
+                                )
+                                .header("x-alpn", if h2 { "h2" } else { "h1" })
+                                .body(Full::new(Bytes::from_static(b"protocol")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(io), service)
+                        .await;
+                }
+            });
+        }
+    });
+    let _server = Server { address, task };
+    let upstream = fixture.config.upstreams.get_mut("main").unwrap();
+    upstream.endpoints[0].address = address.to_string();
+    upstream.tls = Some(prost_config::ClientTls {
+        server_name: "localhost".into(),
+        ca_certificate: Some(tls.certificate),
+    });
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    for (generation, h2) in [false, true, false].into_iter().enumerate() {
+        if generation > 0 {
+            let mut next = p.snapshot().config.clone();
+            next.upstreams.get_mut("main").unwrap().http2 = h2;
+            p.apply(next.encode()?, generation as u64 - 1).await?;
+        }
+        let response = client
+            .send_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "localhost")
+                    .body(Full::new(Bytes::new()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["x-version"],
+            if h2 { "h2" } else { "h1" }
+        );
+        assert_eq!(response.headers()["x-alpn"], if h2 { "h2" } else { "h1" });
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "protocol");
+    }
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn websocket_tunnel_survives_config_update() -> Result<()> {
     let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -1289,6 +1659,7 @@ async fn listener_add_remove_and_force_shutdown() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "wasm")]
 #[tokio::test]
 async fn wasm_header_plugin_updates_and_rejects_invalid_module() -> Result<()> {
     let backend = http_server("plugin").await;

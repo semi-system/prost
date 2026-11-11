@@ -69,19 +69,22 @@ pub fn client(upstream: &Upstream, tls: Arc<rustls::ClientConfig>) -> Result<Htt
         .https_or_http();
     let connector = if let Some(t) = &upstream.tls {
         let name = rustls::pki_types::ServerName::try_from(t.server_name.clone())?;
-        builder
-            .with_server_name_resolver(move |_: &Uri| Ok::<_, Error>(name.clone()))
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(connector)
+        let builder =
+            builder.with_server_name_resolver(move |_: &Uri| Ok::<_, Error>(name.clone()));
+        if upstream.http2 {
+            builder.enable_http2().wrap_connector(connector)
+        } else {
+            builder.enable_http1().wrap_connector(connector)
+        }
+    } else if upstream.http2 {
+        builder.enable_http2().wrap_connector(connector)
     } else {
-        builder
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(connector)
+        builder.enable_http1().wrap_connector(connector)
     };
     let mut builder = Client::builder(hyper_util::rt::TokioExecutor::new());
     builder
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        .http1_max_buf_size(upstream.http1_max_buf_size)
         .pool_max_idle_per_host(upstream.pool_max_idle_per_host)
         .pool_idle_timeout(Duration::from_millis(upstream.pool_idle_timeout_ms))
         .retry_canceled_requests(false);

@@ -1,6 +1,10 @@
 use crate::{FilterCall, FilterDecision, FilterHook, NativeFilter};
+mod conditions;
+mod maps;
 use anyhow::{bail, ensure, Context, Result};
+use conditions::Condition;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri};
+use maps::{Eval, Names};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -37,6 +41,8 @@ enum Variable {
     Http(HeaderName),
     Upstream(HeaderName),
     Sent(HeaderName),
+    Mapped(usize),
+    Capture(usize),
 }
 enum Part {
     Text(String),
@@ -47,6 +53,18 @@ enum Value {
     Template(Vec<Part>),
 }
 impl Value {
+    fn captures(&self) -> bool {
+        matches!(self,Self::Template(parts)if parts.iter().any(|p|matches!(p,Part::Variable(Variable::Capture(_)))))
+    }
+    fn maps(&self, target: &mut Vec<usize>) {
+        if let Self::Template(parts) = self {
+            for part in parts {
+                if let Part::Variable(Variable::Mapped(index)) = part {
+                    target.push(*index);
+                }
+            }
+        }
+    }
     fn inputs(&self, upstream: bool, target: &mut Vec<HeaderName>) {
         if let Self::Template(parts) = self {
             for part in parts {
@@ -62,7 +80,7 @@ impl Value {
     }
 }
 impl Value {
-    fn compile(text: String) -> Result<(Self, u8)> {
+    fn compile_in(text: String, names: &Names, captures: bool) -> Result<(Self, u8)> {
         ensure!(text.len() <= 8192, "header value exceeds 8 KiB");
         HeaderValue::from_str(&text)?;
         if !text.contains('$') {
@@ -117,6 +135,10 @@ impl Value {
                     UPSTREAM_HEADERS,
                 ),
                 s if s.starts_with("sent_http_") => (Variable::Sent(variable_header(&s[10..])?), 0),
+                s if names.contains_key(s) => (Variable::Mapped(names[s]), 0),
+                s if captures && s.len() == 1 && matches!(s.as_bytes()[0], b'1'..=b'9') => {
+                    (Variable::Capture((s.as_bytes()[0] - b'0') as usize), 0)
+                }
                 _ => bail!("unknown header variable ${name}"),
             };
             needs |= bits;
@@ -132,6 +154,7 @@ impl Value {
         status: u16,
         ctx: Option<&HeaderContext>,
         headers: &HeaderMap,
+        eval: &mut Eval<'_>,
     ) -> Result<HeaderValue> {
         let Self::Template(parts) = self else {
             if let Self::Literal(v) = self {
@@ -141,6 +164,11 @@ impl Value {
         };
         // Common single-variable values share the already prepared HeaderValue.
         if let [Part::Variable(variable)] = parts.as_slice() {
+            match variable {
+                Variable::Mapped(i) => return eval.get(*i, status, ctx, headers),
+                Variable::Capture(i) => return Ok(eval.capture(*i)),
+                _ => {}
+            }
             let borrowed = match variable {
                 Variable::Remote => ctx.map(|c| &c.remote_addr),
                 Variable::Host => ctx.map(|c| &c.host),
@@ -152,6 +180,10 @@ impl Value {
                 _ => None,
             };
             if let Some(value) = borrowed {
+                ensure!(
+                    value.as_bytes().len() <= 8192,
+                    "expanded header exceeds 8 KiB"
+                );
                 return Ok(value.clone());
             }
             if matches!(variable, Variable::Status) {
@@ -172,6 +204,10 @@ impl Value {
             match part {
                 Part::Text(v) => text.push_str(v),
                 Part::Variable(variable) => match variable {
+                    Variable::Mapped(i) => {
+                        push_value(&mut text, Some(&eval.get(*i, status, ctx, headers)?))
+                    }
+                    Variable::Capture(i) => push_value(&mut text, Some(&eval.capture(*i))),
                     Variable::Status => text.push_str(&status.to_string()),
                     Variable::Sent(name) => push_header(&mut text, headers, name),
                     v => {
@@ -256,6 +292,7 @@ fn name(text: String, trailer: bool) -> Result<HeaderName> {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Rules {
+    rules: Vec<RuleConfig>,
     set: BTreeMap<String, String>,
     append: BTreeMap<String, Vec<String>>,
     remove: Vec<String>,
@@ -268,71 +305,179 @@ struct Addition {
     value: String,
     #[serde(default)]
     always: bool,
+    #[serde(default)]
+    when: Option<conditions::Config>,
 }
 struct Add {
     name: HeaderName,
     value: Value,
     always: bool,
+    when: Option<Condition>,
+}
+impl Add {
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        std::iter::once(&self.value).chain(self.when.iter().flat_map(Condition::values))
+    }
+}
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    Set,
+    Append,
+    Remove,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleConfig {
+    name: String,
+    action: Action,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    when: Option<conditions::Config>,
+}
+struct Operation {
+    name: HeaderName,
+    action: Action,
+    value: Option<Value>,
+    when: Option<Condition>,
+}
+impl Operation {
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        self.value
+            .iter()
+            .chain(self.when.iter().flat_map(Condition::values))
+    }
 }
 struct Compiled {
+    operations: Vec<Operation>,
     set: Vec<(HeaderName, Value)>,
     append: Vec<(HeaderName, Value)>,
     remove: Vec<HeaderName>,
     add: Vec<Add>,
 }
 impl Compiled {
-    fn inputs(&self, upstream: bool, target: &mut Vec<HeaderName>) {
-        for value in self
-            .set
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        self.set
             .iter()
             .map(|(_, v)| v)
             .chain(self.append.iter().map(|(_, v)| v))
-            .chain(self.add.iter().map(|a| &a.value))
-        {
+            .chain(self.add.iter().flat_map(Add::values))
+            .chain(self.operations.iter().flat_map(Operation::values))
+    }
+    fn inputs(&self, upstream: bool, target: &mut Vec<HeaderName>) {
+        for value in self.values() {
             value.inputs(upstream, target);
         }
     }
-    fn new(rules: Rules, needs: &mut u8) -> Result<Self> {
+    fn new(rules: Rules, needs: &mut u8, names: &Names, budget: &mut usize) -> Result<Self> {
         ensure!(
             rules.set.len()
                 + rules.append.values().map(Vec::len).sum::<usize>()
                 + rules.remove.len()
                 + rules.add.len()
+                + rules.rules.len()
                 <= 64,
             "too many header rules"
         );
-        let mut bytes = rules.remove.iter().map(String::len).sum::<usize>();
-        let mut compile = |n: String, v: String| -> Result<_> {
-            bytes += n.len() + v.len();
-            ensure!(bytes <= 32768, "header rules exceed 32 KiB");
-            let (v, b) = Value::compile(v)?;
+        let mut bytes = rules.remove.iter().map(String::len).sum::<usize>()
+            + rules
+                .add
+                .iter()
+                .filter_map(|r| r.when.as_ref())
+                .map(conditions::Config::bytes)
+                .sum::<usize>()
+            + rules
+                .rules
+                .iter()
+                .filter_map(|r| r.when.as_ref())
+                .map(conditions::Config::bytes)
+                .sum::<usize>();
+        ensure!(bytes <= 32768, "header rules exceed 32 KiB");
+        fn compile(
+            n: String,
+            v: String,
+            names: &Names,
+            bytes: &mut usize,
+            needs: &mut u8,
+        ) -> Result<(HeaderName, Value)> {
+            *bytes += n.len() + v.len();
+            ensure!(*bytes <= 32768, "header rules exceed 32 KiB");
+            let (v, b) = Value::compile_in(v, names, false)?;
             *needs |= b;
             Ok((name(n, false)?, v))
-        };
+        }
         let set = rules
             .set
             .into_iter()
-            .map(|(n, v)| compile(n, v))
+            .map(|(n, v)| compile(n, v, names, &mut bytes, needs))
             .collect::<Result<_>>()?;
         let append = rules
             .append
             .into_iter()
             .flat_map(|(n, vs)| vs.into_iter().map(move |v| (n.clone(), v)))
-            .map(|(n, v)| compile(n, v))
+            .map(|(n, v)| compile(n, v, names, &mut bytes, needs))
             .collect::<Result<_>>()?;
         let add = rules
             .add
             .into_iter()
             .map(|a| {
-                let (n, v) = compile(a.name, a.value)?;
+                let (n, v) = compile(a.name, a.value, names, &mut bytes, needs)?;
+                let when = a
+                    .when
+                    .map(|c| -> Result<_> {
+                        let (condition, bits) = Condition::compile(c, names, budget)?;
+                        *needs |= bits;
+                        Ok(condition)
+                    })
+                    .transpose()?;
                 Ok(Add {
                     name: n,
                     value: v,
                     always: a.always,
+                    when,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let operations = rules
+            .rules
+            .into_iter()
+            .map(|r| -> Result<_> {
+                ensure!(
+                    matches!(r.action, Action::Remove) == r.value.is_none(),
+                    "set/append require value; remove must not have value"
+                );
+                let name = name(r.name, false)?;
+                if matches!(r.action, Action::Remove) {
+                    bytes += name.as_str().len();
+                    ensure!(bytes <= 32768, "header rules exceed 32 KiB");
+                }
+                let value = r
+                    .value
+                    .map(|v| -> Result<_> {
+                        let (_, value) =
+                            compile(name.as_str().into(), v, names, &mut bytes, needs)?;
+                        Ok(value)
+                    })
+                    .transpose()?;
+                let when = r
+                    .when
+                    .map(|c| -> Result<_> {
+                        let (condition, bits) = Condition::compile(c, names, budget)?;
+                        *needs |= bits;
+                        Ok(condition)
+                    })
+                    .transpose()?;
+                Ok(Operation {
+                    name,
+                    action: r.action,
+                    value,
+                    when,
                 })
             })
             .collect::<Result<_>>()?;
         Ok(Self {
+            operations,
             set,
             append,
             add,
@@ -348,36 +493,77 @@ impl Compiled {
             && self.append.is_empty()
             && self.remove.is_empty()
             && self.add.is_empty()
+            && self.operations.is_empty()
     }
     fn apply(
         &self,
         status: u16,
         ctx: Option<&HeaderContext>,
         headers: &mut HeaderMap,
+        eval: &mut Eval<'_>,
     ) -> Result<()> {
         let mut bytes = 0;
         for n in &self.remove {
             headers.remove(n);
         }
         for (n, v) in &self.set {
-            let v = v.render(status, ctx, headers)?;
+            let v = v.render(status, ctx, headers, eval)?;
             bytes += v.as_bytes().len();
             ensure!(bytes <= 32768, "header output exceeds 32 KiB");
             headers.insert(n.clone(), v);
         }
         for (n, v) in &self.append {
-            let v = v.render(status, ctx, headers)?;
+            let v = v.render(status, ctx, headers, eval)?;
             bytes += v.as_bytes().len();
             ensure!(bytes <= 32768, "header output exceeds 32 KiB");
             headers.append(n.clone(), v);
         }
         for a in &self.add {
-            if a.always || normal_status(status) {
-                let v = a.value.render(status, ctx, headers)?;
+            if (a.always || normal_status(status))
+                && a.when
+                    .as_ref()
+                    .map(|c| c.matches(status, ctx, headers, eval))
+                    .transpose()?
+                    .unwrap_or(true)
+            {
+                let v = a.value.render(status, ctx, headers, eval)?;
                 bytes += v.as_bytes().len();
                 ensure!(bytes <= 32768, "header output exceeds 32 KiB");
                 if !v.is_empty() {
                     headers.append(a.name.clone(), v);
+                }
+            }
+        }
+        for op in &self.operations {
+            if !op
+                .when
+                .as_ref()
+                .map(|c| c.matches(status, ctx, headers, eval))
+                .transpose()?
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            match op.action {
+                Action::Remove => {
+                    headers.remove(&op.name);
+                }
+                Action::Set | Action::Append => {
+                    let value = op
+                        .value
+                        .as_ref()
+                        .expect("validated header operation")
+                        .render(status, ctx, headers, eval)?;
+                    bytes += value.as_bytes().len();
+                    ensure!(bytes <= 32768, "header output exceeds 32 KiB");
+                    match op.action {
+                        Action::Set => {
+                            headers.insert(op.name.clone(), value);
+                        }
+                        _ => {
+                            headers.append(op.name.clone(), value);
+                        }
+                    }
                 }
             }
         }
@@ -401,6 +587,7 @@ enum Inherit {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
+    maps: BTreeMap<String, maps::MapConfig>,
     request: Rules,
     response: Rules,
     trailers: Vec<Addition>,
@@ -409,6 +596,7 @@ struct Config {
     trailer_inherit: Inherit,
 }
 pub(crate) struct Headers {
+    maps: Vec<maps::Map>,
     request: Compiled,
     response: Compiled,
     trailers: Vec<Add>,
@@ -427,13 +615,17 @@ impl Headers {
     pub fn new(value: serde_json::Value) -> Result<Self> {
         let c: Config = serde_json::from_value(value)?;
         let mut needs = 0;
-        let request = Compiled::new(c.request, &mut needs)?;
-        let response = Compiled::new(c.response, &mut needs)?;
+        let mut regex_budget = 0;
+        let (names, maps) = maps::compile(c.maps, &mut regex_budget)?;
+        let request = Compiled::new(c.request, &mut needs, &names, &mut regex_budget)?;
+        let response = Compiled::new(c.response, &mut needs, &names, &mut regex_budget)?;
         ensure!(c.trailers.len() <= 64, "too many trailer rules");
         ensure!(
             c.trailers
                 .iter()
-                .map(|a| a.name.len() + a.value.len())
+                .map(|a| a.name.len()
+                    + a.value.len()
+                    + a.when.as_ref().map_or(0, conditions::Config::bytes))
                 .sum::<usize>()
                 <= 32768,
             "trailer rules exceed 32 KiB"
@@ -442,19 +634,28 @@ impl Headers {
             .trailers
             .into_iter()
             .map(|a| {
-                let (v, b) = Value::compile(a.value)?;
+                let (v, b) = Value::compile_in(a.value, &names, false)?;
                 needs |= b;
+                let when = a
+                    .when
+                    .map(|c| -> Result<_> {
+                        let (condition, bits) = Condition::compile(c, &names, &mut regex_budget)?;
+                        needs |= bits;
+                        Ok(condition)
+                    })
+                    .transpose()?;
                 Ok(Add {
                     name: name(a.name, true)?,
                     value: v,
                     always: a.always,
+                    when,
                 })
             })
             .collect::<Result<_>>()?;
         let expires = c
             .expires
             .map(|v| -> Result<_> {
-                let expr = Value::compile(v)?;
+                let expr = Value::compile_in(v, &names, false)?;
                 needs |= expr.1;
                 Ok(match expr.0 {
                     Value::Literal(v) => Expiry::Static(Expiration::parse(v.to_str()?)?),
@@ -467,7 +668,9 @@ impl Headers {
             request.inputs(upstream, &mut names);
             response.inputs(upstream, &mut names);
             for a in &trailers {
-                a.value.inputs(upstream, &mut names);
+                for value in a.values() {
+                    value.inputs(upstream, &mut names);
+                }
             }
             if let Some(Expiry::Dynamic(v)) = &expires {
                 v.inputs(upstream, &mut names);
@@ -476,9 +679,29 @@ impl Headers {
             names.dedup();
             names
         };
-        let request_inputs = inputs(false);
-        let upstream_inputs = inputs(true);
+        let mut request_inputs = inputs(false);
+        let mut upstream_inputs = inputs(true);
+        let mut roots = Vec::new();
+        for compiled in [&request, &response] {
+            for v in compiled.values() {
+                v.maps(&mut roots);
+            }
+        }
+        for a in &trailers {
+            for v in a.values() {
+                v.maps(&mut roots);
+            }
+        }
+        if let Some(Expiry::Dynamic(v)) = &expires {
+            v.maps(&mut roots);
+        }
+        needs |= maps::requirements(&maps, &roots, &mut request_inputs, &mut upstream_inputs);
+        for input in [&mut request_inputs, &mut upstream_inputs] {
+            input.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            input.dedup();
+        }
         Ok(Self {
+            maps,
             request,
             response,
             trailers,
@@ -553,10 +776,11 @@ impl NativeFilter for Headers {
         headers: Option<&mut HeaderMap>,
     ) -> Result<FilterDecision> {
         if let Some(headers) = headers {
+            let mut eval = Eval::new(&self.maps);
             match call.hook {
                 FilterHook::RequestHeaders => {
                     if call.inherited_skip & 1 == 0 {
-                        self.request.apply(200, call.context, headers)?;
+                        self.request.apply(200, call.context, headers, &mut eval)?;
                     }
                 }
                 FilterHook::ResponseHeaders => {
@@ -565,7 +789,8 @@ impl NativeFilter for Headers {
                             match e {
                                 Expiry::Static(e) => e.apply(headers, SystemTime::now())?,
                                 Expiry::Dynamic(v) => {
-                                    let value = v.render(call.status, call.context, headers)?;
+                                    let value =
+                                        v.render(call.status, call.context, headers, &mut eval)?;
                                     if let Ok(e) = Expiration::parse(value.to_str()?) {
                                         e.apply(headers, SystemTime::now())?;
                                     }
@@ -574,7 +799,8 @@ impl NativeFilter for Headers {
                         }
                     }
                     if call.inherited_skip & 2 == 0 {
-                        self.response.apply(call.status, call.context, headers)?;
+                        self.response
+                            .apply(call.status, call.context, headers, &mut eval)?;
                     }
                 }
                 _ => {}
@@ -592,10 +818,17 @@ impl NativeFilter for Headers {
             return Ok(None);
         }
         let mut result = HeaderMap::new();
+        let mut eval = Eval::new(&self.maps);
         let mut bytes = 0;
         for a in &self.trailers {
-            if a.always || normal_status(status) && !matches!(status, 204 | 304) {
-                let v = a.value.render(status, ctx, headers)?;
+            if (a.always || normal_status(status) && !matches!(status, 204 | 304))
+                && a.when
+                    .as_ref()
+                    .map(|c| c.matches(status, ctx, headers, &mut eval))
+                    .transpose()?
+                    .unwrap_or(true)
+            {
+                let v = a.value.render(status, ctx, headers, &mut eval)?;
                 bytes += v.as_bytes().len();
                 ensure!(bytes <= 32768, "trailers exceed 32 KiB");
                 if !v.is_empty() {
@@ -822,5 +1055,117 @@ mod tests {
         let literal = Headers::new(serde_json::json!({"response":{"set":{"x-static":"value"}}}))?;
         assert_eq!(literal.context_needs(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn map_evaluation_and_single_header_values_obey_budgets() -> Result<()> {
+        let config: BTreeMap<String, maps::MapConfig> = serde_json::from_value(
+            serde_json::json!({"m":{"source":"literal","default":"ok","volatile":true}}),
+        )?;
+        let (names, maps) = maps::compile(config, &mut 0)?;
+        let mut eval = Eval::new(&maps);
+        for _ in 0..128 {
+            assert_eq!(eval.get(names["m"], 200, None, &HeaderMap::new())?, "ok");
+        }
+        assert!(eval.get(names["m"], 200, None, &HeaderMap::new()).is_err());
+        let (v, _) = Value::compile_in("$sent_http_x_large".into(), &Names::new(), false)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-large", HeaderValue::from_str(&"a".repeat(8193))?);
+        assert!(v.render(200, None, &headers, &mut Eval::new(&[])).is_err());
+        let rules = (0..8)
+            .map(|_| {
+                serde_json::json!({"action":"remove","name":"x-test",
+            "when":{"source":"a".repeat(8192),"not_empty":true}})
+            })
+            .collect::<Vec<_>>();
+        assert!(Headers::new(serde_json::json!({"response":{"rules":rules}})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn map_precedence_case_folding_and_regex_captures() -> Result<()> {
+        for (source, expected) in [
+            ("api.admin.example", "exact"),
+            ("API.ADMIN.other", "long"),
+            ("api.foo.example", "prefix"),
+            ("www.example", "suffix"),
+            ("regex", "gex"),
+            ("other", "default"),
+        ] {
+            let h = apply(
+                serde_json::json!({"maps":{"pick":{"source":"$sent_http_x_source","default":"default","entries":[
+                {"pattern":"api.admin.example","value":"exact"},{"kind":"prefix","pattern":"api.","value":"prefix"},
+                {"kind":"prefix","pattern":"api.admin.","value":"long"},{"kind":"suffix","pattern":".example","value":"suffix"},
+                {"kind":"regex","pattern":"^re(.+)$","value":"$1"}
+            ]}},"response":{"set":{"x-source":source},"add":[{"name":"x-picked","value":"$pick"}]}}),
+                200,
+            )?;
+            assert_eq!(h["x-picked"], expected);
+        }
+        Ok(())
+    }
+    #[test]
+    fn maps_are_lazy_and_chained_requirements_reach_expiry() -> Result<()> {
+        let h = Headers::new(
+            serde_json::json!({"maps":{"unused":{"source":"$http_authorization"}},"response":{"set":{"x-static":"yes"}}}),
+        )?;
+        assert_eq!(h.context_needs(), 0);
+        assert!(h.header_inputs(false).is_empty());
+        let h = apply(
+            serde_json::json!({"maps":{"ttl":{"source":"$status","default":"off","entries":[{"pattern":"200","value":"1h"}]},"label":{"source":"$ttl","default":"private","entries":[{"pattern":"1h","value":"public"}]}},"expires":"$ttl","response":{"add":[{"name":"x-policy","value":"$label","always":true}]}}),
+            200,
+        )?;
+        assert_eq!(h["cache-control"], "max-age=3600");
+        assert_eq!(h["x-policy"], "public");
+        let h = Headers::new(
+            serde_json::json!({"maps":{"a":{"source":"$b"},"b":{"source":"$http_origin"}},"response":{"set":{"x-origin":"$a"}}}),
+        )?;
+        assert_ne!(h.context_needs() & REQUEST_HEADERS, 0);
+        assert_eq!(h.header_inputs(false), [header::ORIGIN]);
+        Ok(())
+    }
+    #[test]
+    fn volatile_maps_observe_changes_while_cached_maps_keep_first_value() -> Result<()> {
+        for volatile in [false, true] {
+            let h = apply(
+                serde_json::json!({"maps":{"m":{"source":"$sent_http_x_source","volatile":volatile,"entries":[{"pattern":"before","value":"old"},{"pattern":"after","value":"new"}]}},"response":{"set":{"x-source":"before"},"add":[{"name":"x-first","value":"$m"}],"rules":[{"action":"set","name":"x-source","value":"after"},{"action":"set","name":"x-last","value":"$m"}]}}),
+                200,
+            )?;
+            assert_eq!(h["x-first"], "old");
+            assert_eq!(h["x-last"], if volatile { "new" } else { "old" });
+        }
+        Ok(())
+    }
+    #[test]
+    fn conditional_add_set_append_remove_and_truthiness() -> Result<()> {
+        for status in [200, 404] {
+            let h = apply(
+                serde_json::json!({"response":{"set":{"server":"origin"},"add":[{"name":"x-success","value":"yes","always":true,"when":{"source":"$status","matches":"^2[0-9][0-9]$"}},{"name":"x-zero","value":"present","always":true,"when":{"source":"0","not_empty":true}},{"name":"x-false","value":"no","when":{"source":"0","truthy":true}}],"rules":[{"action":"remove","name":"server","when":{"source":"$status","not_equals":"200"}},{"action":"set","name":"x-rule","value":"set","when":{"source":"$status","equals":"200"}},{"action":"append","name":"x-rule","value":"append","when":{"source":"$status","equals":"200"}}]}}),
+                status,
+            )?;
+            assert_eq!(h.contains_key("server"), status == 200);
+            assert_eq!(h.contains_key("x-success"), status == 200);
+            assert_eq!(h["x-zero"], "present");
+            assert!(!h.contains_key("x-false"));
+            assert_eq!(
+                h.get_all("x-rule").iter().count(),
+                if status == 200 { 2 } else { 0 }
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn invalid_maps_conditions_and_cycles_fail_during_prepare() {
+        for cfg in [
+            serde_json::json!({"maps":{"a":{"source":"$a"}}}),
+            serde_json::json!({"maps":{"a":{"source":"$b"},"b":{"source":"$a"}}}),
+            serde_json::json!({"maps":{"status":{"source":"x"}}}),
+            serde_json::json!({"maps":{"m":{"source":"x","entries":[{"pattern":"A","value":"1"},{"pattern":"a","value":"2"}]}}}),
+            serde_json::json!({"maps":{"m":{"source":"x","entries":[{"kind":"regex","pattern":"(","value":"1"}]}}}),
+            serde_json::json!({"response":{"add":[{"name":"x-a","value":"x","when":{"source":"1","equals":"1","truthy":true}}]}}),
+            serde_json::json!({"response":{"rules":[{"action":"remove","name":"server","value":"invalid"}]}}),
+        ] {
+            assert!(Headers::new(cfg).is_err());
+        }
     }
 }

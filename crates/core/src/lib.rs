@@ -355,38 +355,31 @@ fn prepare(
             .as_ref()
             .map(|t| prost_transport::server_tls(t, l.protocol == Protocol::Http))
             .transpose()?;
-        let plugins = if let Some(old) = previous_l.filter(|old| {
-            serde_json::to_value(&old.config.plugins).ok() == serde_json::to_value(&l.plugins).ok()
-        }) {
-            old.plugins.clone()
-        } else {
-            Arc::new(
-                l.plugins
-                    .iter()
-                    .map(|p| registry.prepare(p))
-                    .collect::<Result<Vec<_>>>()?,
-            )
-        };
+        let plugins = prepare_plugins(
+            registry,
+            &l.plugins,
+            previous_l.map(|old| old.config.plugins.as_slice()),
+            previous_l.map(|old| &old.plugins),
+        )?;
         let has_hooks = plugins.iter().any(PreparedPlugin::has_event_hooks);
         let routes = l
             .routes
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                if let Some(old) = previous_l.filter(|old| {
-                    old.config.routes.get(i).is_some_and(|old_r| {
-                        serde_json::to_value(&old_r.plugins).ok()
-                            == serde_json::to_value(&r.plugins).ok()
+                let old = previous_l.filter(|old| {
+                    old.config.routes.get(i).is_some_and(|route| {
+                        route.host == r.host
+                            && route.path_prefix == r.path_prefix
+                            && route.priority == r.priority
                     })
-                }) {
-                    return Ok(old.routes[i].clone());
-                }
-                Ok(Arc::new(
-                    r.plugins
-                        .iter()
-                        .map(|p| registry.prepare(p))
-                        .collect::<Result<Vec<_>>>()?,
-                ))
+                });
+                prepare_plugins(
+                    registry,
+                    &r.plugins,
+                    old.map(|old| old.config.routes[i].plugins.as_slice()),
+                    old.map(|old| &old.routes[i]),
+                )
             })
             .collect::<Result<_>>()?;
         let mut route_order: Vec<usize> = (0..l.routes.len()).collect();
@@ -425,6 +418,32 @@ fn prepare(
         upstreams,
         listeners,
     })
+}
+fn prepare_plugins(
+    registry: &PluginRegistry,
+    config: &[prost_config::Plugin],
+    old_config: Option<&[prost_config::Plugin]>,
+    old_plugins: Option<&Arc<Vec<PreparedPlugin>>>,
+) -> Result<Arc<Vec<PreparedPlugin>>> {
+    if let (Some(old_config), Some(old_plugins)) = (old_config, old_plugins) {
+        if old_config == config {
+            return Ok(old_plugins.clone());
+        }
+    }
+    Ok(Arc::new(
+        config
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if old_config.and_then(|old| old.get(i)) == Some(p) {
+                    if let Some(prepared) = old_plugins.and_then(|old| old.get(i)) {
+                        return Ok(prepared.clone());
+                    }
+                }
+                registry.prepare(p)
+            })
+            .collect::<Result<_>>()?,
+    ))
 }
 impl RunningProxy {
     pub fn snapshot(&self) -> Arc<Snapshot> {

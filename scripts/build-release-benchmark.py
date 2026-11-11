@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--profile", choices=["dev", "release"], default="release")
 parser.add_argument("--tag")
+parser.add_argument("--features", default="", help="Optional Cargo features, e.g. prost-cli/wasm")
 args = parser.parse_args()
 tag = args.tag or ("prost:bench-debug" if args.profile == "dev" else "prost:bench-release")
 
@@ -22,7 +23,7 @@ run("docker", "run", "--name", name,
     "-v", f"{ROOT}:/work", "-v", "prost-target:/work/target",
     "-v", "prost-cargo:/usr/local/cargo/registry", "-w", "/work",
     "-e", "CARGO_BUILD_JOBS=2", "rust:1.93-bookworm",
-    "cargo", "build", "--profile", args.profile, "--locked", "--workspace")
+    "cargo", "build", "--profile", args.profile, "--locked", "--workspace", "--features", args.features)
 try:
     with tempfile.TemporaryDirectory(prefix="prost-release-image-") as directory:
         context = Path(directory)

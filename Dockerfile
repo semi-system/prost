@@ -4,7 +4,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 ENV CARGO_BUILD_JOBS=2
 ARG CARGO_PROFILE=release
-RUN cargo build --workspace --locked --profile "$CARGO_PROFILE" \
+ARG CARGO_FEATURES=""
+RUN cargo build --workspace --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" \
     && mkdir /out \
     && if [ "$CARGO_PROFILE" = dev ]; then \
          cp target/debug/prost target/debug/prostctl /out/; \

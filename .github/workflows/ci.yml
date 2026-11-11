@@ -13,6 +13,8 @@ jobs:
         run: sh scripts/docker-dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: sh scripts/docker-dev.sh cargo test --workspace --locked
+      - name: Optional WASM compatibility
+        run: sh scripts/docker-dev.sh cargo test --workspace --all-features --locked
       - name: Demo
         run: |
           docker compose up -d --build
@@ -24,8 +26,8 @@ jobs:
           docker tag prost:mvp prost:advanced-release
           python3 scripts/prepare-advanced-bench.py
           docker compose -f benchmarks/advanced/compose.yaml build backend
-          python3 scripts/advanced-bench.py --rounds 1 --scale 0.02 --output-dir test-results/advanced-ci
-          python3 scripts/advanced-backpressure.py --clients 4 --seconds 2 --output test-results/advanced-ci/backpressure.json
+          sudo python3 scripts/advanced-bench.py --rounds 1 --scale 0.02 --output-dir test-results/advanced-ci
+          sudo python3 scripts/advanced-backpressure.py --clients 4 --seconds 2 --output test-results/advanced-ci/backpressure.json
       - name: Logs
         if: failure()
         run: |

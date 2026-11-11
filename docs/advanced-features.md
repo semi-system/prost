@@ -1,5 +1,25 @@
 # Health check HTTP và cấu hình HTTP/2
 
+## Pool và buffer upstream
+
+```toml
+[upstreams.api]
+http1_max_buf_size = 65536
+pool_max_idle_per_host = 128
+pool_idle_timeout_ms = 30000
+http2 = false
+```
+
+HTTP/1 dùng buffer đọc adaptive, tối đa 64 KiB mặc định; cấu hình từ 8 KiB đến
+1 MiB. Đây cũng là giới hạn vùng đọc header upstream, nên cần tăng nếu backend
+có response headers lớn. Không gom toàn bộ body vào buffer này.
+Pool có timer thu hồi idle sockets tự động, không cần một request mới để dọn.
+Thay pool/buffer tạo tài nguyên upstream mới; stream cũ tiếp tục dùng tài nguyên cũ.
+
+`http2=false` khóa HTTP/1.1 cho upstream, kể cả TLS server hỗ trợ ALPN h2.
+`http2=true` dùng HTTP/2, với ALPN h2 trên TLS và prior knowledge trên TCP.
+Đổi protocol có thể apply trên frontend keep-alive mà không restart listener.
+
 ## Health check chủ động
 
 Mặc định vẫn probe TCP/TLS. Để phát hiện ứng dụng lỗi dù port còn mở:

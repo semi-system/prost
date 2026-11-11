@@ -5,7 +5,9 @@ MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix
 
 Đã triển khai TCP relay, TLS hai phía, HTTP/1.1–HTTP/2, HTTPS, WebSocket,
 gRPC streaming/trailers, weighted round-robin, TCP/TLS/HTTP health check, cấu hình
-flow control HTTP/2, plugin native và WASM. Đây là MVP để chạy thử; soak dài và
+flow control HTTP/2 và bộ filter native: header/trailer, expires, map/điều kiện,
+ACL và rate limit toàn cục/theo IP/header. WASM là feature tùy chọn, mặc định tắt.
+Đây là MVP để chạy thử; soak dài và
 đánh giá production vẫn còn cần thực hiện.
 
 ## Build và test bằng Docker trong WSL
@@ -149,8 +151,17 @@ module = "/examples/add-header.wat"
 config = { label = "demo" }
 ```
 
-Native plugin `connection_limit` có trong config demo. Các native plugin khác
-đăng ký bằng API Rust trước khi start; thêm code native cần build lại.
+Build mặc định có `headers`, `ip_acl`, `rate_limit`, `connection_limit`.
+Ví dụ WASM trên cần `--build-arg CARGO_FEATURES=prost-cli/wasm` khi build Docker,
+hoặc `cargo build --release --features prost-cli/wasm`.
+Filter tùy biến đăng ký qua API Rust; thêm code native cần build lại.
+
+Bộ header đầy đủ: [docs/native-headers.md](docs/native-headers.md), cấu hình mẫu
+[examples/native-headers.toml](examples/native-headers.toml).
+Map/điều kiện và rate limit theo API key có mẫu chạy được trong Compose:
+[examples/native-policies.toml](examples/native-policies.toml).
+Đo riêng map/điều kiện và limiter native với nginx:
+[docs/native-policies-benchmark.md](docs/native-policies-benchmark.md).
 
 ## API và tài liệu
 

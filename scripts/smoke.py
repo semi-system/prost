@@ -46,6 +46,38 @@ def wait_backend(label):
 
 ctl("apply", "--file", "/examples/prost.toml")
 wait_backend("blue")
+ctl("validate", "--file", "/examples/native-headers.toml")
+ctl("apply", "--file", "/examples/native-headers.toml")
+with urllib.request.urlopen(options.http_url, timeout=3) as response:
+    assert response.headers["x-proxy"] == "prost"
+    assert response.headers["x-status"] == "200"
+    request_id = response.headers["x-request-id"]
+    assert len(request_id) == 32 and all(c in "0123456789abcdef" for c in request_id)
+    assert json.load(response)["backend"] == "blue"
+ctl("validate", "--file", "/examples/native-policies.toml")
+ctl("apply", "--file", "/examples/native-policies.toml")
+def policy_request(key, origin, expected):
+    request = urllib.request.Request(options.http_url, headers={"x-api-key":key,"origin":origin})
+    try:
+        response = urllib.request.urlopen(request, timeout=3)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        assert response.code == expected, (response.code, expected)
+        assert response.headers["x-proxy"] == "prost"
+        if origin == "https://app.example":
+            assert response.headers["access-control-allow-origin"] == origin
+            assert response.headers["x-policy"] == "trusted-origin"
+            if expected == 200:
+                assert response.headers["cache-control"] == "max-age=3600"
+        else:
+            assert "access-control-allow-origin" not in response.headers
+        response.read()
+policy_request("alice", "https://app.example", 200)
+policy_request("alice", "https://app.example", 200)
+policy_request("alice", "https://app.example", 429)
+policy_request("bob", "https://other.invalid", 200)
+ctl("apply", "--file", "/examples/prost.toml")
 state = ctl("status")
 generation = state["generation"]
 ctl("validate", "--file", "/examples/green.toml")
@@ -74,4 +106,4 @@ generation = ctl("status")["generation"]
 subprocess.run([*compose, "restart", "prost"], check=True)
 wait_backend("green")
 assert ctl("status")["generation"] == generation
-print("PASS: HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")
+print("PASS: native headers/maps/conditions/keyed rate limit, HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")
