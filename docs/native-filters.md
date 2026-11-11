@@ -7,6 +7,7 @@ feature tùy chọn `prost-cli/wasm`.
 | Filter | Chức năng | Tài nguyên khi xử lý request |
 |---|---|---|
 | `headers` | Set, append nhiều giá trị, remove header request/response | Tên/giá trị parse trước commit; thao tác trực tiếp `HeaderMap` |
+| `rewrite` | Rewrite path/query, redirect 301/302/303/307/308 | Match/template compile trước commit, không đọc body |
 | `ip_acl` | Allow/deny CIDR IPv4/IPv6 | Danh sách parse sẵn, tối đa 256 CIDR; không có bảng theo IP |
 | `rate_limit` | Giới hạn toàn cục, theo IP hoặc header; HTTP 429 + Retry-After | GCRA chung các worker; bảng key có giới hạn, không queue |
 | `connection_limit` | Giới hạn phiên trên listener | Semaphore permit giữ tới khi phiên/tunnel kết thúc |
@@ -40,6 +41,11 @@ trước commit. Mỗi phía tối đa 64 thao tác và 32 KiB rule tĩnh; giá 
 `always`, gồm lỗi cục bộ 403/404/429/503. Có biến request/upstream, request ID,
 expires/cache-control và trailer HTTP/1.1–HTTP/2.
 Ví dụ và hành vi chi tiết: [native-headers.md](native-headers.md).
+
+Rewrite/redirect và thứ tự với ACL/rate limit: [rewrite.md](rewrite.md).
+NativeFilter có callback `filter_request` tùy chọn để nhận URI hiện tại; callback
+mặc định gọi filter header cũ. `FilterDecision::Redirect` chỉ hợp lệ trong request
+phase và kết thúc request mà không mở upstream.
 
 ## ACL
 

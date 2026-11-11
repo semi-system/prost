@@ -102,6 +102,27 @@ upstream = "plain"
 [[listeners.routes.plugins]]
 name = "rate_limit"
 config = { requests_per_second = 1000000, burst = 1000000, key = "$http_x_api_key", max_keys = 4096, idle_timeout_ms = 60000 }
+[[listeners.routes]]
+path_prefix = "/rewrite-exact"
+priority = 200
+upstream = "plain"
+[[listeners.routes.plugins]]
+name = "rewrite"
+config = { rules = [{ action = "rewrite", exact = "/rewrite-exact", to = "/bytes/34" }] }
+[[listeners.routes]]
+path_prefix = "/rewrite-prefix/"
+priority = 200
+upstream = "plain"
+[[listeners.routes.plugins]]
+name = "rewrite"
+config = { rules = [{ action = "rewrite", prefix = "/rewrite-prefix/", to = "/bytes/" }] }
+[[listeners.routes]]
+path_prefix = "/rewrite-regex/"
+priority = 200
+upstream = "plain"
+[[listeners.routes.plugins]]
+name = "rewrite"
+config = { rules = [{ action = "rewrite", regex = '^/rewrite-regex/([0-9]+)$', to = "/bytes/$1" }] }
 '''
         for i in range(1000):
             prost += f'[[listeners.routes]]\npath_prefix = "/route/{i:04d}/"\nupstream = "plain"\n'
@@ -192,6 +213,9 @@ http {
       proxy_pass http://plain;
     }
     location /keyed { limit_req zone=keyed_rate burst=999999 nodelay; limit_req_status 429; proxy_pass http://plain; }
+    location = /rewrite-exact { proxy_pass http://plain/bytes/34; }
+    location /rewrite-prefix/ { proxy_pass http://plain/bytes/; }
+    location /rewrite-regex/ { rewrite ^/rewrite-regex/([0-9]+)$ /bytes/$1 break; proxy_pass http://plain; }
 '''
 for i in range(1000):
     nginx += f'    location /route/{i:04d}/ {{ proxy_pass http://plain; }}\n'

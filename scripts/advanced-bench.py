@@ -44,6 +44,9 @@ CASES = {
     "native_map_34": ("/map-small", "h2", 20000, 32, 4, 34),
     "native_map_regex_34": ("/map-regex-small", "h2", 20000, 32, 4, 34),
     "native_keyed_rate_34": ("/keyed-small", "h2", 20000, 32, 4, 34),
+    "native_rewrite_exact_34": ("/rewrite-exact", "h2", 20000, 32, 4, 34),
+    "native_rewrite_prefix_34": ("/rewrite-prefix/34", "h2", 20000, 32, 4, 34),
+    "native_rewrite_regex_34": ("/rewrite-regex/34", "h2", 20000, 32, 4, 34),
 }
 
 
@@ -71,6 +74,8 @@ def container_name(target):
 
 def url_for(target, case):
     path, protocol, *_ = CASES[case]
+    if target == "backend" and case.startswith("native_rewrite_"):
+        path = "/bytes/34"
     ports = {"prost": (19081, 19444, 19446), "nginx": (19082, 19445, 19447), "backend": (19080, 19443, 19443)}
     plain, tls, double = ports[target]
     return f"{'http' if protocol == 'h1' else 'https'}://127.0.0.1:{plain if protocol == 'h1' else double if protocol == 'double-tls' else tls}{path}"

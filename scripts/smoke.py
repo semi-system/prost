@@ -77,6 +77,26 @@ policy_request("alice", "https://app.example", 200)
 policy_request("alice", "https://app.example", 200)
 policy_request("alice", "https://app.example", 429)
 policy_request("bob", "https://other.invalid", 200)
+ctl("validate", "--file", "/examples/rewrite.toml")
+ctl("apply", "--file", "/examples/rewrite.toml")
+root = options.http_url.rstrip("/")
+for path, expected, current in [("/api/v1/item?q=1", "/api/v2/item?q=1", "/api/v2/item"),
+                                 ("/users/42?q=1", "/profiles/42?source=legacy&q=1", "/profiles/42")]:
+    with urllib.request.urlopen(root + path, timeout=3) as response:
+        assert json.load(response)["path"] == expected
+        assert response.headers["x-original-uri"] == path
+        assert response.headers["x-current-uri"] == current
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+try:
+    urllib.request.build_opener(NoRedirect).open(root + "/legacy?keep=1", timeout=3)
+    raise AssertionError("expected native redirect")
+except urllib.error.HTTPError as error:
+    assert error.code == 308
+    assert error.headers["location"] == "/new?keep=1"
+    assert error.headers["x-proxy"] == "prost"
+    error.close()
 ctl("apply", "--file", "/examples/prost.toml")
 state = ctl("status")
 generation = state["generation"]
@@ -106,4 +126,4 @@ generation = ctl("status")["generation"]
 subprocess.run([*compose, "restart", "prost"], check=True)
 wait_backend("green")
 assert ctl("status")["generation"] == generation
-print("PASS: native headers/maps/conditions/keyed rate limit, HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")
+print("PASS: native headers/maps/conditions/keyed rate limit/rewrite/redirect, HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")

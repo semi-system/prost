@@ -55,6 +55,47 @@ nodelay; no request is intentionally delayed or rejected by either proxy.
 Key isolation, rejection, bounded capacity and idle cleanup are functional tests.
 Saved measurements and limits: [native-policies-benchmark.md](../docs/native-policies-benchmark.md).
 
+Native rewrite comparison, including unchanged literal/full-header controls:
+
+```sh
+sudo python3 scripts/advanced-bench.py --rounds 3 \
+  --cases native_header_34 native_full_34 native_rewrite_exact_34 native_rewrite_prefix_34 native_rewrite_regex_34 \
+  --output-dir test-results/native-rewrite-final
+```
+
+All three rewrite cases forward to `/bytes/34`. nginx uses a static URI or prefix
+replacement in proxy_pass for exact/prefix cases, and native rewrite with a PCRE
+capture for the regex case. Direct-backend controls call `/bytes/34` directly;
+without the rewrite, the original proxy paths would return a different body size.
+Redirect status/Location/empty-body behavior is verified functionally, outside
+this throughput comparison, since nginx's default redirect response includes HTML.
+Latest measured rewrite results and regression investigation:
+[rewrite-benchmark.md](../docs/rewrite-benchmark.md).
+
+For image-to-image regression investigations, tag a known baseline before changing
+the source and alternate it with the new image:
+
+```sh
+sudo python3 scripts/compare-header-images.py --before prost:sni-control \
+  --after prost:native --strip-rewrite --output-dir test-results/header-control
+```
+
+`prost:sni-control` must already identify the intended baseline image. The default
+is 3 alternating rounds with 100,000 requests per header case per round. The
+optional strip flag replaces rewrite-only fixture plugins with empty header
+filters for older binaries, preserving route count and using identical config
+for both images. The report flags throughput loss above 5% or p99 increase above
+10% for investigation; image IDs identify binaries independently of workspace
+source. It restores the fixture and stops its benchmark project afterward. Do
+not run another build or benchmark concurrently.
+
+When a compatible runtime image is already available, Cargo release binaries can
+also be rebuilt using Linux Docker caches:
+
+```sh
+sudo python3 scripts/build-release-benchmark.py --base-image prost:native --tag prost:native
+```
+
 This isolated Compose project compares the current Prost debug and release
 binaries with the official nginx and Apache HTTP Server (httpd/Apache2) images.
 It does not replace or edit the normal demo's managed config.

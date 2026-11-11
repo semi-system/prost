@@ -135,6 +135,8 @@ struct PreparedListener {
     default_upstream: Option<Arc<PreparedUpstream>>,
     route_upstreams: Vec<Arc<PreparedUpstream>>,
     has_hooks: bool,
+    uri_filter: bool,
+    route_uri_filters: Vec<bool>,
 }
 struct ConnectionInfo {
     peer: SocketAddr,
@@ -350,11 +352,16 @@ fn prepare(
             .filter(|p| p.config.max_connections == l.max_connections)
             .map(|p| p.capacity.clone())
             .unwrap_or_else(|| Arc::new(Semaphore::new(l.max_connections)));
-        let tls = l
-            .tls
-            .as_ref()
-            .map(|t| prost_transport::server_tls(t, l.protocol == Protocol::Http))
-            .transpose()?;
+        let tls = if let Some(old) =
+            previous_l.filter(|old| old.config.tls == l.tls && old.config.protocol == l.protocol)
+        {
+            old.tls.clone()
+        } else {
+            l.tls
+                .as_ref()
+                .map(|t| prost_transport::server_tls(t, l.protocol == Protocol::Http))
+                .transpose()?
+        };
         let plugins = prepare_plugins(
             registry,
             &l.plugins,
@@ -362,7 +369,7 @@ fn prepare(
             previous_l.map(|old| &old.plugins),
         )?;
         let has_hooks = plugins.iter().any(PreparedPlugin::has_event_hooks);
-        let routes = l
+        let routes: Vec<Arc<Vec<PreparedPlugin>>> = l
             .routes
             .iter()
             .enumerate()
@@ -391,6 +398,11 @@ fn prepare(
             )
         });
         let default_upstream = l.upstream.as_ref().map(|name| upstreams[name].clone());
+        let uri_filter = plugins.iter().any(PreparedPlugin::uses_request_uri);
+        let route_uri_filters = routes
+            .iter()
+            .map(|p| p.iter().any(PreparedPlugin::uses_request_uri))
+            .collect();
         let route_upstreams = l
             .routes
             .iter()
@@ -408,6 +420,8 @@ fn prepare(
                 default_upstream,
                 route_upstreams,
                 has_hooks,
+                uri_filter,
+                route_uri_filters,
             }),
         );
     }
@@ -798,12 +812,7 @@ impl RunningProxy {
                 } else {None};
                 let mut request_headers=http::HeaderMap::new();
                 if needs & prost_plugin::NEEDS_REQUEST_HEADERS != 0 {for p in l.plugins.iter().chain(route_plugins.unwrap_or_default()){p.copy_header_inputs(false,request.headers(),&mut request_headers);}}
-                header_context=Some(HeaderContext{remote_addr:info.forwarded_for.clone(),scheme:if l.tls.is_some(){"https"}else{"http"},method:request.method().clone(),uri:request.uri().clone(),host:HeaderValue::from_str(&request_host(&request).to_ascii_lowercase())?,request_id,request_headers,upstream_addr:None,upstream_headers:http::HeaderMap::new()});
-            }
-            if selected.is_none() {
-                let mut response=prost_http::response(404,"no matching route\n");
-                apply_local_headers(&mut response,&snapshot,&id,selected_route,peer,header_context.as_ref(),(head_request,downstream_version)).await;
-                return Ok(response);
+                header_context=Some(HeaderContext{remote_addr:info.forwarded_for.clone(),scheme:if l.tls.is_some(){"https"}else{"http"},method:request.method().clone(),uri:request.uri().clone(),current_uri:None,host:HeaderValue::from_str(&request_host(&request).to_ascii_lowercase())?,request_id,request_headers,upstream_addr:None,upstream_headers:http::HeaderMap::new()});
             }
             if !l.config.trusted_proxies.iter().any(|cidr| cidr.contains(&info.peer.ip())) {
                 let names: Vec<_> = request.headers().keys().filter(|n| n.as_str() == "forwarded" || n.as_str().starts_with("x-forwarded-")).cloned().collect();
@@ -819,8 +828,20 @@ impl RunningProxy {
                 Some(event)
             } else { None };
             let phase = Phase{hook:"request_headers",peer,status:200,context:header_context.as_ref(),skip_headers:overrides.0};
-            invoke_http_plugins(&l.plugins,phase,event.as_mut(),Some(request.headers_mut())).await?;
-            if let Some(plugins) = route_plugins { invoke_http_plugins(plugins,phase.child(),event.as_mut(),Some(request.headers_mut())).await?; }
+            if l.uri_filter || route_index.is_some_and(|i|l.route_uri_filters[i]) {
+                let (uri, result) = Box::pin(invoke_uri_plugins(&l.plugins, route_plugins, phase, event.as_mut(), &mut request)).await;
+                if let Some(ctx)=&mut header_context {ctx.current_uri=Some(Box::new(uri.clone()));}
+                *request.uri_mut()=uri;
+                result?;
+            } else {
+                invoke_http_plugins(&l.plugins,phase,event.as_mut(),Some(request.headers_mut())).await?;
+                if let Some(plugins)=route_plugins {invoke_http_plugins(plugins,phase.child(),event.as_mut(),Some(request.headers_mut())).await?;}
+            }
+            if selected.is_none() {
+                let mut response=prost_http::response(404,"no matching route\n");
+                apply_local_headers(&mut response,&snapshot,&id,selected_route,peer,header_context.as_ref(),(head_request,downstream_version)).await;
+                return Ok(response);
+            }
             if let Some(event) = &mut event {
                 event.hook = "upstream".into();
                 invoke(&l.plugins,event,None).await?;
@@ -874,6 +895,23 @@ impl RunningProxy {
         match result {
             Ok(response) => response,
             Err(e) => {
+                if let Some(redirect) = e.downcast_ref::<NativeRedirect>() {
+                    let mut response = prost_http::response(redirect.0.status, "");
+                    response
+                        .headers_mut()
+                        .insert(header::LOCATION, redirect.0.location.clone());
+                    apply_local_headers(
+                        &mut response,
+                        &snapshot,
+                        &id,
+                        selected_route,
+                        peer,
+                        header_context.as_ref(),
+                        (head_request, downstream_version),
+                    )
+                    .await;
+                    return response;
+                }
                 if let Some(rejection) = e.downcast_ref::<FilterRejection>() {
                     let mut response = prost_http::response(
                         rejection.status,
@@ -1036,6 +1074,15 @@ impl std::fmt::Display for FilterRejection {
 }
 impl std::error::Error for FilterRejection {}
 
+#[derive(Debug)]
+struct NativeRedirect(Arc<prost_plugin::Redirect>);
+impl std::fmt::Display for NativeRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native redirect ({})", self.0.status)
+    }
+}
+impl std::error::Error for NativeRedirect {}
+
 #[derive(Clone, Copy)]
 struct Phase<'a> {
     hook: &'static str,
@@ -1088,8 +1135,17 @@ async fn invoke_http_plugins(
                     0
                 },
             };
-            match plugin.filter_call(&call, headers.as_deref_mut())? {
+            let decision = plugin.filter_call(&call, headers.as_deref_mut())?;
+            match decision {
                 FilterDecision::Continue => {}
+                FilterDecision::Redirect(redirect) => {
+                    ensure!(
+                        hook == "request_headers"
+                            && matches!(redirect.status, 301 | 302 | 303 | 307 | 308),
+                        "invalid native redirect"
+                    );
+                    return Err(NativeRedirect(redirect).into());
+                }
                 FilterDecision::Reject {
                     status,
                     retry_after,
@@ -1113,6 +1169,80 @@ async fn invoke_http_plugins(
         }
     }
     Ok(())
+}
+// URI-aware execution is boxed only when enabled, keeping ordinary request
+// futures small and preserving the existing header/ACL/rate filter path.
+async fn invoke_uri_plugins(
+    parent: &[PreparedPlugin],
+    child: Option<&[PreparedPlugin]>,
+    phase: Phase<'_>,
+    mut event: Option<&mut Event>,
+    request: &mut Request<Incoming>,
+) -> (http::Uri, Result<()>) {
+    let mut uri = request.uri().clone();
+    let result = async {
+        for (plugin, phase) in parent
+            .iter()
+            .map(|p| (p, phase))
+            .chain(child.unwrap_or_default().iter().map(|p| (p, phase.child())))
+        {
+            if !plugin.has_hook("request_headers") {
+                continue;
+            }
+            if !plugin.is_filter() {
+                if let Some(event) = event.as_deref_mut() {
+                    if event.hook != "request_headers" {
+                        event.hook = "request_headers".into();
+                    }
+                    invoke(
+                        std::slice::from_ref(plugin),
+                        event,
+                        Some(request.headers_mut()),
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            let call = FilterCall {
+                hook: FilterHook::RequestHeaders,
+                peer: phase.peer,
+                status: 200,
+                context: phase.context,
+                inherited_skip: if plugin.parent_override().is_some() {
+                    phase.skip_headers
+                } else {
+                    0
+                },
+            };
+            match plugin.filter_request(&call, &mut uri, request.headers_mut())? {
+                FilterDecision::Continue => {}
+                FilterDecision::Redirect(redirect) => {
+                    ensure!(
+                        matches!(redirect.status, 301 | 302 | 303 | 307 | 308),
+                        "invalid native redirect"
+                    );
+                    return Err(NativeRedirect(redirect).into());
+                }
+                FilterDecision::Reject {
+                    status,
+                    retry_after,
+                } => {
+                    ensure!(
+                        (400..=599).contains(&status),
+                        "invalid native filter rejection status"
+                    );
+                    return Err(FilterRejection {
+                        status,
+                        retry_after,
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    (uri, result)
 }
 fn attach_trailers(
     response: &mut Response<Body>,

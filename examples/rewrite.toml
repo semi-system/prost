@@ -1,0 +1,36 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "blue"
+address = "blue:8080"
+
+[upstreams.echo]
+[[upstreams.echo.endpoints]]
+id = "blue"
+address = "blue:9000"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+
+[[listeners.plugins]]
+name = "rewrite"
+config = { rules = [{ action = "redirect", exact = "/legacy", to = "/new", status = 308 }, { action = "rewrite", prefix = "/api/v1/", to = "/api/v2/" }, { action = "rewrite", regex = '^/users/([0-9]+)$', to = "/profiles/$1?source=legacy", query = "append", when = { source = "$request_method", equals = "GET" } }] }
+
+[[listeners.plugins]]
+name = "headers"
+config = { request = { set = { x-original-uri = "$request_uri", x-proxy-uri = "$uri" } }, response = { set = { x-proxy = "prost", x-original-uri = "$request_uri", x-current-uri = "$uri" } } }
+
+[[listeners]]
+id = "echo"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "echo"

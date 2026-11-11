@@ -9,6 +9,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--profile", choices=["dev", "release"], default="release")
 parser.add_argument("--tag")
 parser.add_argument("--features", default="", help="Optional Cargo features, e.g. prost-cli/wasm")
+parser.add_argument("--base-image", default="prost:mvp", help="Existing compatible runtime image to receive the built binaries")
 args = parser.parse_args()
 tag = args.tag or ("prost:bench-debug" if args.profile == "dev" else "prost:bench-release")
 
@@ -31,7 +32,7 @@ try:
             profile_dir = "debug" if args.profile == "dev" else "release"
             run("docker", "cp", f"{name}:/work/target/{profile_dir}/{binary}", str(context / binary))
         (context / "Dockerfile").write_text(
-            "FROM prost:mvp\nCOPY prost prostctl /usr/local/bin/\n")
+            f"FROM {args.base_image}\nCOPY prost prostctl /usr/local/bin/\n")
         run("docker", "build", "-t", tag, str(context))
 finally:
     run("docker", "rm", name)

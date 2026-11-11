@@ -23,6 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nghttp2-client
+          python3 scripts/sni-smoke.py --image prost:mvp --output test-results/advanced-ci/sni-smoke.json
           docker tag prost:mvp prost:advanced-release
           python3 scripts/prepare-advanced-bench.py
           docker compose -f benchmarks/advanced/compose.yaml build backend

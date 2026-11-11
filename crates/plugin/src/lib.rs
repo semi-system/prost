@@ -5,7 +5,7 @@ pub use headers::{
     HeaderContext, REQUEST_HEADERS as NEEDS_REQUEST_HEADERS, REQUEST_ID as NEEDS_REQUEST_ID,
     UPSTREAM_HEADERS as NEEDS_UPSTREAM_HEADERS,
 };
-pub use native::{FilterCall, FilterDecision, FilterHook, NativeFilter};
+pub use native::{FilterCall, FilterDecision, FilterHook, NativeFilter, Redirect};
 use prost_config::Plugin;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
@@ -83,6 +83,11 @@ impl PluginRegistry {
     fn prepare_inner(&self, p: &Plugin) -> Result<PreparedPlugin> {
         let value = || serde_json::to_value(&p.config);
         match p.name.as_str() {
+            "rewrite" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(headers::Rewrite::new(
+                    value()?,
+                )?)))
+            }
             "headers" => {
                 return Ok(PreparedPlugin::Fast(Arc::new(headers::Headers::new(
                     value()?,
@@ -152,6 +157,28 @@ fn hook_bit(hook: &str) -> u8 {
     }
 }
 impl PreparedPlugin {
+    pub fn uses_request_uri(&self) -> bool {
+        if !self.has_hook("request_headers") {
+            return false;
+        }
+        match self {
+            Self::Filtered(p, _) => p.uses_request_uri(),
+            Self::Fast(p) => p.uses_request_uri(),
+            _ => false,
+        }
+    }
+    pub fn filter_request(
+        &self,
+        call: &FilterCall<'_>,
+        uri: &mut http::Uri,
+        headers: &mut http::HeaderMap,
+    ) -> Result<FilterDecision> {
+        match self {
+            Self::Filtered(p, _) => p.filter_request(call, uri, headers),
+            Self::Fast(p) => p.filter_request(call, uri, headers),
+            _ => Ok(FilterDecision::Continue),
+        }
+    }
     pub fn copy_header_inputs(
         &self,
         upstream: bool,

@@ -1,0 +1,41 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "blue"
+address = "blue:8080"
+
+[upstreams.api]
+[[upstreams.api.endpoints]]
+id = "green"
+address = "green:8080"
+
+[[listeners]]
+id = "https"
+address = "0.0.0.0:8443"
+protocol = "http"
+upstream = "web"
+
+[listeners.tls]
+certificate = "/certs/default.pem"
+private_key = "/certs/default.key"
+reject_unknown_sni = false
+
+[[listeners.tls.certificates]]
+server_names = ["api.example.test"]
+certificate = "/certs/api.pem"
+private_key = "/certs/api.key"
+
+[[listeners.tls.certificates]]
+server_names = ["*.example.test"]
+certificate = "/certs/wildcard.pem"
+private_key = "/certs/wildcard.key"
+
+[[listeners.routes]]
+host = "api.example.test"
+path_prefix = "/"
+upstream = "api"

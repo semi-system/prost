@@ -23,12 +23,29 @@ impl FilterHook {
 }
 pub enum FilterDecision {
     Continue,
+    Redirect(std::sync::Arc<Redirect>),
     Reject {
         status: u16,
         retry_after: Option<u64>,
     },
 }
+#[derive(Debug)]
+pub struct Redirect {
+    pub status: u16,
+    pub location: http::HeaderValue,
+}
 pub trait NativeFilter: Send + Sync {
+    fn uses_request_uri(&self) -> bool {
+        false
+    }
+    fn filter_request(
+        &self,
+        call: &FilterCall<'_>,
+        _: &mut http::Uri,
+        headers: &mut HeaderMap,
+    ) -> Result<FilterDecision> {
+        self.filter_with_context(call, Some(headers))
+    }
     fn header_inputs(&self, _: bool) -> &[http::HeaderName] {
         &[]
     }

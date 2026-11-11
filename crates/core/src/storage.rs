@@ -79,6 +79,10 @@ pub fn stage(mut c: Config) -> Result<Config> {
         if let Some(tls) = &mut l.tls {
             artifact(&mut tls.certificate, &dir)?;
             artifact(&mut tls.private_key, &dir)?;
+            for cert in &mut tls.certificates {
+                artifact(&mut cert.certificate, &dir)?;
+                artifact(&mut cert.private_key, &dir)?;
+            }
         }
         for p in l
             .plugins

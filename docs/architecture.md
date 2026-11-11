@@ -52,9 +52,21 @@ raise it for applications with long uploads before headers are returned.
 
 Route ordering is priority, longest prefix, then first declaration. If no route
 matches, the listener-level upstream is used; without one the result is 404.
-Health checks verify TCP/TLS connectivity, not application readiness. Passive
+Native request filters run before that 404, so a redirect-only listener can return
+without an upstream. The rewrite filter changes the forwarded path/query while
+retaining the original route, method and streaming body. Redirects finish the
+request phase and run local native response filters. See [rewrite.md](rewrite.md).
+Health checks verify TCP/TLS connectivity or perform HTTP GET checks with expected
+status, timeout and fall/rise thresholds; see [advanced-features.md](advanced-features.md). Passive
 transport errors exclude an endpoint until an active check succeeds. Requests
 are never automatically retried.
+
+TLS listeners select certificates using exact SNI names or single-label wildcards.
+Certificate/key bundles are prepared and staged as artifacts before commit. A
+policy can reject absent/unmatched SNI; the default retains the original fallback
+certificate behavior. TLS state is reused when unchanged, while rotations create
+new state for newly accepted connections; existing sessions retain their state.
+Details and runnable smoke: [tls-sni.md](tls-sni.md).
 
 Native plugins implement `prost_plugin::NativePlugin` and register before start.
 Their callbacks must return quickly and must not block Tokio workers. The

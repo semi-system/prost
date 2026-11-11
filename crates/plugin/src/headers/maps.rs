@@ -224,6 +224,7 @@ pub(super) fn requirements(
     })
 }
 pub(super) struct Eval<'a> {
+    pub current_uri: Option<&'a http::Uri>,
     maps: &'a [Map],
     results: Vec<Option<HeaderValue>>,
     captures: Vec<HeaderValue>,
@@ -233,6 +234,7 @@ pub(super) struct Eval<'a> {
 impl<'a> Eval<'a> {
     pub fn new(maps: &'a [Map]) -> Self {
         Self {
+            current_uri: None,
             maps,
             results: Vec::new(),
             captures: Vec::new(),
@@ -245,6 +247,20 @@ impl<'a> Eval<'a> {
             .get(index)
             .cloned()
             .unwrap_or_else(|| HeaderValue::from_static(""))
+    }
+    pub fn set_captures(&mut self, captures: regex::Captures<'_>) -> Result<()> {
+        self.captures = (0..captures.len().min(10))
+            .map(|i| HeaderValue::from_str(captures.get(i).map_or("", |m| m.as_str())))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(
+            self.captures
+                .iter()
+                .map(|v| v.as_bytes().len())
+                .sum::<usize>()
+                <= 32768,
+            "rewrite captures exceed 32 KiB"
+        );
+        Ok(())
     }
     pub fn get(
         &mut self,

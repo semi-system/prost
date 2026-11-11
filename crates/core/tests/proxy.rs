@@ -580,6 +580,296 @@ async fn keyed_rate_limit_shares_workers_and_survives_neighbor_update() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_rewrite_h1_h2_keeps_route_and_stream_snapshot() -> Result<()> {
+    let main = http_server("main").await;
+    let other = http_server("other").await;
+    let mut fixture = Fixture::new(Protocol::Http, main.address);
+    fixture.config.upstreams.get_mut("main").unwrap().http2 = true;
+    let mut other_upstream = fixture.config.upstreams["main"].clone();
+    other_upstream.endpoints[0].address = other.address.to_string();
+    fixture
+        .config
+        .upstreams
+        .insert("other".into(), other_upstream);
+    fixture.config.listeners[0]
+        .routes
+        .push(serde_json::from_value(serde_json::json!({
+            "path_prefix":"/new","upstream":"other"
+        }))?);
+    let rules = serde_json::json!({"rules":[
+        {"action":"rewrite","exact":"/old","to":"/new"},
+        {"action":"rewrite","regex":"^/old/(.*)$","to":"/$1"}
+    ]});
+    fixture.config.listeners[0].plugins = vec![
+        builtin("rewrite", rules.clone())?,
+        builtin(
+            "headers",
+            serde_json::json!({"request":{"set":{"x-test-plugin":"$uri|$request_uri"}},
+            "response":{"set":{"x-current":"$uri","x-original":"$request_uri"}},
+            "trailers":[{"name":"x-final-uri","value":"$uri"}]}),
+        )?,
+    ];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let request = |path: &str| {
+        Request::builder()
+            .uri(format!("http://localhost{path}"))
+            .header("host", "localhost")
+            .header("te", "trailers")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let h1driver = tokio::spawn(conn);
+    let response = h1.send_request(request("/old?a=1")).await?;
+    assert_eq!(response.headers()["x-seen-uri"], "/new?a=1");
+    assert_eq!(response.headers()["x-seen-plugin"], "/new|/old?a=1");
+    assert_eq!(response.headers()["x-current"], "/new");
+    assert_eq!(response.headers()["x-original"], "/old?a=1");
+    let body = response.into_body().collect().await?;
+    assert_eq!(body.trailers().unwrap()["x-final-uri"], "/new");
+    assert_eq!(body.to_bytes(), "main"); // Original route is retained after rewriting to /new.
+    let response = h1.send_request(request("/new")).await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "other");
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let h2driver = tokio::spawn(conn);
+    let response = h2.send_request(request("/old/grpc?x=1")).await?;
+    assert_eq!(response.headers()["x-seen-uri"], "/grpc?x=1");
+    let body = response.into_body().collect().await?;
+    assert_eq!(body.trailers().unwrap()["grpc-status"], "0");
+    assert_eq!(body.trailers().unwrap()["x-final-uri"], "/grpc");
+    assert_eq!(body.to_bytes(), Bytes::from_static(b"\0\0\0\0\x04test"));
+    let streaming = h2.send_request(request("/old/split")).await?;
+    assert_eq!(streaming.headers()["x-current"], "/split");
+    let mut next = p.snapshot().config.clone();
+    let mut next_rules = rules;
+    next_rules["rules"][0]["to"] = serde_json::json!("/changed");
+    next.listeners[0].plugins[0] = builtin("rewrite", next_rules)?;
+    p.apply(next.encode()?, 0).await?;
+    let body = streaming.into_body().collect().await?;
+    assert_eq!(body.trailers().unwrap()["x-final-uri"], "/split");
+    assert_eq!(body.to_bytes(), "onetwo");
+    for response in [
+        h1.send_request(request("/old")).await?,
+        h2.send_request(request("/old")).await?,
+    ] {
+        assert_eq!(response.headers()["x-current"], "/changed");
+        assert_eq!(response.headers()["x-seen-uri"], "/changed");
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "main");
+    }
+    assert_eq!(p.metrics.errors.get(), 0);
+    drop(h1);
+    drop(h2);
+    h1driver.abort();
+    h2driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_rewrite_upload_streams_before_eof_and_survives_apply() -> Result<()> {
+    let first = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let socket = TcpListener::bind("127.0.0.1:0").await?;
+    let address = socket.local_addr()?;
+    let received = first.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((io, _)) = socket.accept().await {
+            let received = received.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |mut req: Request<Incoming>| {
+                    let received = received.clone();
+                    async move {
+                        assert_eq!(req.method(), "POST");
+                        assert_eq!(req.uri().path(), "/v1/upload");
+                        let mut bytes = Vec::new();
+                        let mut trailer = false;
+                        while let Some(frame) = req.body_mut().frame().await {
+                            let frame = frame.unwrap();
+                            if let Some(data) = frame.data_ref() {
+                                bytes.extend_from_slice(data);
+                                received.notify_one();
+                            }
+                            if let Some(headers) = frame.trailers_ref() {
+                                assert_eq!(headers["x-upload-end"], "done");
+                                trailer = true;
+                            }
+                        }
+                        assert_eq!(bytes, b"first-second");
+                        assert!(trailer);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(bytes))))
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(io), service)
+                    .await;
+            });
+        }
+    });
+    let _backend = Server { address, task };
+    let mut fixture = Fixture::new(Protocol::Http, address);
+    fixture.config.upstreams.get_mut("main").unwrap().http2 = true;
+    fixture.config.listeners[0].plugins.push(builtin(
+        "rewrite",
+        serde_json::json!({"rules":[{"action":"rewrite","exact":"/upload","to":"/v1/upload"}]}),
+    )?);
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    let release = resume.clone();
+    let frames = futures_util::stream::once(async {
+        Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"first-")))
+    })
+    .chain(futures_util::stream::once(async move {
+        release.notified().await;
+        Ok(Frame::data(Bytes::from_static(b"second")))
+    }))
+    .chain(futures_util::stream::once(async {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-upload-end", http::HeaderValue::from_static("done"));
+        Ok(Frame::trailers(trailers))
+    }));
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://localhost/upload")
+        .header("te", "trailers")
+        .body(StreamBody::new(frames).boxed_unsync())?;
+    let request_task = tokio::spawn(async move {
+        let response = client.send_request(request).await?;
+        assert_eq!(response.status(), 200);
+        response
+            .into_body()
+            .collect()
+            .await
+            .map(|v| v.to_bytes())
+            .map_err(anyhow::Error::from)
+    });
+    // The backend must see bytes while the client deliberately withholds EOF.
+    timeout(Duration::from_secs(2), first.notified()).await?;
+    let mut next = p.snapshot().config.clone();
+    next.listeners[0].plugins[0] = builtin(
+        "rewrite",
+        serde_json::json!({"rules":[{"action":"rewrite","exact":"/upload","to":"/v2/upload"}]}),
+    )?;
+    p.apply(next.encode()?, 0).await?;
+    resume.notify_one();
+    assert_eq!(
+        timeout(Duration::from_secs(2), request_task).await???,
+        "first-second"
+    );
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Result<()> {
+    let backend = http_server("unused").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    fixture.config.listeners[0].upstream = None;
+    fixture.config.upstreams.get_mut("main").unwrap().endpoints[0].enabled = false;
+    fixture.config.listeners[0].plugins = vec![
+        builtin("ip_acl", serde_json::json!({"allow":["127.0.0.0/8"]}))?,
+        builtin(
+            "rewrite",
+            serde_json::json!({"rules":[
+                {"action":"redirect","exact":"/redirect","to":"/destination?from=1","query":"append","status":308},
+                {"action":"redirect","exact":"/dynamic","to":"$http_x_target"}
+            ]}),
+        )?,
+        builtin(
+            "headers",
+            serde_json::json!({"response":{"set":{"x-native":"yes","x-status":"$status"}}}),
+        )?,
+    ];
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let request = |path: &str, method: &str| {
+        Request::builder()
+            .method(method)
+            .uri(format!("http://localhost{path}"))
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let h1driver = tokio::spawn(conn);
+    for method in ["GET", "HEAD", "POST"] {
+        let response = h1.send_request(request("/redirect?old=2", method)).await?;
+        assert_eq!(response.status(), 308);
+        assert_eq!(response.headers()["location"], "/destination?from=1&old=2");
+        assert_eq!(response.headers()["x-native"], "yes");
+        assert!(response.into_body().collect().await?.to_bytes().is_empty());
+    }
+    let response = h1.send_request(request("/unmatched", "GET")).await?;
+    assert_eq!(response.status(), 404);
+    response.into_body().collect().await?;
+    let mut dynamic = request("/dynamic", "GET");
+    dynamic.headers_mut().insert(
+        "x-target",
+        http::HeaderValue::from_static("//untrusted.example"),
+    );
+    let response = h1.send_request(dynamic).await?;
+    assert_eq!(response.status(), 503);
+    assert!(!response.headers().contains_key("location"));
+    response.into_body().collect().await?;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let h2driver = tokio::spawn(conn);
+    let response = h2.send_request(request("/redirect", "POST")).await?;
+    assert_eq!(response.status(), 308);
+    assert_eq!(response.headers()["x-status"], "308");
+    response.into_body().collect().await?;
+    let durable = std::fs::read(&fixture.path)?;
+    let mut invalid = p.snapshot().config.clone();
+    invalid.listeners[0].plugins[1] = builtin(
+        "rewrite",
+        serde_json::json!({"rules":[{"action":"rewrite","regex":"[","to":"/new"}]}),
+    )?;
+    assert!(p.apply(invalid.encode()?, 0).await.is_err());
+    assert_eq!(p.snapshot().config.generation, 0);
+    assert_eq!(std::fs::read(&fixture.path)?, durable);
+    let mut next = p.snapshot().config.clone();
+    next.listeners[0].plugins.insert(
+        1,
+        builtin(
+            "rate_limit",
+            serde_json::json!({"requests_per_second":1,"burst":1}),
+        )?,
+    );
+    p.apply(next.encode()?, 0).await?;
+    let response = h1.send_request(request("/redirect", "GET")).await?;
+    assert_eq!(response.status(), 308);
+    response.into_body().collect().await?;
+    let response = h2.send_request(request("/redirect", "GET")).await?;
+    assert_eq!(response.status(), 429);
+    assert!(!response.headers().contains_key("location"));
+    response.into_body().collect().await?;
+    let mut next = p.snapshot().config.clone();
+    next.listeners[0].plugins[0] = builtin("ip_acl", serde_json::json!({"deny":["127.0.0.0/8"]}))?;
+    p.apply(next.encode()?, 1).await?;
+    let response = h1.send_request(request("/redirect", "GET")).await?;
+    assert_eq!(response.status(), 403);
+    assert!(!response.headers().contains_key("location"));
+    response.into_body().collect().await?;
+    assert_eq!(p.metrics.errors.get(), 1); // Only the intentionally invalid dynamic target is an error.
+    drop(h1);
+    drop(h2);
+    h1driver.abort();
+    h2driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> {
     let backend = http_server("limited").await;
     let mut fixture = Fixture::new(Protocol::Http, backend.address);
@@ -1139,6 +1429,17 @@ async fn http_server(label: &'static str) -> Server {
                         };
                     let path = request.uri().path();
                     let mut response = Response::new(body);
+                    response.headers_mut().insert(
+                        "x-seen-uri",
+                        http::HeaderValue::from_str(
+                            request.uri().path_and_query().map_or("/", |p| p.as_str()),
+                        )
+                        .unwrap(),
+                    );
+                    response.headers_mut().insert(
+                        "x-seen-method",
+                        http::HeaderValue::from_str(request.method().as_str()).unwrap(),
+                    );
                     if let Some(status) = path
                         .strip_prefix("/status/")
                         .and_then(|v| v.parse::<u16>().ok())
@@ -1398,7 +1699,16 @@ async fn http2_grpc_trailers_and_untrusted_forwarded_headers() -> Result<()> {
 }
 
 fn certificate(dir: &std::path::Path) -> Result<prost_config::ServerTls> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    certificate_for(dir, &["localhost"])
+}
+fn certificate_for(dir: &std::path::Path, names: &[&str]) -> Result<prost_config::ServerTls> {
+    std::fs::create_dir_all(dir)?;
+    let cert = rcgen::generate_simple_self_signed(
+        names
+            .iter()
+            .map(|n| (*n).to_owned())
+            .collect::<Vec<String>>(),
+    )?;
     let certificate = dir.join("cert.pem");
     let private_key = dir.join("key.pem");
     std::fs::write(&certificate, cert.cert.pem())?;
@@ -1406,8 +1716,285 @@ fn certificate(dir: &std::path::Path) -> Result<prost_config::ServerTls> {
     Ok(prost_config::ServerTls {
         certificate,
         private_key,
+        ..Default::default()
     })
 }
+#[tokio::test]
+async fn sni_tcp_selection_strict_policy_rotation_and_restart() -> Result<()> {
+    let backend = echo().await;
+    let mut fixture = Fixture::new(Protocol::Tcp, backend.address);
+    let default = certificate_for(
+        &fixture.dir.path().join("default"),
+        &[
+            "localhost",
+            "unknown.other.test",
+            "example.test",
+            "deep.shop.example.test",
+        ],
+    )?;
+    let exact = certificate_for(
+        &fixture.dir.path().join("exact"),
+        &["api.example.test", "alias.example.test"],
+    )?;
+    let wildcard = certificate_for(&fixture.dir.path().join("wildcard"), &["*.example.test"])?;
+    let specific = certificate_for(
+        &fixture.dir.path().join("specific"),
+        &["*.internal.example.test"],
+    )?;
+    let mut tls = default.clone();
+    tls.certificates = vec![
+        prost_config::NamedCertificate {
+            server_names: vec!["API.Example.Test.".into(), "alias.example.test".into()],
+            certificate: exact.certificate.clone(),
+            private_key: exact.private_key.clone(),
+        },
+        prost_config::NamedCertificate {
+            server_names: vec!["*.example.test".into()],
+            certificate: wildcard.certificate.clone(),
+            private_key: wildcard.private_key.clone(),
+        },
+        prost_config::NamedCertificate {
+            server_names: vec!["*.internal.example.test".into()],
+            certificate: specific.certificate.clone(),
+            private_key: specific.private_key.clone(),
+        },
+    ];
+    fixture.config.listeners[0].tls = Some(tls);
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    for (name, cert) in [
+        ("localhost", &default),
+        ("api.example.test", &exact),
+        ("alias.example.test", &exact),
+        ("shop.example.test", &wildcard),
+        ("site.internal.example.test", &specific),
+        ("example.test", &default),
+        ("deep.shop.example.test", &default),
+        ("unknown.other.test", &default),
+    ] {
+        let mut io = connect_named(fixture.address(), name, cert, true, &[]).await?;
+        roundtrip(&mut io, name.as_bytes()).await?;
+    }
+    let mut no_sni = connect_named(fixture.address(), "localhost", &default, false, &[]).await?;
+    roundtrip(&mut no_sni, b"default without SNI").await?;
+    drop(no_sni);
+    let mut old = connect_named(fixture.address(), "api.example.test", &exact, true, &[]).await?;
+    let old_cert = old.get_ref().1.peer_certificates().unwrap()[0].clone();
+    let mut strict = p.snapshot().config.clone();
+    strict.listeners[0].tls.as_mut().unwrap().reject_unknown_sni = true;
+    p.apply(strict.encode()?, 0).await?;
+    assert!(
+        connect_named(fixture.address(), "unknown.other.test", &default, true, &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        connect_named(fixture.address(), "localhost", &default, false, &[])
+            .await
+            .is_err()
+    );
+    let mut known =
+        connect_named(fixture.address(), "shop.example.test", &wildcard, true, &[]).await?;
+    roundtrip(&mut known, b"strict wildcard").await?;
+    drop(known);
+    roundtrip(&mut old, b"survives strict update").await?;
+    let durable = std::fs::read(&fixture.path)?;
+    let mut bad = p.snapshot().config.clone();
+    bad.listeners[0].tls.as_mut().unwrap().certificates[0].private_key =
+        wildcard.private_key.clone();
+    assert!(p.apply(bad.encode()?, 1).await.is_err());
+    let mut bad = p.snapshot().config.clone();
+    bad.listeners[0].tls.as_mut().unwrap().certificates[1]
+        .server_names
+        .push("api.example.test".into());
+    assert!(p.apply(bad.encode()?, 1).await.is_err());
+    let mut bad = p.snapshot().config.clone();
+    bad.listeners[0].tls.as_mut().unwrap().certificates[0].certificate =
+        fixture.dir.path().join("missing.pem");
+    assert!(p.apply(bad.encode()?, 1).await.is_err());
+    assert_eq!(p.snapshot().config.generation, 1);
+    assert_eq!(std::fs::read(&fixture.path)?, durable);
+    roundtrip(&mut old, b"survives invalid configs").await?;
+    let replacement = certificate_for(
+        &fixture.dir.path().join("replacement"),
+        &["api.example.test", "alias.example.test"],
+    )?;
+    let mut next = p.snapshot().config.clone();
+    let entry = &mut next.listeners[0].tls.as_mut().unwrap().certificates[0];
+    entry.certificate = replacement.certificate.clone();
+    entry.private_key = replacement.private_key.clone();
+    p.apply(next.encode()?, 1).await?;
+    let mut new = connect_named(
+        fixture.address(),
+        "api.example.test",
+        &replacement,
+        true,
+        &[],
+    )
+    .await?;
+    assert_ne!(new.get_ref().1.peer_certificates().unwrap()[0], old_cert);
+    roundtrip(&mut new, b"new certificate").await?;
+    roundtrip(&mut old, b"old session still works").await?;
+    let restart_exact = named_connector(&replacement, true, &[])?;
+    let restart_wildcard = named_connector(&wildcard, true, &[])?;
+    let restart_default = named_connector(&default, true, &[])?;
+    for cert in [&default, &exact, &wildcard, &specific, &replacement] {
+        std::fs::remove_file(&cert.certificate)?;
+        std::fs::remove_file(&cert.private_key)?;
+    }
+    drop(old);
+    drop(new);
+    p.shutdown().await;
+    drop(p);
+    let p = fixture.start().await;
+    assert_eq!(p.snapshot().config.generation, 2);
+    for (name, connector) in [
+        ("api.example.test", restart_exact),
+        ("shop.example.test", restart_wildcard),
+    ] {
+        let mut io = connector
+            .connect(
+                name.try_into()?,
+                TcpStream::connect(fixture.address()).await?,
+            )
+            .await?;
+        roundtrip(&mut io, b"persisted SNI artifact").await?;
+    }
+    assert!(restart_default
+        .connect(
+            "unknown.other.test".try_into()?,
+            TcpStream::connect(fixture.address()).await?
+        )
+        .await
+        .is_err());
+    p.shutdown().await;
+    Ok(())
+}
+
+fn named_connector(
+    cert: &prost_config::ServerTls,
+    send_sni: bool,
+    alpn: &[&[u8]],
+) -> Result<tokio_rustls::TlsConnector> {
+    let mut client = (*prost_transport::client_tls(Some(&prost_config::ClientTls {
+        server_name: "localhost".into(),
+        ca_certificate: Some(cert.certificate.clone()),
+    }))?)
+    .clone();
+    client.enable_sni = send_sni;
+    client.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client)))
+}
+async fn connect_named(
+    address: SocketAddr,
+    name: &str,
+    cert: &prost_config::ServerTls,
+    send_sni: bool,
+    alpn: &[&[u8]],
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    Ok(timeout(
+        Duration::from_secs(2),
+        named_connector(cert, send_sni, alpn)?.connect(
+            name.to_owned().try_into()?,
+            TcpStream::connect(address).await?,
+        ),
+    )
+    .await??)
+}
+
+#[tokio::test]
+async fn sni_http1_http2_and_live_streams_use_new_routes() -> Result<()> {
+    let main = http_server("default").await;
+    let api = http_server("api").await;
+    let mut fixture = Fixture::new(Protocol::Http, main.address);
+    let default = certificate_for(&fixture.dir.path().join("default"), &["localhost"])?;
+    let exact = certificate_for(&fixture.dir.path().join("exact"), &["api.example.test"])?;
+    let mut tls = default;
+    tls.reject_unknown_sni = true;
+    tls.certificates.push(prost_config::NamedCertificate {
+        server_names: vec!["api.example.test".into()],
+        certificate: exact.certificate.clone(),
+        private_key: exact.private_key.clone(),
+    });
+    fixture.config.listeners[0].tls = Some(tls);
+    let mut upstream = fixture.config.upstreams["main"].clone();
+    upstream.endpoints[0].address = api.address.to_string();
+    fixture.config.upstreams.insert("api".into(), upstream);
+    fixture.config.listeners[0]
+        .routes
+        .push(serde_json::from_value(serde_json::json!({
+            "host":"api.example.test", "path_prefix":"/", "upstream":"api"
+        }))?);
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = connect_named(
+        fixture.address(),
+        "api.example.test",
+        &exact,
+        true,
+        &[b"http/1.1"],
+    )
+    .await?;
+    assert_eq!(io.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let h1driver = tokio::spawn(conn);
+    let request = || {
+        Request::builder()
+            .uri("https://api.example.test/")
+            .header("host", "api.example.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let response = h1.send_request(request()).await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "api");
+    let io = connect_named(
+        fixture.address(),
+        "api.example.test",
+        &exact,
+        true,
+        &[b"h2"],
+    )
+    .await?;
+    assert_eq!(io.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (mut h2, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let h2driver = tokio::spawn(conn);
+    let response = h2.send_request(request()).await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "api");
+    let replacement = certificate_for(
+        &fixture.dir.path().join("replacement"),
+        &["api.example.test"],
+    )?;
+    let mut next = p.snapshot().config.clone();
+    let cert = &mut next.listeners[0].tls.as_mut().unwrap().certificates[0];
+    cert.certificate = replacement.certificate.clone();
+    cert.private_key = replacement.private_key.clone();
+    next.listeners[0].routes[0].upstream = "main".into();
+    p.apply(next.encode()?, 0).await?;
+    for response in [
+        h1.send_request(request()).await?,
+        h2.send_request(request()).await?,
+    ] {
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "default");
+    }
+    let io = connect_named(
+        fixture.address(),
+        "api.example.test",
+        &replacement,
+        true,
+        &[b"h2"],
+    )
+    .await?;
+    assert_eq!(io.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    drop(io);
+    drop(h1);
+    drop(h2);
+    h1driver.abort();
+    h2driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn tls_termination_rotation_and_artifact_restart() -> Result<()> {
     let backend = echo().await;
@@ -1503,6 +2090,7 @@ async fn tls_upstream_verified_and_bad_certificate_rejected() -> Result<()> {
     bad.listeners[0].tls = Some(prost_config::ServerTls {
         certificate: fixture.dir.path().join("missing"),
         private_key: fixture.dir.path().join("missing-key"),
+        ..Default::default()
     });
     assert!(p.apply(bad.encode()?, 0).await.is_err());
     assert_eq!(p.snapshot().config.generation, 0);

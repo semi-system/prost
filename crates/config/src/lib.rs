@@ -7,6 +7,9 @@ use std::{
     path::PathBuf,
 };
 
+mod tls;
+pub use tls::{NamedCertificate, ServerTls};
+
 fn yes() -> bool {
     true
 }
@@ -180,12 +183,6 @@ pub struct ClientTls {
     #[serde(default)]
     pub ca_certificate: Option<PathBuf>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerTls {
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -343,6 +340,9 @@ impl Config {
         }
         for l in &self.listeners {
             l.http2_settings.validate()?;
+            if let Some(tls) = &l.tls {
+                tls.validate()?;
+            }
             valid_id(&l.id)?;
             ensure!(ids.insert(&l.id), "duplicate listener id");
             ensure!(
@@ -358,7 +358,7 @@ impl Config {
                 ensure!(
                     !l.plugins
                         .iter()
-                        .any(|p| matches!(p.name.as_str(), "headers" | "rate_limit")),
+                        .any(|p| matches!(p.name.as_str(), "headers" | "rate_limit" | "rewrite")),
                     "HTTP filter on TCP listener"
                 );
                 ensure!(

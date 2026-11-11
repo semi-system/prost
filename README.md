@@ -7,6 +7,11 @@ MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix
 gRPC streaming/trailers, weighted round-robin, TCP/TLS/HTTP health check, cấu hình
 flow control HTTP/2 và bộ filter native: header/trailer, expires, map/điều kiện,
 ACL và rate limit toàn cục/theo IP/header. WASM là feature tùy chọn, mặc định tắt.
+Native rewrite path/query và redirect có điều kiện: [docs/rewrite.md](docs/rewrite.md).
+So sánh rewrite với nginx và kiểm tra regression:
+[docs/rewrite-benchmark.md](docs/rewrite-benchmark.md).
+TLS hỗ trợ nhiều certificate theo SNI, exact/wildcard và hot rotate:
+[docs/tls-sni.md](docs/tls-sni.md).
 Đây là MVP để chạy thử; soak dài và
 đánh giá production vẫn còn cần thực hiện.
 
@@ -151,7 +156,7 @@ module = "/examples/add-header.wat"
 config = { label = "demo" }
 ```
 
-Build mặc định có `headers`, `ip_acl`, `rate_limit`, `connection_limit`.
+Build mặc định có `headers`, `rewrite`, `ip_acl`, `rate_limit`, `connection_limit`.
 Ví dụ WASM trên cần `--build-arg CARGO_FEATURES=prost-cli/wasm` khi build Docker,
 hoặc `cargo build --release --features prost-cli/wasm`.
 Filter tùy biến đăng ký qua API Rust; thêm code native cần build lại.

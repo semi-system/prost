@@ -1,10 +1,12 @@
 use crate::{FilterCall, FilterDecision, FilterHook, NativeFilter};
 mod conditions;
 mod maps;
+mod rewrite;
 use anyhow::{bail, ensure, Context, Result};
 use conditions::Condition;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use maps::{Eval, Names};
+pub(crate) use rewrite::Rewrite;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -21,6 +23,7 @@ pub struct HeaderContext {
     pub scheme: &'static str,
     pub method: Method,
     pub uri: Uri,
+    pub current_uri: Option<Box<Uri>>,
     pub host: HeaderValue,
     pub request_id: Option<HeaderValue>,
     pub request_headers: HeaderMap,
@@ -209,6 +212,14 @@ impl Value {
                     }
                     Variable::Capture(i) => push_value(&mut text, Some(&eval.capture(*i))),
                     Variable::Status => text.push_str(&status.to_string()),
+                    Variable::Uri => {
+                        if let Some(uri) = eval
+                            .current_uri
+                            .or_else(|| ctx.map(|c| c.current_uri.as_deref().unwrap_or(&c.uri)))
+                        {
+                            text.push_str(uri.path());
+                        }
+                    }
                     Variable::Sent(name) => push_header(&mut text, headers, name),
                     v => {
                         if let Some(c) = ctx {
@@ -219,7 +230,6 @@ impl Value {
                                 Variable::Method => text.push_str(c.method.as_str()),
                                 Variable::RequestUri => text
                                     .push_str(c.uri.path_and_query().map_or("/", |v| v.as_str())),
-                                Variable::Uri => text.push_str(c.uri.path()),
                                 Variable::RequestId => push_value(&mut text, c.request_id.as_ref()),
                                 Variable::UpstreamAddr => {
                                     push_value(&mut text, c.upstream_addr.as_ref())
@@ -715,6 +725,19 @@ impl Headers {
     }
 }
 impl NativeFilter for Headers {
+    fn filter_request(
+        &self,
+        call: &FilterCall<'_>,
+        uri: &mut Uri,
+        headers: &mut HeaderMap,
+    ) -> Result<FilterDecision> {
+        let mut eval = Eval::new(&self.maps);
+        eval.current_uri = Some(uri);
+        if call.inherited_skip & 1 == 0 {
+            self.request.apply(200, call.context, headers, &mut eval)?;
+        }
+        Ok(FilterDecision::Continue)
+    }
     fn header_inputs(&self, upstream: bool) -> &[HeaderName] {
         if upstream {
             &self.upstream_inputs

@@ -75,7 +75,7 @@ khi apply, không parse tên biến trên đường xử lý traffic.
 | `$host` | Host lowercase, bỏ port |
 | `$request_method` | Method request |
 | `$request_uri` | Path và query nguyên bản |
-| `$uri` | Path nguyên bản, không query; không giải mã percent-encoding |
+| `$uri` | Path hiện tại sau rewrite, không query; không giải mã percent-encoding |
 | `$request_id` | 16 byte random, biểu diễn 32 ký tự hex, dùng chung trong một request |
 | `$status` | Status response |
 | `$upstream_addr` | Địa chỉ kết nối upstream; fallback địa chỉ endpoint nếu connector không cung cấp HttpInfo |

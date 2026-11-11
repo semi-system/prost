@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use prost_config::{ClientTls, ServerTls, Upstream};
-use rustls::{pki_types::ServerName, ClientConfig, RootCertStore, ServerConfig};
+use prost_config::{ClientTls, Upstream};
+use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use std::{
     io::BufReader,
     sync::Arc,
@@ -17,6 +17,9 @@ pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 pub type BoxStream = Box<dyn Stream>;
 
+mod tls;
+pub use tls::server_tls;
+
 /// Detect dead peers without waiting for the kernel's long retransmission defaults.
 pub fn configure_socket(tcp: &TcpStream) -> Result<()> {
     tcp.set_nodelay(true)?;
@@ -32,21 +35,6 @@ pub fn configure_socket(tcp: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-pub fn server_tls(tls: &ServerTls, http: bool) -> Result<Arc<ServerConfig>> {
-    let cert = std::fs::read(&tls.certificate).context("read certificate")?;
-    let key = std::fs::read(&tls.private_key).context("read private key")?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert.as_slice()))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key.as_slice()))?
-        .context("missing private key")?;
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    if http {
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    }
-    Ok(Arc::new(config))
-}
 pub fn client_tls(tls: Option<&ClientTls>) -> Result<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
