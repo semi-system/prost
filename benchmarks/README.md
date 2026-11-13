@@ -1,5 +1,83 @@
 # HTTP proxy comparison
 
+Four-backend algorithm comparison (independent project):
+
+```sh
+sudo python3 scripts/prepare-advanced-bench.py
+sudo docker compose -f benchmarks/advanced/compose.yaml build backend
+sudo python3 scripts/balance-bench.py --image prost:native --rounds 3 --requests 20000
+```
+
+Compares weighted round-robin and least-conn with uniform backends and with one
+backend delaying response headers by 5 ms; consistent hash uses a uniform farm
+and a corpus of 256 request-URI keys. Proxy quota is 2 CPU/256 MiB, each of four
+backends gets 1 CPU/128 MiB. All cases use TLS + HTTP/2 downstream, HTTP/1.1
+upstream, 34-byte bodies, 32 connections × 4 streams and 2 h2load threads.
+Each proxy runs alone; image and case order rotate. Request logging, cache,
+buffering and retries are off. nginx uses a shared upstream zone for global
+least-conn state. Prost runs active /ready checks, which do not increment the
+fixture's measured request counters; nginx uses passive checking.
+
+Idle capacity is capped at 512 across the four addresses: Prost allows 128 per
+host, nginx 256 per worker for the group. Allocation differs (per host versus
+shared group), so pool behavior remains part of the result. Backend request
+counters must sum to the measured load, validating that responses reach the
+backend. Key affinity is checked in preflight; nginx and Prost hash mappings
+differ. Compare hash results as complete routing workloads, not isolated hash
+function cost. Raw counts expose backend distribution. Client/server share the
+WSL host and are not CPU-pinned; CI's small functional runs are not performance
+measurements. Do not run another benchmark/build concurrently.
+Pass `--pin-cpus` on a host with at least 8 distinct guest cores to place the
+2-thread client, 2-core proxy and four backends on separate cores. Pinning uses
+one logical CPU per core from lscpu and records the masks. It does not isolate
+Windows/hypervisor work. Saved results: [load-balancing-benchmark.md](../docs/load-balancing-benchmark.md).
+
+Endpoint capacity and backup spillover (optional cases, not in the five-case default):
+
+```sh
+sudo python3 scripts/balance-bench.py --pin-cpus --rounds 3 --requests 20000 \
+  --cases rr_backup least_backup --output-dir test-results/capacity-benchmark-final
+```
+
+node-a is the sole primary, with a 5 ms delay and cap 16; the other three nodes
+are backups without separate caps. Prost uses `max_active`, nginx `max_conns`
+with a shared zone and HTTP/1 upstream. Preflight serial traffic must stay on
+the primary; measured concurrent traffic must reach both tiers, with every
+request accounted for by backend counters. Units differ for multiplexed HTTP/2
+upstreams. See [upstream-capacity.md](../docs/upstream-capacity.md).
+Saved measurements: [upstream-capacity-benchmark.md](../docs/upstream-capacity-benchmark.md).
+The control requires the preserved pre-change image `prost:admission-control`
+(image ID in the saved summaries), not a rebuild of current source with another tag.
+
+```sh
+sudo python3 scripts/compare-header-images.py --before prost:admission-control \
+  --after prost:native --rounds 5 --pin-cpus --output-dir test-results/capacity-header-final
+sudo python3 scripts/report-balance-bench.py --directory test-results/capacity-benchmark-final \
+  --control test-results/capacity-header-final/summary.json \
+  --previous-control test-results/capacity-header-control/summary.json \
+  --date 2026-11-13 --output docs/upstream-capacity-benchmark.md
+```
+
+Passive policy on healthy traffic (optional cases):
+
+```sh
+sudo python3 scripts/balance-bench.py --pin-cpus --rounds 3 --requests 20000 \
+  --cases rr_passive least_passive --output-dir test-results/passive-benchmark
+sudo python3 scripts/compare-header-images.py --before prost:passive-control \
+  --after prost:native --rounds 5 --pin-cpus --output-dir test-results/passive-header-control
+sudo python3 scripts/report-balance-bench.py --directory test-results/passive-benchmark \
+  --control test-results/passive-header-control/summary.json \
+  --date 2026-11-13 --output docs/passive-health-benchmark.md
+```
+
+The control image is the preserved binary before passive policy support. Four
+healthy backends return 200, while both proxies configure threshold 3, timeout 1s,
+and failure statuses 502/503/504. nginx uses a shared zone and one upstream try;
+backend counters must account for all requests without replay. This measures the
+healthy path with policy enabled, not fault/recovery speed or identical health
+semantics. Protocol/fault tests and the CLI demo exercise failure paths separately.
+Saved results: [passive-health-benchmark.md](../docs/passive-health-benchmark.md).
+
 Heavy native workloads use the separate project in `advanced/`:
 
 ```sh
@@ -88,6 +166,9 @@ for both images. The report flags throughput loss above 5% or p99 increase above
 10% for investigation; image IDs identify binaries independently of workspace
 source. It restores the fixture and stops its benchmark project afterward. Do
 not run another build or benchmark concurrently.
+This comparison also accepts `--pin-cpus`, requiring 6 distinct guest cores for
+the client, proxy and single backend. Do not compare absolute latency between
+pinned and unpinned runs; compare the before/after images within the same run.
 
 When a compatible runtime image is already available, Cargo release binaries can
 also be rebuilt using Linux Docker caches:

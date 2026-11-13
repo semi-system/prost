@@ -29,11 +29,13 @@ jobs:
           docker compose -f benchmarks/advanced/compose.yaml build backend
           sudo python3 scripts/advanced-bench.py --rounds 1 --scale 0.02 --output-dir test-results/advanced-ci
           sudo python3 scripts/advanced-backpressure.py --clients 4 --seconds 2 --output test-results/advanced-ci/backpressure.json
+          sudo python3 scripts/balance-bench.py --image prost:mvp --rounds 1 --requests 512 --cases rr_uniform least_uniform rr_slow least_slow hash_uniform rr_backup least_backup rr_passive least_passive --output-dir test-results/advanced-ci/balance
       - name: Logs
         if: failure()
         run: |
           docker compose logs
           docker compose -f benchmarks/advanced/compose.yaml logs
+          docker compose -f benchmarks/balance/compose.yaml logs
       - name: Protocol reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -44,4 +46,5 @@ jobs:
         if: always()
         run: |
           docker compose -f benchmarks/advanced/compose.yaml down -v
+          docker compose -f benchmarks/balance/compose.yaml down -v
           docker compose down

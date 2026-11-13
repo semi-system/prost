@@ -90,6 +90,10 @@ pub struct Upstream {
     pub endpoints: Vec<Endpoint>,
     #[serde(default = "balance")]
     pub balance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_replicas: Option<u32>,
     #[serde(default)]
     pub tls: Option<ClientTls>,
     #[serde(default = "connect_ms")]
@@ -108,6 +112,8 @@ pub struct Upstream {
     pub http1_max_buf_size: usize,
     #[serde(default)]
     pub health_check: HealthCheck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passive_health: Option<PassiveHealth>,
     #[serde(default)]
     pub http2_settings: Http2Settings,
 }
@@ -121,6 +127,22 @@ pub struct HealthCheck {
     pub timeout_ms: u64,
     pub fall: u32,
     pub rise: u32,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PassiveHealth {
+    pub max_fails: u32,
+    pub fail_timeout_ms: u64,
+    pub failure_statuses: Vec<u16>,
+}
+impl Default for PassiveHealth {
+    fn default() -> Self {
+        Self {
+            max_fails: 1,
+            fail_timeout_ms: 10000,
+            failure_statuses: Vec::new(),
+        }
+    }
 }
 impl Default for HealthCheck {
     fn default() -> Self {
@@ -175,6 +197,14 @@ pub struct Endpoint {
     pub weight: u32,
     #[serde(default = "yes")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup: bool,
+    /// Maximum active HTTP streams or TCP sessions; zero means unlimited.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_active: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -271,7 +301,19 @@ impl Config {
         let mut addresses = HashSet::new();
         for (name, u) in &self.upstreams {
             valid_id(name)?;
-            ensure!(u.balance == "round_robin", "unsupported balance algorithm");
+            ensure!(
+                matches!(
+                    u.balance.as_str(),
+                    "round_robin" | "least_conn" | "consistent_hash"
+                ),
+                "unsupported balance algorithm"
+            );
+            if u.balance != "consistent_hash" {
+                ensure!(
+                    u.hash_key.is_none() && u.hash_replicas.is_none(),
+                    "hash settings require consistent_hash"
+                );
+            }
             ensure!(
                 !u.endpoints.is_empty() && u.endpoints.len() <= 256,
                 "upstream {name} requires 1..256 endpoints"
@@ -289,6 +331,19 @@ impl Config {
                 "HTTP/1 upstream buffer must be 8192..1048576 bytes"
             );
             u.http2_settings.validate()?;
+            if let Some(p) = &u.passive_health {
+                ensure!(
+                    p.max_fails <= 1000 && (1..=3600000).contains(&p.fail_timeout_ms),
+                    "invalid passive health threshold/timeout"
+                );
+                let unique: HashSet<_> = p.failure_statuses.iter().copied().collect();
+                ensure!(
+                    p.failure_statuses.len() <= 32
+                        && unique.len() == p.failure_statuses.len()
+                        && p.failure_statuses.iter().all(|s| (400..=599).contains(s)),
+                    "passive failure_statuses must contain at most 32 unique HTTP 400..599 codes"
+                );
+            }
             let h = &u.health_check;
             ensure!(
                 (1..=100).contains(&h.fall)
@@ -334,6 +389,18 @@ impl Config {
                 sum += e.weight as u64;
             }
             ensure!(sum <= 1_000_000, "total weight too large");
+            if u.balance == "consistent_hash" {
+                ensure!(
+                    !u.endpoints.iter().any(|e| e.backup),
+                    "backup endpoints require round_robin or least_conn"
+                );
+                let replicas = u.hash_replicas.unwrap_or(160);
+                ensure!(
+                    (16..=1024).contains(&replicas),
+                    "hash_replicas must be 16..1024"
+                );
+                ensure!(sum * u64::from(replicas) <= 65536, "consistent hash ring exceeds 65536 points; normalize weights or reduce hash_replicas");
+            }
             if let Some(tls) = &u.tls {
                 ensure!(!tls.server_name.is_empty(), "TLS server_name is required");
             }
@@ -368,6 +435,15 @@ impl Config {
             }
             if let Some(u) = &l.upstream {
                 ensure!(self.upstreams.contains_key(u), "unknown upstream {u}");
+                if l.protocol == Protocol::Tcp {
+                    let upstream = &self.upstreams[u];
+                    ensure!(
+                        upstream.balance != "consistent_hash"
+                            || upstream.hash_key.as_deref().unwrap_or("$remote_addr")
+                                == "$remote_addr",
+                        "TCP consistent hash requires $remote_addr"
+                    );
+                }
             }
             for r in &l.routes {
                 ensure!(

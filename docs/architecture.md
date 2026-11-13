@@ -44,7 +44,7 @@ arbitrary protocols on the same port.
 ## HTTP and plugins
 
 Hyper forwards bodies incrementally with bounded protocol buffers. Upstream
-clients reuse pools when the complete upstream config is unchanged. gRPC uses
+clients reuse pools when transport/client settings and endpoint identity are compatible. gRPC uses
 explicit `http2 = true` on the upstream, including h2c. WebSocket supports the
 HTTP/1.1 upgrade handshake. CONNECT and RFC8441 extended CONNECT are outside MVP.
 The configured upstream idle timeout also bounds waiting for response headers;
@@ -56,10 +56,22 @@ Native request filters run before that 404, so a redirect-only listener can retu
 without an upstream. The rewrite filter changes the forwarded path/query while
 retaining the original route, method and streaming body. Redirects finish the
 request phase and run local native response filters. See [rewrite.md](rewrite.md).
+Upstreams support weighted round-robin, least active request/session load and
+bounded consistent-hash rings. Compatible least-load counters survive updates;
+HTTP leases follow the existing body/tunnel lifetime guard. Client pools survive
+algorithm/weight/administrative changes when transport and endpoint identity are
+unchanged. See [load-balancing.md](load-balancing.md).
+Backup tiers and optional endpoint `max_active` admission share the same lifetime
+leases. Tracked state survives compatible algorithm/cap changes; overload rejects
+immediately without queuing or marking health down. See [upstream-capacity.md](upstream-capacity.md).
 Health checks verify TCP/TLS connectivity or perform HTTP GET checks with expected
 status, timeout and fall/rise thresholds; see [advanced-features.md](advanced-features.md). Passive
-transport errors exclude an endpoint until an active check succeeds. Requests
-are never automatically retried.
+transport errors exclude an endpoint until an active check succeeds by default.
+An optional passive policy adds bounded rolling failure windows, cooldown and
+configured upstream HTTP statuses; recovery requires a successful probe after
+cooldown. Compatible health observations are copied between generations; changing
+only passive policy resets its window while keeping active health observations.
+See [passive-health.md](passive-health.md). Requests are never automatically retried.
 
 TLS listeners select certificates using exact SNI names or single-label wildcards.
 Certificate/key bundles are prepared and staged as artifacts before commit. A

@@ -97,6 +97,52 @@ except urllib.error.HTTPError as error:
     assert error.headers["location"] == "/new?keep=1"
     assert error.headers["x-proxy"] == "prost"
     error.close()
+ctl("validate", "--file", "/examples/balancing.toml")
+ctl("apply", "--file", "/examples/balancing.toml")
+def sticky(key):
+    request = urllib.request.Request(root + "/sticky/item", headers={"x-session":key})
+    with urllib.request.urlopen(request, timeout=3) as response:
+        return json.load(response)["backend"]
+owners = [sticky(f"session-{i}") for i in range(32)]
+assert set(owners) == {"blue", "green"}
+assert [sticky(f"session-{i}") for i in range(32)] == owners
+ctl("upstream", "disable", "sticky/blue")
+assert all(sticky(f"session-{i}") == "green" for i in range(32))
+ctl("upstream", "enable", "sticky/blue")
+assert [sticky(f"session-{i}") for i in range(32)] == owners
+state = ctl("status")["result"]
+assert state["balancers"]["web"]["algorithm"] == "least_conn"
+assert state["balancers"]["sticky"]["hash_points"] == 320
+assert all(e["active"] == 0 for e in state["upstreams"]["web"])
+subprocess.run([*compose, "restart", "prost"], check=True)
+assert [sticky(f"session-{i}") for i in range(32)] == owners
+ctl("validate", "--file", "/examples/upstream-capacity.toml")
+ctl("apply", "--file", "/examples/upstream-capacity.toml")
+wait_backend("blue")
+state = ctl("status")["result"]["upstreams"]["web"]
+assert state[0]["max_active"] == 32 and not state[0]["backup"]
+assert state[1]["max_active"] == 128 and state[1]["backup"]
+ctl("upstream", "disable", "web/blue")
+wait_backend("green")
+ctl("upstream", "enable", "web/blue")
+wait_backend("blue")
+ctl("validate", "--file", "/examples/passive-health.toml")
+ctl("apply", "--file", "/examples/passive-health.toml")
+for _ in range(3):
+    try:
+        urllib.request.urlopen(root + "/status/503", timeout=3)
+        raise AssertionError("expected original upstream 503")
+    except urllib.error.HTTPError as error:
+        assert error.code == 503
+        with error:
+            assert json.load(error)["backend"] == "blue"
+state = ctl("status")["result"]["upstreams"]["web"][0]
+assert not state["healthy"] and state["passive_health"]["ejected"]
+wait_backend("green")
+# A restart keeps the policy but resets observations, not a persistent admin disable.
+subprocess.run([*compose, "restart", "prost"], check=True)
+wait_backend("blue")
+assert not ctl("status")["result"]["upstreams"]["web"][0]["passive_health"]["ejected"]
 ctl("apply", "--file", "/examples/prost.toml")
 state = ctl("status")
 generation = state["generation"]
@@ -126,4 +172,4 @@ generation = ctl("status")["generation"]
 subprocess.run([*compose, "restart", "prost"], check=True)
 wait_backend("green")
 assert ctl("status")["generation"] == generation
-print("PASS: native headers/maps/conditions/keyed rate limit/rewrite/redirect, HTTP, TCP, validate, atomic apply, live session, disable/enable, restart persistence")
+print("PASS: native headers/maps/conditions/rate limit/rewrite/redirect, least_conn/hash affinity/disable/restart, backup/capacity/passive health, HTTP, TCP, validate, atomic apply, live session")

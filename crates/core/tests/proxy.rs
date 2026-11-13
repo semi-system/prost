@@ -712,6 +712,7 @@ async fn native_rewrite_upload_streams_before_eof_and_survives_apply() -> Result
     let _backend = Server { address, task };
     let mut fixture = Fixture::new(Protocol::Http, address);
     fixture.config.upstreams.get_mut("main").unwrap().http2 = true;
+    fixture.config.upstreams.get_mut("main").unwrap().balance = "least_conn".into();
     fixture.config.listeners[0].plugins.push(builtin(
         "rewrite",
         serde_json::json!({"rules":[{"action":"rewrite","exact":"/upload","to":"/v1/upload"}]}),
@@ -752,17 +753,20 @@ async fn native_rewrite_upload_streams_before_eof_and_survives_apply() -> Result
     });
     // The backend must see bytes while the client deliberately withholds EOF.
     timeout(Duration::from_secs(2), first.notified()).await?;
+    wait_active(&p, &[1]).await?;
     let mut next = p.snapshot().config.clone();
     next.listeners[0].plugins[0] = builtin(
         "rewrite",
         serde_json::json!({"rules":[{"action":"rewrite","exact":"/upload","to":"/v2/upload"}]}),
     )?;
     p.apply(next.encode()?, 0).await?;
+    wait_active(&p, &[1]).await?;
     resume.notify_one();
     assert_eq!(
         timeout(Duration::from_secs(2), request_task).await???,
         "first-second"
     );
+    wait_active(&p, &[0]).await?;
     driver.abort();
     p.shutdown().await;
     Ok(())
@@ -802,12 +806,14 @@ async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Resul
     let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
     let h1driver = tokio::spawn(conn);
     for method in ["GET", "HEAD", "POST"] {
+        h1.ready().await?;
         let response = h1.send_request(request("/redirect?old=2", method)).await?;
         assert_eq!(response.status(), 308);
         assert_eq!(response.headers()["location"], "/destination?from=1&old=2");
         assert_eq!(response.headers()["x-native"], "yes");
         assert!(response.into_body().collect().await?.to_bytes().is_empty());
     }
+    h1.ready().await?;
     let response = h1.send_request(request("/unmatched", "GET")).await?;
     assert_eq!(response.status(), 404);
     response.into_body().collect().await?;
@@ -816,6 +822,7 @@ async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Resul
         "x-target",
         http::HeaderValue::from_static("//untrusted.example"),
     );
+    h1.ready().await?;
     let response = h1.send_request(dynamic).await?;
     assert_eq!(response.status(), 503);
     assert!(!response.headers().contains_key("location"));
@@ -846,6 +853,7 @@ async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Resul
         )?,
     );
     p.apply(next.encode()?, 0).await?;
+    h1.ready().await?;
     let response = h1.send_request(request("/redirect", "GET")).await?;
     assert_eq!(response.status(), 308);
     response.into_body().collect().await?;
@@ -856,6 +864,7 @@ async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Resul
     let mut next = p.snapshot().config.clone();
     next.listeners[0].plugins[0] = builtin("ip_acl", serde_json::json!({"deny":["127.0.0.0/8"]}))?;
     p.apply(next.encode()?, 1).await?;
+    h1.ready().await?;
     let response = h1.send_request(request("/redirect", "GET")).await?;
     assert_eq!(response.status(), 403);
     assert!(!response.headers().contains_key("location"));
@@ -1140,6 +1149,7 @@ async fn upgraded_connections_hold_admission_until_tunnel_closes() -> Result<()>
     let server = Server { address, task };
     let mut fixture = Fixture::new(Protocol::Http, server.address);
     fixture.config.runtime.max_connections = 1;
+    fixture.config.upstreams.get_mut("main").unwrap().balance = "least_conn".into();
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let (mut ws, _) =
@@ -1148,6 +1158,7 @@ async fn upgraded_connections_hold_admission_until_tunnel_closes() -> Result<()>
         .await?;
     assert_eq!(ws.next().await.unwrap()?.into_text()?, "held");
     assert_eq!(p.metrics.connections.get(), 1);
+    wait_active(&p, &[1]).await?;
     assert!(timeout(
         Duration::from_secs(2),
         tokio_tungstenite::connect_async(format!("ws://{}/", fixture.address()))
@@ -1161,6 +1172,7 @@ async fn upgraded_connections_hold_admission_until_tunnel_closes() -> Result<()>
         }
     })
     .await?;
+    wait_active(&p, &[0]).await?;
     p.shutdown().await;
     Ok(())
 }
@@ -1407,7 +1419,7 @@ async fn http_server(label: &'static str) -> Server {
                             StreamBody::new(futures_util::stream::iter(frames))
                                 .map_err(|e| match e {})
                                 .boxed_unsync()
-                        } else if request.uri().path() == "/split" {
+                        } else if matches!(request.uri().path(), "/split" | "/error-stream") {
                             let first = futures_util::stream::once(async {
                                 Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"one")))
                             });
@@ -1451,7 +1463,10 @@ async fn http_server(label: &'static str) -> Server {
                             .headers_mut()
                             .insert("content-length", http::HeaderValue::from_static("4"));
                     }
-                    if path == "/split" {
+                    if path == "/error-stream" {
+                        *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+                    }
+                    if matches!(path, "/split" | "/error-stream") {
                         response
                             .headers_mut()
                             .insert("content-length", http::HeaderValue::from_static("6"));
@@ -2312,6 +2327,717 @@ async fn wasm_header_plugin_updates_and_rejects_invalid_module() -> Result<()> {
 }
 
 #[tokio::test]
+async fn least_conn_tcp_sessions_survive_disable_half_close_and_shutdown() -> Result<()> {
+    async fn backend(label: u8) -> Server {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut io, _)) = socket.accept().await {
+                tokio::spawn(async move {
+                    if io.write_all(&[label]).await.is_err() {
+                        return;
+                    }
+                    let (mut r, mut w) = io.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        });
+        Server { address, task }
+    }
+    async fn connect(address: SocketAddr, label: u8) -> Result<TcpStream> {
+        let mut io = TcpStream::connect(address).await?;
+        let mut banner = [0];
+        timeout(Duration::from_secs(2), io.read_exact(&mut banner)).await??;
+        assert_eq!(banner, [label]);
+        Ok(io)
+    }
+    let a = backend(b'A').await;
+    let b = backend(b'B').await;
+    let mut fixture = Fixture::new(Protocol::Tcp, a.address);
+    fixture.config.runtime.io_workers = 2;
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.balance = "least_conn".into();
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: b.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: false,
+        max_active: 0,
+    });
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let mut a1 = connect(fixture.address(), b'A').await?;
+    let _b1 = connect(fixture.address(), b'B').await?;
+    let _a2 = connect(fixture.address(), b'A').await?;
+    let _b2 = connect(fixture.address(), b'B').await?;
+    wait_active(&p, &[2, 2]).await?;
+    p.set_enabled("main/one".into(), false, 0).await?;
+    let mut newer = connect(fixture.address(), b'B').await?;
+    wait_active(&p, &[2, 3]).await?;
+    roundtrip(&mut a1, b"old disabled endpoint stays live").await?;
+    newer.shutdown().await?;
+    let mut tail = Vec::new();
+    timeout(Duration::from_secs(2), newer.read_to_end(&mut tail)).await??;
+    wait_active(&p, &[2, 2]).await?;
+    p.set_enabled("main/one".into(), true, 1).await?;
+    drop(a1);
+    wait_active(&p, &[1, 2]).await?;
+    let _fresh = connect(fixture.address(), b'A').await?;
+    wait_active(&p, &[2, 2]).await?;
+    // Live sessions deliberately force the one-second drain deadline.
+    timeout(Duration::from_secs(3), p.shutdown()).await?;
+    wait_active(&p, &[0, 0]).await?;
+    Ok(())
+}
+
+fn active_counts(p: &RunningProxy) -> Vec<u64> {
+    p.status()["upstreams"]["main"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["active"].as_u64().expect("upstream load must be tracked"))
+        .collect()
+}
+async fn wait_active(p: &RunningProxy, expected: &[u64]) -> Result<()> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if active_counts(p) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_capacity_tcp_limit_update_half_close_and_shutdown() -> Result<()> {
+    async fn rejected(address: SocketAddr) -> Result<()> {
+        let mut io = TcpStream::connect(address).await?;
+        let result = timeout(Duration::from_secs(2), io.read_u8()).await?;
+        assert!(result.is_err(), "full endpoint must close, not queue TCP");
+        Ok(())
+    }
+    let backend = echo().await;
+    let mut fixture = Fixture::new(Protocol::Tcp, backend.address);
+    fixture.config.runtime.io_workers = 2;
+    fixture.config.upstreams.get_mut("main").unwrap().endpoints[0].max_active = 1;
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let mut first = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut first, b"first").await?;
+    wait_active(&p, &[1]).await?;
+    rejected(fixture.address()).await?;
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().endpoints[0].max_active = 2;
+    p.apply(next.encode()?, 0).await?;
+    let mut second = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut second, b"second").await?;
+    wait_active(&p, &[2]).await?;
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().endpoints[0].max_active = 1;
+    p.apply(next.encode()?, 1).await?;
+    rejected(fixture.address()).await?;
+    roundtrip(&mut first, b"existing session survives lower limit").await?;
+    first.shutdown().await?;
+    timeout(Duration::from_secs(2), first.read_to_end(&mut Vec::new())).await??;
+    wait_active(&p, &[1]).await?;
+    rejected(fixture.address()).await?;
+    drop(second);
+    wait_active(&p, &[0]).await?;
+    let mut fresh = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut fresh, b"recovered capacity").await?;
+    wait_active(&p, &[1]).await?;
+    p.shutdown().await;
+    wait_active(&p, &[0]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_http2_capacity_hot_update_cancel_and_restart() -> Result<()> {
+    async fn backend(label: &'static str) -> Server {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((io, _)) = socket.accept().await {
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| async move {
+                        let body = if request.uri().path() == "/hold" {
+                            let first = futures_util::stream::once(async move {
+                                Ok::<_, Infallible>(Frame::data(Bytes::from_static(
+                                    label.as_bytes(),
+                                )))
+                            });
+                            StreamBody::new(first.chain(futures_util::stream::pending()))
+                                .boxed_unsync()
+                        } else {
+                            Full::new(Bytes::from_static(label.as_bytes())).boxed_unsync()
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("x-backend", label)
+                                .body(body)
+                                .unwrap(),
+                        )
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(io), service)
+                        .await;
+                });
+            }
+        });
+        Server { address, task }
+    }
+    let a = backend("primary").await;
+    let b = backend("backup").await;
+    let mut fixture = Fixture::new(Protocol::Http, a.address);
+    fixture.config.runtime.io_workers = 2;
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.http2 = true;
+    u.passive_health = Some(prost_config::PassiveHealth {
+        max_fails: 1,
+        fail_timeout_ms: 5000,
+        failure_statuses: vec![503],
+    });
+    u.endpoints[0].max_active = 1;
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: b.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: true,
+        max_active: 1,
+    });
+    fixture.config.listeners[0].plugins.push(builtin(
+        "headers",
+        serde_json::json!({
+            "response":{"add":[{"name":"x-always","value":"filtered","always":true}]}
+        }),
+    )?);
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    let req = |path: &str| {
+        Request::builder()
+            .uri(format!("http://localhost{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    // Healthy primary always wins until its request slot is occupied.
+    for _ in 0..4 {
+        let response = client.send_request(req("/")).await?;
+        assert_eq!(response.headers()["x-backend"], "primary");
+        response.into_body().collect().await?;
+        wait_active(&p, &[0, 0]).await?;
+    }
+    let mut first = client.send_request(req("/hold")).await?;
+    assert_eq!(first.headers()["x-backend"], "primary");
+    first.body_mut().frame().await.unwrap()?;
+    let mut second = client.send_request(req("/hold")).await?;
+    assert_eq!(second.headers()["x-backend"], "backup");
+    second.body_mut().frame().await.unwrap()?;
+    wait_active(&p, &[1, 1]).await?;
+    let rejected = timeout(Duration::from_secs(1), client.send_request(req("/"))).await??;
+    assert_eq!(rejected.status(), 503);
+    assert_eq!(rejected.headers()["x-always"], "filtered");
+    rejected.into_body().collect().await?;
+    assert!(p.status()["upstreams"]["main"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["healthy"] == true));
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().endpoints[0].max_active = 2;
+    p.apply(next.encode()?, 0).await?;
+    let mut third = client.send_request(req("/hold")).await?;
+    assert_eq!(third.headers()["x-backend"], "primary");
+    third.body_mut().frame().await.unwrap()?;
+    wait_active(&p, &[2, 1]).await?;
+    let mut next = p.snapshot().config.clone();
+    let u = next.upstreams.get_mut("main").unwrap();
+    u.balance = "least_conn".into();
+    u.endpoints[0].max_active = 1;
+    u.pool_max_idle_per_host = 32;
+    p.apply(next.encode()?, 1).await?;
+    wait_active(&p, &[2, 1]).await?;
+    drop(first);
+    wait_active(&p, &[1, 1]).await?;
+    let rejected = client.send_request(req("/")).await?;
+    assert_eq!(rejected.status(), 503);
+    rejected.into_body().collect().await?;
+    drop(third);
+    wait_active(&p, &[0, 1]).await?;
+    let response = client.send_request(req("/")).await?;
+    assert_eq!(response.headers()["x-backend"], "primary");
+    response.into_body().collect().await?;
+    drop(second);
+    wait_active(&p, &[0, 0]).await?;
+    p.set_enabled("main/one".into(), false, 2).await?;
+    let response = client.send_request(req("/")).await?;
+    assert_eq!(response.headers()["x-backend"], "backup");
+    response.into_body().collect().await?;
+    let before = std::fs::read(&fixture.path)?;
+    let mut invalid = p.snapshot().config.clone();
+    invalid.upstreams.get_mut("main").unwrap().balance = "consistent_hash".into();
+    assert!(p.apply(invalid.encode()?, 3).await.is_err());
+    assert_eq!(std::fs::read(&fixture.path)?, before);
+    assert_eq!(p.status()["generation"], 3);
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    drop(p);
+    let p = fixture.start().await;
+    let status = p.status();
+    assert_eq!(status["generation"], 3);
+    assert_eq!(status["upstreams"]["main"][0]["max_active"], 1);
+    assert_eq!(status["upstreams"]["main"][1]["backup"], true);
+    wait_active(&p, &[0, 0]).await?;
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn least_conn_http2_counts_bodies_trailers_cancel_and_hot_update() -> Result<()> {
+    async fn backend(label: &'static str, gate: Arc<tokio::sync::Notify>) -> Server {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((io, _)) = socket.accept().await {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let gate = gate.clone();
+                        async move {
+                            let body: http_body_util::combinators::UnsyncBoxBody<
+                                Bytes,
+                                Infallible,
+                            > = if request.uri().path() == "/hold" {
+                                let first = futures_util::stream::once(async move {
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(
+                                        label.as_bytes(),
+                                    )))
+                                });
+                                let last = futures_util::stream::once(async move {
+                                    gate.notified().await;
+                                    Ok(Frame::data(Bytes::from_static(b"done")))
+                                });
+                                let trailers = futures_util::stream::once(async {
+                                    let mut h = http::HeaderMap::new();
+                                    h.insert("grpc-status", http::HeaderValue::from_static("0"));
+                                    Ok(Frame::trailers(h))
+                                });
+                                StreamBody::new(first.chain(last).chain(trailers)).boxed_unsync()
+                            } else {
+                                Full::new(Bytes::from_static(label.as_bytes())).boxed_unsync()
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("x-backend", label)
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(io), service)
+                        .await;
+                });
+            }
+        });
+        Server { address, task }
+    }
+    let ga = Arc::new(tokio::sync::Notify::new());
+    let gb = Arc::new(tokio::sync::Notify::new());
+    let a = backend("A", ga).await;
+    let b = backend("B", gb.clone()).await;
+    let mut fixture = Fixture::new(Protocol::Http, a.address);
+    fixture.config.runtime.io_workers = 2;
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.balance = "least_conn".into();
+    u.http2 = true;
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: b.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: false,
+        max_active: 0,
+    });
+    fixture.config.listeners[0].plugins.push(builtin(
+        "headers",
+        serde_json::json!({"trailers":[{"name":"x-native-end","value":"done"}]}),
+    )?);
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let driver = tokio::spawn(conn);
+    let req = |path: &str| {
+        Request::builder()
+            .uri(format!("http://localhost{path}"))
+            .header("te", "trailers")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    let mut first = client.send_request(req("/hold")).await?;
+    assert_eq!(first.headers()["x-backend"], "A");
+    first.body_mut().frame().await.unwrap()?;
+    wait_active(&p, &[1, 0]).await?;
+    let quick = client.send_request(req("/")).await?;
+    assert_eq!(quick.headers()["x-backend"], "B");
+    quick.into_body().collect().await?;
+    wait_active(&p, &[1, 0]).await?;
+    let mut second = client.send_request(req("/hold")).await?;
+    assert_eq!(second.headers()["x-backend"], "B");
+    second.body_mut().frame().await.unwrap()?;
+    wait_active(&p, &[1, 1]).await?;
+    let mut next = p.snapshot().config.clone();
+    next.upstreams
+        .get_mut("main")
+        .unwrap()
+        .pool_max_idle_per_host = 32;
+    p.apply(next.encode()?, 0).await?;
+    wait_active(&p, &[1, 1]).await?;
+    drop(first);
+    wait_active(&p, &[0, 1]).await?;
+    let quick = client.send_request(req("/")).await?;
+    assert_eq!(quick.headers()["x-backend"], "A");
+    quick.into_body().collect().await?;
+    wait_active(&p, &[0, 1]).await?;
+    gb.notify_one();
+    let body = second.into_body().collect().await?;
+    assert_eq!(body.trailers().unwrap()["grpc-status"], "0");
+    assert_eq!(body.trailers().unwrap()["x-native-end"], "done");
+    assert_eq!(body.to_bytes(), "done");
+    wait_active(&p, &[0, 0]).await?;
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passive_http_status_window_backup_recovery_update_and_restart() -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let a = http_server("primary").await;
+    let b = http_server("backup").await;
+    let mut fixture = Fixture::new(Protocol::Http, a.address);
+    fixture.config.runtime.io_workers = 2;
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.http2 = true;
+    u.passive_health = Some(prost_config::PassiveHealth {
+        max_fails: 2,
+        fail_timeout_ms: 1500,
+        failure_statuses: vec![503],
+    });
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: b.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: true,
+        max_active: 0,
+    });
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let mut connect = TcpStream::connect(fixture.address()).await?;
+    connect
+        .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+        .await?;
+    let mut reader = tokio::io::BufReader::new(connect);
+    let mut line = String::new();
+    timeout(Duration::from_secs(2), reader.read_line(&mut line)).await??;
+    assert!(line.starts_with("HTTP/1.1 503"));
+    drop(reader);
+    assert_eq!(
+        p.status()["upstreams"]["main"][0]["passive_health"]["recent_failures"],
+        0
+    );
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let driver = tokio::spawn(connection);
+    let request = |path: &str| {
+        Request::builder()
+            .uri(format!("http://localhost{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    for path in ["/status/500", "/status/503", "/"] {
+        let response = client.send_request(request(path)).await?;
+        let expected_status = if path == "/status/500" {
+            500
+        } else if path == "/status/503" {
+            503
+        } else {
+            200
+        };
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "primary");
+        if path == "/status/500" {
+            assert_eq!(
+                p.status()["upstreams"]["main"][0]["passive_health"]["recent_failures"],
+                0
+            );
+        }
+    }
+    let mut stream = client.send_request(request("/error-stream")).await?;
+    assert_eq!(stream.status(), 503);
+    assert_eq!(
+        stream
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()?
+            .into_data()
+            .unwrap(),
+        "one"
+    );
+    let state = &p.status()["upstreams"]["main"][0];
+    assert_eq!(state["healthy"], false);
+    assert_eq!(state["passive_health"]["ejected"], true);
+    assert!(
+        state["passive_health"]["cooldown_remaining_ms"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let mut next = p.snapshot().config.clone();
+    let u = next.upstreams.get_mut("main").unwrap();
+    u.pool_max_idle_per_host = 32;
+    u.endpoints[0].weight = 2;
+    p.apply(next.encode()?, 0).await?;
+    assert_eq!(stream.into_body().collect().await?.to_bytes(), "two");
+    let response = client.send_request(request("/")).await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "backup");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if p.status()["upstreams"]["main"][0]["healthy"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let response = client.send_request(request("/")).await?;
+    assert_eq!(response.into_body().collect().await?.to_bytes(), "primary");
+    let mut next = p.snapshot().config.clone();
+    next.upstreams
+        .get_mut("main")
+        .unwrap()
+        .passive_health
+        .as_mut()
+        .unwrap()
+        .max_fails = 0;
+    p.apply(next.encode()?, 1).await?;
+    for _ in 0..4 {
+        let response = client.send_request(request("/status/503")).await?;
+        assert_eq!(response.status(), 503);
+        assert_eq!(response.into_body().collect().await?.to_bytes(), "primary");
+    }
+    assert_eq!(p.status()["upstreams"]["main"][0]["healthy"], true);
+    let persisted = std::fs::read(&fixture.path)?;
+    let mut bad = p.snapshot().config.clone();
+    bad.upstreams
+        .get_mut("main")
+        .unwrap()
+        .passive_health
+        .as_mut()
+        .unwrap()
+        .failure_statuses = vec![200];
+    assert!(p.apply(bad.encode()?, 2).await.is_err());
+    assert_eq!(p.status()["generation"], 2);
+    assert_eq!(std::fs::read(&fixture.path)?, persisted);
+    drop(client);
+    driver.abort();
+    p.shutdown().await;
+    drop(p);
+    let p = fixture.start().await;
+    assert_eq!(p.status()["generation"], 2);
+    assert_eq!(
+        p.status()["upstreams"]["main"][0]["passive_health"]["enabled"],
+        false
+    );
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passive_tcp_connect_failures_do_not_retry_and_recover_after_probe() -> Result<()> {
+    let reserved = TcpListener::bind("127.0.0.1:0").await?;
+    let failed_address = reserved.local_addr()?;
+    drop(reserved);
+    let backup = echo().await;
+    let mut fixture = Fixture::new(Protocol::Tcp, failed_address);
+    fixture.config.runtime.io_workers = 2;
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.health_interval_ms = 60000;
+    u.health_check.fall = 100; // Isolate passive errors from active probe failure.
+    u.passive_health = Some(prost_config::PassiveHealth {
+        max_fails: 2,
+        fail_timeout_ms: 500,
+        failure_statuses: vec![],
+    });
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: backup.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: true,
+        max_active: 0,
+    });
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    for index in 0..2 {
+        let mut io = TcpStream::connect(fixture.address()).await?;
+        io.write_all(b"do not retry").await?;
+        let read = timeout(Duration::from_secs(2), io.read_u8()).await?;
+        assert!(
+            read.is_err(),
+            "failed connect must not replay bytes to backup"
+        );
+        assert_eq!(p.status()["upstreams"]["main"][0]["healthy"], index == 0);
+    }
+    let mut old = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut old, b"backup session").await?;
+    let listener = TcpListener::bind(failed_address).await?;
+    let backend = Server {
+        address: failed_address,
+        task: tokio::spawn(async move {
+            while let Ok((mut io, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = io.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        }),
+    };
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().health_interval_ms = 100;
+    p.apply(next.encode()?, 0).await?;
+    timeout(Duration::from_secs(4), async {
+        loop {
+            if p.status()["upstreams"]["main"][0]["healthy"] == true {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    // Returning primary changes new admission, never an existing backup relay.
+    roundtrip(&mut old, b"old backup remains usable").await?;
+    p.set_enabled("main/two".into(), false, 1).await?;
+    let mut fresh = TcpStream::connect(fixture.address()).await?;
+    roundtrip(&mut fresh, b"recovered primary").await?;
+    drop(fresh);
+    drop(old);
+    drop(backend);
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn consistent_hash_http_keys_disable_reorder_restart_and_original_uri() -> Result<()> {
+    let a = http_server("A").await;
+    let b = http_server("B").await;
+    let mut fixture = Fixture::new(Protocol::Http, a.address);
+    let u = fixture.config.upstreams.get_mut("main").unwrap();
+    u.balance = "consistent_hash".into();
+    u.hash_key = Some("$http_x_session".into());
+    u.endpoints.push(Endpoint {
+        id: "two".into(),
+        address: b.address.to_string(),
+        weight: 1,
+        enabled: true,
+        backup: false,
+        max_active: 0,
+    });
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    async fn owners(address: SocketAddr) -> Result<Vec<Bytes>> {
+        let io = TcpStream::connect(address).await?;
+        let (mut client, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+        let driver = tokio::spawn(conn);
+        let mut found = Vec::new();
+        for n in 0..32 {
+            let req = || {
+                Request::builder()
+                    .uri(format!("http://localhost/tenant/{n}?q={n}"))
+                    .header("x-session", format!("session-{n}"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap()
+            };
+            let first = client
+                .send_request(req())
+                .await?
+                .into_body()
+                .collect()
+                .await?
+                .to_bytes();
+            let second = client
+                .send_request(req())
+                .await?
+                .into_body()
+                .collect()
+                .await?
+                .to_bytes();
+            assert_eq!(first, second);
+            found.push(first);
+        }
+        drop(client);
+        driver.abort();
+        Ok(found)
+    }
+    let initial = owners(fixture.address()).await?;
+    assert!(initial.iter().any(|b| b == "A"));
+    assert!(initial.iter().any(|b| b == "B"));
+    p.set_enabled("main/one".into(), false, 0).await?;
+    assert!(owners(fixture.address()).await?.iter().all(|b| b == "B"));
+    p.set_enabled("main/one".into(), true, 1).await?;
+    assert_eq!(owners(fixture.address()).await?, initial);
+    let durable = std::fs::read(&fixture.path)?;
+    let mut invalid = p.snapshot().config.clone();
+    invalid.upstreams.get_mut("main").unwrap().hash_key = Some("$http_bad:name".into());
+    assert!(p.apply(invalid.encode()?, 2).await.is_err());
+    assert_eq!(std::fs::read(&fixture.path)?, durable);
+    assert_eq!(p.snapshot().config.generation, 2);
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().endpoints.reverse();
+    p.apply(next.encode()?, 2).await?;
+    assert_eq!(owners(fixture.address()).await?, initial);
+    p.shutdown().await;
+    drop(p);
+    let p = fixture.start().await;
+    assert_eq!(owners(fixture.address()).await?, initial);
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().hash_key = Some("$request_uri".into());
+    next.listeners[0].plugins.push(builtin(
+        "rewrite",
+        serde_json::json!({"rules":[{"action":"rewrite","regex":"^/tenant/[0-9]+$","to":"/same"}]}),
+    )?);
+    p.apply(next.encode()?, 3).await?;
+    let original = owners(fixture.address()).await?;
+    assert!(original.iter().any(|b| b == "A") && original.iter().any(|b| b == "B"));
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().hash_key = Some("$uri".into());
+    p.apply(next.encode()?, 4).await?;
+    let current = owners(fixture.address()).await?;
+    assert!(current.iter().all(|b| b == &current[0]));
+    assert_eq!(p.status()["balancers"]["main"]["hash_points"], 320);
+    p.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn weighted_round_robin_and_endpoint_disable() -> Result<()> {
     let a = http_server("a").await;
     let b = http_server("b").await;
@@ -2323,6 +3049,8 @@ async fn weighted_round_robin_and_endpoint_disable() -> Result<()> {
         address: b.address.to_string(),
         weight: 1,
         enabled: true,
+        backup: false,
+        max_active: 0,
     });
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;

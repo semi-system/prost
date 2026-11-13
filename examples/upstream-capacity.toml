@@ -1,0 +1,45 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+
+[upstreams.web]
+balance = "least_conn"
+[[upstreams.web.endpoints]]
+id = "blue"
+address = "blue:8080"
+max_active = 32
+[[upstreams.web.endpoints]]
+id = "green"
+address = "green:8080"
+backup = true
+max_active = 128
+
+[upstreams.echo]
+balance = "round_robin"
+[[upstreams.echo.endpoints]]
+id = "blue"
+address = "blue:9000"
+max_active = 64
+[[upstreams.echo.endpoints]]
+id = "green"
+address = "green:9000"
+backup = true
+max_active = 64
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+[[listeners.plugins]]
+name = "headers"
+config = { response = { set = { x-proxy = "prost" } } }
+
+[[listeners]]
+id = "echo"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "echo"

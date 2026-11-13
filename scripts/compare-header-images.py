@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import statistics
+from benchmark_cpu import partitions
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("advanced_bench", ROOT / "scripts/advanced-bench.py")
@@ -25,6 +26,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--scale", type=float, default=5)
     parser.add_argument("--strip-rewrite", action="store_true", help="Use empty header filters in rewrite-only fixture routes for images predating rewrite support")
+    parser.add_argument("--pin-cpus", action="store_true", help="Separate client/proxy/backend onto 6 distinct guest physical cores")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "test-results/header-image-control")
     args = parser.parse_args()
     if args.rounds < 1 or args.scale <= 0:
@@ -39,6 +41,13 @@ def main():
             parser.error("no rewrite fixture plugins found; regenerate fixtures first")
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
+    affinity = partitions([2]) if args.pin_cpus else None
+    if affinity:
+        override = out.resolve() / "pinning.yaml"
+        override.write_text("services:\n  prost:\n    cpuset: " + json.dumps(affinity["proxy"]) + "\n  backend:\n    cpuset: " + json.dumps(affinity["backends"][0]) + "\n")
+        bench.COMPOSE += ["-f", str(override)]
+        original_command = bench.command
+        bench.command = lambda *a, **kw: ["taskset", "-c", affinity["client"], *original_command(*a, **kw)]
     os.environ["PROST_ADVANCED_CONFIG"] = "prost-native.toml"
     images = {"before": args.before, "after": args.after}
     results = []
@@ -63,7 +72,7 @@ def main():
                     results.append(result)
                 bench.compose("stop", "prost")
         summary = {"method": "Alternating image order and case order; one proxy at a time, identical config, no nginx load or builds concurrently.",
-                   "rounds": args.rounds, "scale": args.scale, "stripped_rewrite_plugins": replaced,
+                   "rounds": args.rounds, "scale": args.scale, "stripped_rewrite_plugins": replaced,"cpu_affinity":affinity,
                    "config_sha256": hashlib.sha256(control.encode()).hexdigest(),
                    "source_note": "Image IDs identify the binaries; this test does not assert the current workspace source identifies an older image.",
                    "results": {}}

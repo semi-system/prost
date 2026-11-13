@@ -4,6 +4,7 @@ import json
 import os
 import socketserver
 import threading
+from urllib.parse import urlsplit
 
 
 class HTTP(http.server.BaseHTTPRequestHandler):
@@ -12,7 +13,16 @@ class HTTP(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         payload = json.dumps({"backend": os.environ.get("LABEL", "blue"),
                               "path": self.path}).encode() + b"\n"
-        self.send_response(200)
+        status = 200
+        path = urlsplit(self.path).path
+        if path.startswith("/status/"):
+            try:
+                code = int(path.removeprefix("/status/"))
+                if 400 <= code <= 599:
+                    status = code
+            except ValueError:
+                pass
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()

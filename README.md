@@ -4,7 +4,7 @@ MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix
 `prostctl`**, không polling, không watcher, không restart worker.
 
 Đã triển khai TCP relay, TLS hai phía, HTTP/1.1–HTTP/2, HTTPS, WebSocket,
-gRPC streaming/trailers, weighted round-robin, TCP/TLS/HTTP health check, cấu hình
+gRPC streaming/trailers, weighted round-robin/least-conn/consistent hash, TCP/TLS/HTTP health check, cấu hình
 flow control HTTP/2 và bộ filter native: header/trailer, expires, map/điều kiện,
 ACL và rate limit toàn cục/theo IP/header. WASM là feature tùy chọn, mặc định tắt.
 Native rewrite path/query và redirect có điều kiện: [docs/rewrite.md](docs/rewrite.md).
@@ -12,6 +12,16 @@ So sánh rewrite với nginx và kiểm tra regression:
 [docs/rewrite-benchmark.md](docs/rewrite-benchmark.md).
 TLS hỗ trợ nhiều certificate theo SNI, exact/wildcard và hot rotate:
 [docs/tls-sni.md](docs/tls-sni.md).
+Cấu hình, vòng đời active load và affinity: [docs/load-balancing.md](docs/load-balancing.md).
+Backend dự phòng và giới hạn request/stream/session trên từng endpoint:
+[docs/upstream-capacity.md](docs/upstream-capacity.md).
+Đo tải primary đầy và chuyển sang backup:
+[docs/upstream-capacity-benchmark.md](docs/upstream-capacity-benchmark.md).
+Passive health có ngưỡng lỗi, cửa sổ trượt, cooldown và HTTP status tùy chọn:
+[docs/passive-health.md](docs/passive-health.md).
+Đo tải healthy khi bật policy và đối chứng regression:
+[docs/passive-health-benchmark.md](docs/passive-health-benchmark.md).
+So sánh thuật toán với nginx trên bốn backend: [docs/load-balancing-benchmark.md](docs/load-balancing-benchmark.md).
 Đây là MVP để chạy thử; soak dài và
 đánh giá production vẫn còn cần thực hiện.
 

@@ -1,10 +1,11 @@
 #![cfg(unix)]
+mod balance;
 mod health;
 mod local_metrics;
 mod storage;
 mod workers;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use arc_swap::ArcSwap;
 use http::{header, HeaderName, HeaderValue, Request, Response};
 use hyper::{body::Incoming, service::service_fn};
@@ -23,10 +24,7 @@ use std::{
     fs::File,
     net::SocketAddr,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
-    },
+    sync::{atomic::Ordering, Arc, Mutex, Weak},
     time::Duration,
 };
 use tokio::{
@@ -85,44 +83,24 @@ pub struct Snapshot {
     pub hash: String,
     upstreams: BTreeMap<String, Arc<PreparedUpstream>>,
     listeners: BTreeMap<String, Arc<PreparedListener>>,
+    original_hash_key: bool,
 }
 struct PreparedUpstream {
     config: Upstream,
     tls: Arc<rustls::ClientConfig>,
-    client: ClientPool,
+    client: Arc<ClientPool>,
     health: Vec<Arc<health::State>>,
-    counter: AtomicU64,
+    balancer: balance::Balancer,
     targets: Vec<prost_http::Target>,
+    passive_statuses: Option<Box<[u64; 4]>>,
 }
 impl PreparedUpstream {
-    fn select(&self) -> Result<(usize, &str)> {
-        if self.config.endpoints.len() == 1 {
-            let endpoint = &self.config.endpoints[0];
-            ensure!(
-                endpoint.enabled && self.health[0].healthy.load(Ordering::Relaxed),
-                "no healthy endpoints"
-            );
-            return Ok((0, &endpoint.address));
-        }
-        let total: u64 = self
-            .config
-            .endpoints
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| e.enabled && self.health[*i].healthy.load(Ordering::Relaxed))
-            .map(|(_, e)| e.weight as u64)
-            .sum();
-        ensure!(total > 0, "no healthy endpoints");
-        let mut ticket = self.counter.fetch_add(1, Ordering::Relaxed) % total;
-        for (i, e) in self.config.endpoints.iter().enumerate() {
-            if e.enabled && self.health[i].healthy.load(Ordering::Relaxed) {
-                if ticket < e.weight as u64 {
-                    return Ok((i, &e.address));
-                }
-                ticket -= e.weight as u64;
-            }
-        }
-        bail!("endpoint health changed during selection")
+    #[inline]
+    fn failed_status(&self, status: u16) -> bool {
+        self.passive_statuses.as_ref().is_some_and(|mask| {
+            (400..=599).contains(&status)
+                && mask[(status as usize - 400) / 64] & (1 << ((status - 400) % 64)) != 0
+        })
     }
 }
 struct PreparedListener {
@@ -293,8 +271,20 @@ fn prepare(
                 continue;
             }
         }
-        let tls = prost_transport::client_tls(u.tls.as_ref())?;
-        let client = ClientPool::new(u, tls.clone(), worker_count)?;
+        let old = previous
+            .and_then(|s| s.upstreams.get(name))
+            .map(Arc::as_ref);
+        let tls = if let Some(old) = old.filter(|old| old.config.tls == u.tls) {
+            old.tls.clone()
+        } else {
+            prost_transport::client_tls(u.tls.as_ref())?
+        };
+        let client = if let Some(old) = old.filter(|old| pool_compatible(&old.config, u)) {
+            old.client.clone()
+        } else {
+            Arc::new(ClientPool::new(u, tls.clone(), worker_count)?)
+        };
+        let balancer = balance::Balancer::new(u, old)?;
         upstreams.insert(
             name.clone(),
             Arc::new(PreparedUpstream {
@@ -319,17 +309,36 @@ fn prepare(
                                     .position(|e| {
                                         e.id == endpoint.id && e.address == endpoint.address
                                     })
-                                    .map(|i| Arc::new(old.health[i].snapshot()))
+                                    .map(|i| {
+                                        Arc::new(if old.config.passive_health == u.passive_health {
+                                            old.health[i].snapshot()
+                                        } else {
+                                            old.health[i].reconfigure(u.passive_health.as_ref())
+                                        })
+                                    })
                             })
-                            .unwrap_or_else(|| Arc::new(health::State::new()))
+                            .unwrap_or_else(|| {
+                                Arc::new(health::State::new(u.passive_health.as_ref()))
+                            })
                     })
                     .collect(),
-                counter: AtomicU64::new(0),
+                balancer,
                 targets: u
                     .endpoints
                     .iter()
                     .map(|e| prost_http::Target::new(&e.address, u.tls.is_some()))
                     .collect::<Result<_>>()?,
+                passive_statuses: u
+                    .passive_health
+                    .as_ref()
+                    .filter(|p| p.max_fails > 0 && !p.failure_statuses.is_empty())
+                    .map(|p| {
+                        let mut mask = Box::new([0; 4]);
+                        for code in &p.failure_statuses {
+                            mask[(*code as usize - 400) / 64] |= 1 << ((*code - 400) % 64);
+                        }
+                        mask
+                    }),
             }),
         );
     }
@@ -425,13 +434,32 @@ fn prepare(
             }),
         );
     }
+    let original_hash_key = upstreams.values().any(|u| u.balancer.needs_original());
     let hash = storage::hash(config.encode()?.as_bytes());
     Ok(Snapshot {
         config,
         hash,
         upstreams,
         listeners,
+        original_hash_key,
     })
+}
+fn pool_compatible(a: &Upstream, b: &Upstream) -> bool {
+    // Match every setting captured by prost_http::client. Selection, health and
+    // per-request idle timeouts can change while the existing pool remains valid.
+    a.tls == b.tls
+        && a.http2 == b.http2
+        && a.connect_timeout_ms == b.connect_timeout_ms
+        && a.pool_max_idle_per_host == b.pool_max_idle_per_host
+        && a.pool_idle_timeout_ms == b.pool_idle_timeout_ms
+        && a.http1_max_buf_size == b.http1_max_buf_size
+        && a.http2_settings == b.http2_settings
+        && a.endpoints.len() == b.endpoints.len()
+        && a.endpoints.iter().all(|e| {
+            b.endpoints
+                .iter()
+                .any(|n| n.id == e.id && n.address == e.address)
+        })
 }
 fn prepare_plugins(
     registry: &PluginRegistry,
@@ -475,11 +503,12 @@ impl RunningProxy {
         generations.retain(|g| g.strong_count() > 0);
         let upstreams: BTreeMap<_, _> = snapshot.upstreams.iter().map(|(name, u)| {
             let endpoints: Vec<_> = u.config.endpoints.iter().enumerate().map(|(i, e)| {
-                serde_json::json!({"id":e.id,"enabled":e.enabled,"healthy":u.health[i].healthy.load(Ordering::Relaxed)})
+                serde_json::json!({"id":e.id,"enabled":e.enabled,"backup":e.backup,"max_active":e.max_active,"healthy":u.health[i].healthy.load(Ordering::Relaxed),"active":u.balancer.active(i),"passive_health":u.health[i].passive_status()})
             }).collect();
             (name, endpoints)
         }).collect();
-        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": self.workers.is_some(), "io_workers": self.worker_count, "upstreams": upstreams})
+        let balancers:BTreeMap<_,_>=snapshot.upstreams.iter().map(|(name,u)|(name,serde_json::json!({"algorithm":u.config.balance,"hash_key":if u.config.balance=="consistent_hash" {Some(u.config.hash_key.as_deref().unwrap_or("$remote_addr"))} else {None},"hash_points":u.balancer.points()}))).collect();
+        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": self.workers.is_some(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers})
     }
     pub async fn validate(self: &Arc<Self>, text: String) -> Result<()> {
         let _guard = self.coordinator.lock().await;
@@ -710,8 +739,15 @@ impl RunningProxy {
                 .upstreams
                 .get(event.upstream.as_ref().context("no upstream selected")?)
                 .context("plugin selected unknown upstream")?;
-            let (index, address) = u.select()?;
-            let backend = match prost_transport::connect(address, &u.config, u.tls.clone()).await {
+            let selection = u.balancer.select_tcp(u, peer.ip())?;
+            let index = selection.index;
+            let backend = match prost_transport::connect(
+                &u.config.endpoints[index].address,
+                &u.config,
+                u.tls.clone(),
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(e) => {
                     u.health[index].passive_failure();
@@ -727,6 +763,7 @@ impl RunningProxy {
             if let Ok(bytes) = &result {
                 self.metrics.bytes.inc_by(*bytes);
             }
+            drop(selection);
             event.hook = "end".into();
             invoke(&listener.plugins, &mut event, None).await?;
             return result.map(|_| ());
@@ -829,6 +866,9 @@ impl RunningProxy {
             } else { None };
             let phase = Phase{hook:"request_headers",peer,status:200,context:header_context.as_ref(),skip_headers:overrides.0};
             if l.uri_filter || route_index.is_some_and(|i|l.route_uri_filters[i]) {
+                if header_context.is_none() && (selected.is_some_and(|u|u.balancer.needs_original()) || (has_hooks && snapshot.original_hash_key)) {
+                    if let Some(original)=request.uri().path_and_query().cloned() {request.extensions_mut().insert(balance::OriginalPath(original));}
+                }
                 let (uri, result) = Box::pin(invoke_uri_plugins(&l.plugins, route_plugins, phase, event.as_mut(), &mut request)).await;
                 if let Some(ctx)=&mut header_context {ctx.current_uri=Some(Box::new(uri.clone()));}
                 *request.uri_mut()=uri;
@@ -850,11 +890,15 @@ impl RunningProxy {
             let u = if let Some(event) = &event {
                 snapshot.upstreams.get(event.upstream.as_ref().context("no upstream")?).context("plugin selected unknown upstream")?
             } else { selected.context("no matching upstream")? };
-            let (index,_) = u.select()?;
+            // Local protocol rejections must not be counted as backend failures.
+            anyhow::ensure!(request.method() != http::Method::CONNECT, "CONNECT unsupported");
+            let selection = u.balancer.select_http(u,peer,&request,header_context.as_ref().map(|c|&c.uri))?;
+            let index=selection.index;
             if let Some(ctx)=&mut header_context {ctx.upstream_addr=Some(HeaderValue::from_str(&u.config.endpoints[index].address)?);}
-            let mut outcome = match prost_http::forward(request,&u.targets[index],&u.config,u.client.current(),permit,prost_http::KeepAlive::new(snapshot.clone(),info),end_hook).await {
+            let mut outcome = match prost_http::forward(request,&u.targets[index],&u.config,u.client.current(),permit,http_keepalive(snapshot.clone(),info,selection.lease),end_hook).await {
                 Ok(v)=>v, Err(e)=>{u.health[index].passive_failure(); return Err(e);}
             };
+            if u.failed_status(outcome.response.status().as_u16()) {u.health[index].passive_failure();}
             if let Some(tunnel) = outcome.tunnel.take() {
                 let force = self.force.clone();
                 self.tasks.spawn(async move {
@@ -1044,6 +1088,17 @@ fn connection_permits(plugins: &[PreparedPlugin]) -> Result<Vec<OwnedSemaphorePe
         .iter()
         .filter_map(|p| p.acquire_connection().transpose())
         .collect()
+}
+fn http_keepalive(
+    snapshot: Arc<Snapshot>,
+    info: Arc<ConnectionInfo>,
+    lease: Option<balance::Lease>,
+) -> prost_http::KeepAlive {
+    if let Some(lease) = lease {
+        prost_http::KeepAlive::new(Arc::new((snapshot, lease)), info)
+    } else {
+        prost_http::KeepAlive::new(snapshot, info)
+    }
 }
 fn request_host(request: &Request<Incoming>) -> &str {
     let host = request

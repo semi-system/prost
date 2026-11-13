@@ -10,18 +10,26 @@ import (
     "io"
     "log"
     "net/http"
+    "os"
     "strconv"
     "strings"
+    "sync/atomic"
     "time"
 )
 
 var block = []byte(strings.Repeat("0123456789abcdef", 1024))
 var uploadHash = sha256.Sum256(bytes.Repeat(block, 64))
+var backendLabel string
+var backendDelay time.Duration
+var backendRequests atomic.Uint64
 
 func serve(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("x-upstream-http-version", r.Proto)
     if value := r.Header.Get("x-test-plugin"); value != "" { w.Header().Set("x-seen-plugin", value) }
     if r.URL.Path == "/ready" { w.Write([]byte("ready")); return }
+    if r.URL.Path == "/stats" { w.Header().Set("content-type", "application/json"); fmt.Fprintf(w, "{\"label\":%q,\"requests\":%d}", backendLabel, backendRequests.Load()); return }
+    if backendLabel != "" { w.Header().Set("x-backend", backendLabel); backendRequests.Add(1) }
+    if backendDelay > 0 { time.Sleep(backendDelay) }
     if r.URL.Path == "/upload" {
         hash := sha256.New()
         n, err := io.Copy(hash, io.LimitReader(r.Body, 16*1024*1024+1))
@@ -67,6 +75,9 @@ func serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+    backendLabel = os.Getenv("BACKEND_LABEL")
+    delay, err := strconv.Atoi(os.Getenv("REQUEST_DELAY_MS"))
+    if err == nil && delay > 0 { backendDelay = time.Duration(delay) * time.Millisecond }
     handler := http.HandlerFunc(serve)
     go func() {
         server := &http.Server{Addr: ":8080", Handler: handler, ReadHeaderTimeout: 10*time.Second}

@@ -1,0 +1,47 @@
+name: prost-balance-benchmark
+x-backend: &backend
+  image: prost:advanced-backend
+  cpus: 1
+  mem_limit: 128m
+  volumes:
+    - ../../test-results/advanced-fixtures/certs:/certs:ro
+services:
+  node-a:
+    <<: *backend
+    environment:
+      GOMAXPROCS: 1
+      BACKEND_LABEL: a
+      REQUEST_DELAY_MS: ${BALANCE_SLOW_MS:-5}
+  node-b:
+    <<: *backend
+    environment:
+      GOMAXPROCS: 1
+      BACKEND_LABEL: b
+  node-c:
+    <<: *backend
+    environment:
+      GOMAXPROCS: 1
+      BACKEND_LABEL: c
+  node-d:
+    <<: *backend
+    environment:
+      GOMAXPROCS: 1
+      BACKEND_LABEL: d
+  prost:
+    image: ${PROST_BALANCE_IMAGE:-prost:native}
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ../../test-results/balance-fixtures/prost-${BALANCE_ALGORITHM:-round_robin}.toml:/etc/prost/seed.toml:ro
+      - ../../test-results/advanced-fixtures/certs:/certs:ro
+    ports:
+      - "127.0.0.1:19454:8443"
+  nginx:
+    image: nginx:stable-bookworm
+    cpus: 2
+    mem_limit: 256m
+    volumes:
+      - ../../test-results/balance-fixtures/nginx-${BALANCE_ALGORITHM:-round_robin}.conf:/etc/nginx/nginx.conf:ro
+      - ../../test-results/advanced-fixtures/certs:/certs:ro
+    ports:
+      - "127.0.0.1:19455:8443"

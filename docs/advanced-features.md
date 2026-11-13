@@ -48,6 +48,8 @@ HTTP/2, còn lại dùng HTTP/1.1.
 giữ tương thích hành vi MVP; probe đầu chạy ngay. Endpoint bị disable không
 được probe và không nhận traffic mới. Passive transport failure vẫn eject ngay,
 không chờ `fall`; HTTP 5xx của request thường không tự eject.
+Đây là mặc định khi không có passive policy. Có thể cấu hình ngưỡng lỗi/cooldown
+và danh sách HTTP status: [passive-health.md](passive-health.md).
 
 Probe chạy ngoài I/O workers, tối đa 32 đang thực thi toàn proxy và 16 task cho
 mỗi upstream. Chu kỳ là thời gian chờ sau khi hoàn thành một lượt, không phải
