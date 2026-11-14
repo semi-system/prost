@@ -10,18 +10,21 @@ wasm = ["prost-plugin/wasm"]
 anyhow.workspace = true
 arc-swap.workspace = true
 fs2.workspace = true
+libc.workspace = true
 http.workspace = true
 getrandom.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 prometheus.workspace = true
+regex.workspace = true
 prost-config = { path = "../config" }
 prost-transport = { path = "../transport" }
 prost-http = { path = "../http" }
 prost-plugin = { path = "../plugin" }
 rustls.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 tokio.workspace = true
@@ -29,6 +32,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 [dev-dependencies]
+async-compression.workspace = true
 tempfile.workspace = true
 rcgen = "0.13"
 bytes.workspace = true

@@ -1,0 +1,30 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+io_workers = 2
+drain_seconds = 30
+
+[upstreams.app.http.cache]
+max_bytes = 16777216
+max_entries = 1024
+max_object_bytes = 262144
+max_ttl_seconds = 300
+revalidate = true
+revalidate_retention_seconds = 300
+# Origin must also send stale-if-error=N; strict cache directives still win.
+stale_if_error_seconds = 10
+
+[[upstreams.app.endpoints]]
+id = "one"
+address = "127.0.0.1:8088"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "app"
+
+# Origin responses still need eligible public/max-age or s-maxage directives.
+# This enables conservative RAM caching; it does not override private/no-store.

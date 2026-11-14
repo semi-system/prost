@@ -1,0 +1,89 @@
+# Generic opt-in edge policies. Supply a certificate for example.test and
+# replace backend addresses before running. No application-specific assumptions.
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+max_connections = 4096
+max_requests = 4096
+max_proxy_connections = 4096
+drain_seconds = 30
+
+[upstreams.web]
+connect_timeout_ms = 3000
+idle_timeout_ms = 30000
+response_header_timeout_ms = 30000
+response_body_timeout_ms = 30000
+pool_max_idle_per_host = 64
+[[upstreams.web.endpoints]]
+id = "one"
+address = "127.0.0.1:8081"
+
+[upstreams.stream]
+connect_timeout_ms = 1000
+idle_timeout_ms = 300000
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
+[upstreams.stream.tcp_retry]
+max_attempts = 3
+timeout_ms = 3500
+backoff_ms = 25
+[[upstreams.stream.endpoints]]
+id = "one"
+address = "127.0.0.1:9001"
+
+[[listeners]]
+id = "redirect"
+address = "0.0.0.0:8080"
+protocol = "http"
+header_read_timeout_ms = 10000
+keepalive_idle_timeout_ms = 30000
+[[listeners.plugins]]
+name = "host_acl"
+config = { hosts = ["example.test"], status = 421 }
+[[listeners.plugins]]
+name = "rewrite"
+config = { rules = [{ action = "redirect", to = "https://example.test:8443$request_uri", status = 308, query = "drop" }] }
+
+[[listeners]]
+id = "https"
+address = "0.0.0.0:8443"
+protocol = "http"
+upstream = "web"
+max_connections_per_ip = 100
+header_read_timeout_ms = 10000
+keepalive_idle_timeout_ms = 30000
+max_request_body_bytes = 67108864
+request_body_timeout_ms = 30000
+client_write_timeout_ms = 30000
+[[listeners.plugins]]
+name = "host_acl"
+config = { hosts = ["example.test"], status = 421 }
+[[listeners.plugins]]
+name = "headers"
+config = { response = { set = { x-served-by = "prost" } } }
+[listeners.tls]
+certificate = "/etc/prost/tls/cert.pem"
+private_key = "/etc/prost/tls/key.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["example.test"]
+certificate = "/etc/prost/tls/cert.pem"
+private_key = "/etc/prost/tls/key.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+[listeners.http2_settings]
+header_read_timeout_ms = 10000
+stream_write_timeout_ms = 5000
+
+[[listeners]]
+id = "tcp"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "stream"
+max_connections_per_ip = 50
+client_write_timeout_ms = 30000
+[[listeners.plugins]]
+name = "connection_window"
+config = { max_connections = 100, window_ms = 10000, max_keys = 4096, expire_ms = 30000 }

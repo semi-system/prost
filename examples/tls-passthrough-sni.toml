@@ -1,0 +1,40 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+io_workers = 2
+drain_seconds = 30
+
+# These backends already speak TLS and hold their own certificates/private keys.
+[upstreams.web]
+[[upstreams.web.endpoints]]
+id = "one"
+address = "127.0.0.1:9443"
+
+[upstreams.mail]
+[[upstreams.mail.endpoints]]
+id = "one"
+address = "127.0.0.1:9993"
+
+[[listeners]]
+id = "edge"
+address = "0.0.0.0:10443"
+protocol = "tcp"
+upstream = "web"
+tls_passthrough = true
+
+[listeners.tls_passthrough_settings]
+client_hello_timeout_ms = 5000
+max_client_hello_bytes = 65536
+reject_unknown_sni = true
+server_names = ["fallback.other.test"]
+
+[[listeners.tls_passthrough_settings.routes]]
+server_names = ["*.example.test"]
+upstream = "web"
+
+# Exact match wins over the wildcard above, regardless of declaration order.
+[[listeners.tls_passthrough_settings.routes]]
+server_names = ["mail.example.test"]
+upstream = "mail"

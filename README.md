@@ -1,5 +1,45 @@
 # Prost
 
+DNS backend có TTL/negative TTL và cache ETag/Last-Modified, stale-on-error:
+[docs/dns-cache.md](docs/dns-cache.md).
+
+Quản trị RAM cache: status/entries/key/purge qua Unix socket, chặn fill cũ ghi lại
+sau purge: [docs/cache-control.md](docs/cache-control.md).
+
+Routing HTTP theo method/header và ví dụ SNI default backend:
+[docs/http-routing.md](docs/http-routing.md).
+
+TLS passthrough chọn backend theo SNI, exact/wildcard và hot update:
+[docs/passthrough-routing.md](docs/passthrough-routing.md).
+Các phần chức năng còn lại: [docs/functional-roadmap.md](docs/functional-roadmap.md).
+
+Runtime API/CLI liệt kê, xem và xóa state native rate limit/connection window:
+[docs/rate-tables.md](docs/rate-tables.md).
+
+Native Host ACL, HTTP/1 keepalive idle, TCP dial retry và connection window có
+giới hạn tài nguyên: [docs/edge-policies.md](docs/edge-policies.md).
+Ví dụ cấu hình chung: [examples/edge.toml](examples/edge.toml).
+
+Kiểm chứng H2 p99, A/A noise và soak đúng image:
+[docs/h2-validation.md](docs/h2-validation.md).
+
+Trạng thái: dùng cho **MVP/pilot có giám sát**; chưa xác nhận cho production quan
+trọng. Bằng chứng kiểm thử và điều kiện còn thiếu:
+[docs/mvp-bundle-results.md](docs/mvp-bundle-results.md).
+
+Gói native mở rộng (compression/cache/retry, mTLS/PROXY/passthrough,
+timeout H2, metrics plugin/pool và soak local): [docs/mvp-bundle.md](docs/mvp-bundle.md).
+
+Access log native JSONL, rotate qua Runtime API và metrics kết nối upstream thực tế:
+[docs/access-log.md](docs/access-log.md).
+
+GC artifact qua Runtime API và kiểm thử crash/đầy đĩa:
+[docs/artifact-gc.md](docs/artifact-gc.md).
+
+Streaming body limits, granular HTTP timeouts và ví dụ cấu hình:
+[docs/http-limits.md](docs/http-limits.md).
+Kết quả đo: [docs/http-limits-benchmark.md](docs/http-limits-benchmark.md).
+
 MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix socket +
 `prostctl`**, không polling, không watcher, không restart worker.
 
@@ -190,6 +230,12 @@ Methods: `status`, `validate`, `apply`, `upstream.set_enabled`, `config.export`.
 Socket mặc định `/run/prost/admin.sock`, quyền `0600`. Không có admin TCP port.
 Export chứa đường dẫn artifact, không chứa nội dung private key.
 Metrics demo chỉ bind loopback trong container ở `127.0.0.1:9090/metrics`.
+Metrics endpoint/health/capacity, TLS, transaction, generation và process:
+[docs/observability.md](docs/observability.md).
+Đo heap/RSS, idle connections và thu hồi sau cancellation/apply:
+[docs/memory-profiling.md](docs/memory-profiling.md).
+Kết quả đo và đánh đổi RAM/throughput:
+[docs/observability-memory-benchmark.md](docs/observability-memory-benchmark.md).
 
 Chi tiết transaction, WASM ABI, giới hạn hiện tại và phần tham khảo Broom:
 [docs/architecture.md](docs/architecture.md).

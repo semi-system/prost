@@ -124,8 +124,9 @@ prostctl upstream enable sessions/a --if-generation 14
 prostctl status
 ```
 
-Chưa có retry, slow-start hoặc tự chuyển session sang backend khác sau
-khi đã kết nối. Tham khảo thuật toán của nginx:
+Retry HTTP bodyless GET/HEAD cùng endpoint có thể bật theo
+[mvp-bundle.md](mvp-bundle.md). Chưa có slow-start hoặc tự chuyển session sang
+backend khác sau khi đã kết nối. Tham khảo thuật toán của nginx:
 [upstream least_conn/hash](https://nginx.org/en/docs/http/ngx_http_upstream_module.html).
 
 Đo bốn backend và đối chứng đường chạy mặc định:

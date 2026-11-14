@@ -1,0 +1,152 @@
+# Representative SMTP / IMAPS / HTTPS mapping, not a complete HAProxy conversion.
+# Replace mail.test and the public certificate path using your real crt-list.
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+max_connections = 4096
+max_requests = 4096
+max_proxy_connections = 4096
+drain_seconds = 30
+
+[upstreams.smtp]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+idle_timeout_ms = 300000
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
+health_interval_ms = 2000
+[upstreams.smtp.health_check]
+protocol = "smtp" # Banner 220, matching the supplied HAProxy check.
+timeout_ms = 3000
+fall = 3
+rise = 2
+# To require a real STARTTLS health probe, use protocol="smtp_starttls" and
+# add health_check.tls with server_name, CA and identity as described in docs.
+[[upstreams.smtp.endpoints]]
+id = "smtp"
+address = "be-smtp:1025"
+
+[upstreams.imap]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+idle_timeout_ms = 300000
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
+health_interval_ms = 2000
+[upstreams.imap.health_check]
+protocol = "imap" # * OK after the verified backend mTLS handshake.
+timeout_ms = 3000
+fall = 3
+rise = 2
+[upstreams.imap.tls]
+server_name = "be-imap"
+ca_certificate = "/run/rusty-certs/internal-ca.crt"
+[upstreams.imap.tls.identity]
+certificate = "/run/rusty-certs/edge-client.pem"
+private_key = "/run/rusty-certs/edge-client.pem" # Combined PEM is supported.
+[upstreams.imap.tls.policy]
+min_version = "tls12"
+session_resumption = false
+cipher_suites = ["TLS13_AES_128_GCM_SHA256", "TLS13_AES_256_GCM_SHA384", "TLS13_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
+[[upstreams.imap.endpoints]]
+id = "imap"
+address = "be-imap:1993"
+
+[upstreams.web]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+idle_timeout_ms = 30000
+response_header_timeout_ms = 30000
+response_body_timeout_ms = 30000
+write_timeout_ms = 30000
+pool_idle_timeout_ms = 5000
+health_interval_ms = 2000
+[upstreams.web.health_check]
+protocol = "http"
+path = "/health"
+host = "be-http"
+expected_status = 200
+timeout_ms = 3000
+fall = 3
+rise = 2
+[upstreams.web.tls]
+server_name = "be-http"
+ca_certificate = "/run/rusty-certs/internal-ca.crt"
+[upstreams.web.tls.identity]
+certificate = "/run/rusty-certs/edge-client.pem"
+private_key = "/run/rusty-certs/edge-client.pem"
+[upstreams.web.tls.policy]
+min_version = "tls12"
+session_resumption = false
+cipher_suites = ["TLS13_AES_128_GCM_SHA256", "TLS13_AES_256_GCM_SHA384", "TLS13_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
+[[upstreams.web.endpoints]]
+id = "http"
+address = "be-http:18080"
+
+[[listeners]]
+id = "smtp_in"
+address = "0.0.0.0:10025"
+protocol = "tcp"
+upstream = "smtp"
+max_connections_per_ip = 50
+client_write_timeout_ms = 30000
+[[listeners.plugins]]
+name = "connection_rate"
+# GCRA: 10 conn/s, burst 100. Not identical to HAProxy conn_rate(10s).
+config = { connections_per_second = 10, burst = 100, key = "$remote_addr", max_keys = 100000, idle_timeout_ms = 30000 }
+
+[[listeners]]
+id = "imaps_in"
+address = "0.0.0.0:10993"
+protocol = "tcp"
+upstream = "imap"
+max_connections_per_ip = 50
+tls_handshake_timeout_ms = 3000
+client_write_timeout_ms = 30000
+[[listeners.plugins]]
+name = "connection_rate"
+config = { connections_per_second = 10, burst = 100, key = "$remote_addr", max_keys = 100000, idle_timeout_ms = 30000 }
+[listeners.tls]
+certificate = "/run/rusty-certs/edge-public.pem"
+private_key = "/run/rusty-certs/edge-public.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["mail.test"] # Replace with the real allowed public SNI names.
+certificate = "/run/rusty-certs/edge-public.pem"
+private_key = "/run/rusty-certs/edge-public.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+session_resumption = false
+cipher_suites = ["TLS13_AES_128_GCM_SHA256", "TLS13_AES_256_GCM_SHA384", "TLS13_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
+
+[[listeners]]
+id = "https_in"
+address = "0.0.0.0:10443"
+protocol = "http"
+max_connections_per_ip = 100
+max_request_body_bytes = 67108864
+request_body_timeout_ms = 30000
+header_read_timeout_ms = 10000
+client_write_timeout_ms = 30000
+tls_handshake_timeout_ms = 3000
+[[listeners.routes]]
+host = "web.test"
+path_prefix = "/"
+upstream = "web"
+[[listeners.plugins]]
+name = "connection_rate"
+config = { connections_per_second = 20, burst = 200, key = "$remote_addr", max_keys = 100000, idle_timeout_ms = 30000 }
+[listeners.tls]
+certificate = "/run/rusty-certs/edge-public.pem"
+private_key = "/run/rusty-certs/edge-public.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["web.test"]
+certificate = "/run/rusty-certs/edge-public.pem"
+private_key = "/run/rusty-certs/edge-public.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+session_resumption = false
+cipher_suites = ["TLS13_AES_128_GCM_SHA256", "TLS13_AES_256_GCM_SHA384", "TLS13_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]

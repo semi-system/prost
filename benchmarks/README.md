@@ -1,5 +1,9 @@
 # HTTP proxy comparison
 
+Memory/observability profiling and fixed/timed image controls:
+[memory-profiling.md](../docs/memory-profiling.md),
+[observability.md](../docs/observability.md).
+
 Four-backend algorithm comparison (independent project):
 
 ```sh
@@ -269,6 +273,88 @@ sudo docker compose -f benchmarks/compose.yaml down -v
 ```
 
 Configuration references:
+
+HTTP limit regression and same-image policy overhead (WSL, after preparing advanced fixtures):
+
+```sh
+sudo python3 scripts/prepare-limits-bench.py
+sudo python3 scripts/compare-header-images.py --before prost:limits-control --after prost:native \
+  --rounds 3 --duration 10 --pin-cpus --cases native_full_34 h2_64k tls_h1_64k h2_upload_1m grpc_stream \
+  --output-dir test-results/http-limits-default-timed
+sudo python3 scripts/compare-header-images.py --before prost:native --after prost:native \
+  --after-config test-results/advanced-fixtures/prost-limits.toml --rounds 3 --duration 10 --pin-cpus \
+  --cases native_full_34 h2_64k h2_upload_1m grpc_stream --output-dir test-results/http-limits-policy-timed
+sudo python3 scripts/profile-memory.py --image prost:native --http-limits --output-dir test-results/http-limits-memory
+```
+
+`prost:limits-control` must tag the binary from before HTTP limit implementation.
+Reports capture image IDs and the config hash for each label. Timed runs count
+completed responses and report deadline tail streams separately; fixed request
+runs remain useful for correctness and can show uneven per-connection tails.
+
+For CPU stacks, run separately from throughput/memory measurements:
+
+```sh
+sudo python3 scripts/profile-http-cpu.py --pin-cpus --case h2_64k \
+  --images prost:limits-control prost:native --output-dir test-results/http-limits-cpu
+```
+
+This requires Linux `perf` with permission to sample the Docker host processes.
+The load output during profiling is diagnostic, not an uninstrumented benchmark.
+If the WSL perf build cannot resolve ELF symbols, recover leaf function names
+from the exact image IDs with `python3 scripts/symbolize-http-cpu.py test-results/http-limits-cpu`.
+This does not recover full DWARF/inline call stacks.
+
+Native access-log correctness/resource checks run locally with
+`sudo python3 scripts/access-log-smoke.py --image prost:native`. This confines
+real ENOSPC to a private 64 KiB log tmpfs while serving 10000 HTTP/2 requests.
+For same-image off/on policy comparisons, `compare-header-images.py` accepts
+`--before-config off.toml --after-config on.toml --capture-access-log`;
+the optional capture flushes outside the timed interval and saves cumulative
+writer counters, including drops. It does not fsync. Full logging and 1/16
+sampling costs, default-path regression and image IDs:
+[access-log-benchmark.md](../docs/access-log-benchmark.md).
+
+Before interpreting a small A/B difference, calibrate with the **same image and
+config under both labels**. `compare-header-images.py` saves every p99/CPU round,
+worker runnable wait time (`schedstat`), cgroup throttling and host CPU pressure.
+An A/A result is marked inapplicable to a code-change gate; absolute median
+differences over 5% throughput or 10% p99 flag environmental noise. Use a fresh
+output directory for each run; existing measurements are never overwritten.
+
+```sh
+sudo python3 scripts/compare-header-images.py --before prost:native --after prost:native \
+  --cases h2_64k --rounds 5 --duration 12 --pin-cpus \
+  --output-dir test-results/h2-aa-new
+sudo python3 scripts/compare-header-images.py --before prost:native --after prost:native \
+  --cases h2_64k --rounds 3 --duration 12 --pin-cpus --rps-per-client 100 \
+  --output-dir test-results/h2-aa-paced-new
+```
+
+The second run offers 100 requests/second per connection: 3,200 total for the
+32-connection H2 fixture. This diagnoses latency below saturation; it does not
+replace the original saturated capacity test or clear a failing historical gate.
+Guest CPU affinity is not an exclusive reservation on the Windows host.
+Evidence and limits: [h2-validation.md](../docs/h2-validation.md).
+
+Start a separate background soak **after all builds/benchmarks finish**:
+
+```sh
+sudo python3 scripts/start-soak.py --image prost:native \
+  --cert-dir /absolute/path/to/test-certs --edge-policies \
+  --output-dir test-results/soak-edge-new
+```
+
+The launcher pins proxy and backend image IDs, checks certificate lifetime for
+the campaign plus an hour, records PID/command/expected completion in
+`launcher.json`, and writes `run.log`/`progress.json`. Inspect `summary.json` for
+the completed result; successful launch is not a passed soak. SIGTERM stops the
+recorded process and preserves logs; an interrupted campaign is marked failed.
+The edge variant enables Host ACL, H1 idle timeout, TCP dial retry and connection
+window, probes Host denial after each hot apply, and checks idle reuse past the
+header budget. Healthy traffic does not exercise retry recovery or rate-limit
+rejection; their integration tests cover those paths.
+
 [nginx proxy module](https://nginx.org/en/docs/http/ngx_http_proxy_module.html),
 [Apache mod_proxy](https://httpd.apache.org/docs/2.4/mod/mod_proxy.html),
 [Apache event MPM](https://httpd.apache.org/docs/2.4/mod/event.html).

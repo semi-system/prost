@@ -99,9 +99,24 @@ pub fn server_tls(tls: &ServerTls, http: bool) -> Result<Arc<ServerConfig>> {
             }
         }
     }
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+    let builder =
+        ServerConfig::builder_with_provider(crate::policy::provider(tls.policy.as_ref())?)
+            .with_protocol_versions(crate::policy::versions(tls.policy.as_ref()))?;
+    let builder = if let Some(path) = &tls.client_ca {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(std::fs::read(path)?.as_slice())) {
+            roots.add(cert?)?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+    let mut config = builder.with_cert_resolver(Arc::new(resolver));
+    if tls.policy.as_ref().is_some_and(|p| !p.session_resumption) {
+        config.send_tls13_tickets = 0;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    }
     if http {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }

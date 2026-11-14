@@ -28,6 +28,7 @@ func serve(w http.ResponseWriter, r *http.Request) {
     if value := r.Header.Get("x-test-plugin"); value != "" { w.Header().Set("x-seen-plugin", value) }
     if r.URL.Path == "/ready" { w.Write([]byte("ready")); return }
     if r.URL.Path == "/stats" { w.Header().Set("content-type", "application/json"); fmt.Fprintf(w, "{\"label\":%q,\"requests\":%d}", backendLabel, backendRequests.Load()); return }
+    if strings.HasPrefix(r.URL.Path, "/cached/") { w.Header().Set("cache-control", "public,max-age=10") }
     if backendLabel != "" { w.Header().Set("x-backend", backendLabel); backendRequests.Add(1) }
     if backendDelay > 0 { time.Sleep(backendDelay) }
     if r.URL.Path == "/upload" {

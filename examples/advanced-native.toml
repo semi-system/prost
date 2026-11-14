@@ -1,0 +1,54 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+metrics_address = "127.0.0.1:9090"
+observe_plugins = true
+io_workers = 2
+
+[runtime.access_log]
+path = "/var/lib/prost/access.jsonl"
+format = "compact"
+sample_every = 16
+exclude_paths = ["/healthz", "/ready"]
+# statuses = [400, 401, 403, 404, 429, 500, 502, 503, 504]
+
+[upstreams.web]
+observe_pool_state = true
+observe_connection_reuse = true
+
+[upstreams.web.http.compression]
+algorithms = ["br", "gzip"]
+level = 3
+min_bytes = 1024
+max_concurrent = 16
+
+[upstreams.web.http.cache]
+max_bytes = 16777216
+max_entries = 1024
+max_object_bytes = 262144
+max_ttl_seconds = 300
+
+[upstreams.web.http.retry]
+max_attempts = 2
+statuses = [502, 503, 504]
+timeout_ms = 5000
+
+[[upstreams.web.endpoints]]
+id = "app"
+address = "127.0.0.1:8081"
+
+[[listeners]]
+id = "http"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "web"
+
+[listeners.http2_settings]
+header_read_timeout_ms = 5000
+stream_write_timeout_ms = 5000
+
+[[listeners.plugins]]
+name = "headers"
+config = { response = { set = { x-proxy = "prost" } } }

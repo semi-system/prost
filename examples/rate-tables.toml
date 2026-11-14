@@ -1,0 +1,36 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+io_workers = 2
+drain_seconds = 30
+
+[upstreams.app]
+[[upstreams.app.endpoints]]
+id = "one"
+address = "127.0.0.1:8088"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "app"
+
+[[listeners.routes]]
+path_prefix = "/api"
+upstream = "app"
+
+[[listeners.routes.plugins]]
+name = "rate_limit"
+config = { requests_per_second = 20, burst = 40, key = "$http_x_tenant", max_keys = 4096 }
+
+[[listeners]]
+id = "stream"
+address = "0.0.0.0:9000"
+protocol = "tcp"
+upstream = "app"
+
+[[listeners.plugins]]
+name = "connection_window"
+config = { max_connections = 100, window_ms = 10000, max_keys = 4096, expire_ms = 30000 }

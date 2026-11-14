@@ -1,6 +1,8 @@
 #![cfg(unix)]
 use anyhow::{ensure, Context, Result};
-use prost_core::RunningProxy;
+pub use prost_core::{CacheKeyInput, CacheQuery};
+use prost_core::{GcOptions, RunningProxy};
+pub use prost_core::{KeyEncoding, RateTableTarget, TableKey, TableQuery};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -43,6 +45,87 @@ pub enum Command {
     Status,
     #[serde(rename = "config.export")]
     Export,
+    #[serde(rename = "cache.status")]
+    CacheStatus {
+        #[serde(default)]
+        upstream: Option<String>,
+    },
+    #[serde(rename = "cache.entries")]
+    CacheEntries {
+        upstream: String,
+        #[serde(default)]
+        query: CacheQuery,
+    },
+    #[serde(rename = "cache.key")]
+    CacheKey {
+        input: CacheKeyInput,
+    },
+    #[serde(rename = "cache.purge")]
+    CachePurge {
+        upstream: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        all: bool,
+        expected_generation: u64,
+    },
+    #[serde(rename = "rate_table.list")]
+    RateTableList {
+        #[serde(default)]
+        listener: Option<String>,
+        #[serde(default = "rate_table_limit")]
+        limit: usize,
+    },
+    #[serde(rename = "rate_table.show")]
+    RateTableShow {
+        target: RateTableTarget,
+        #[serde(default)]
+        query: TableQuery,
+    },
+    #[serde(rename = "rate_table.clear")]
+    RateTableClear {
+        target: RateTableTarget,
+        #[serde(default)]
+        key: Option<TableKey>,
+        #[serde(default)]
+        all: bool,
+        expected_generation: u64,
+    },
+    #[serde(rename = "artifacts.gc")]
+    CollectArtifacts {
+        #[serde(default = "gc_dry_run")]
+        dry_run: bool,
+        #[serde(default = "gc_min_age")]
+        min_age_seconds: u64,
+        #[serde(default = "gc_max_entries")]
+        max_entries: usize,
+        #[serde(default = "gc_max_delete")]
+        max_delete_files: u64,
+        expected_generation: u64,
+    },
+    #[serde(rename = "access_log.flush")]
+    FlushAccessLog {
+        expected_generation: u64,
+    },
+    #[serde(rename = "access_log.reopen")]
+    ReopenAccessLog {
+        expected_generation: u64,
+    },
+}
+fn rate_table_limit() -> usize {
+    100
+}
+fn gc_dry_run() -> bool {
+    true
+}
+fn gc_min_age() -> u64 {
+    GcOptions::default().min_age_seconds
+}
+fn gc_max_entries() -> usize {
+    GcOptions::default().max_entries
+}
+fn gc_max_delete() -> u64 {
+    GcOptions::default().max_delete_files
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Response {
@@ -182,6 +265,50 @@ async fn dispatch(proxy: Arc<RunningProxy>, request: Request) -> Response {
         match request.command {
             Command::Status => Ok(proxy.status()),
             Command::Export => Ok(json!({"config":proxy.snapshot().config.encode()?})),
+            Command::CacheStatus {upstream}=>proxy.cache_status(upstream).await,
+            Command::CacheEntries {upstream,query}=>proxy.cache_entries(upstream,query).await,
+            Command::CacheKey {input}=>Ok(json!({"key":prost_core::cache_key(&input)?,"generation":proxy.snapshot().config.generation})),
+            Command::CachePurge {upstream,key,all,expected_generation}=>proxy.cache_purge(upstream,key,all,expected_generation).await,
+            Command::RateTableList { listener, limit } => {
+                proxy.rate_table_list(listener, limit).await
+            }
+            Command::RateTableShow { target, query } => proxy.rate_table_show(target, query).await,
+            Command::RateTableClear {
+                target,
+                key,
+                all,
+                expected_generation,
+            } => {
+                proxy
+                    .rate_table_clear(target, key, all, expected_generation)
+                    .await
+            }
+            Command::FlushAccessLog {
+                expected_generation,
+            } => proxy.access_log_control(false, expected_generation).await,
+            Command::ReopenAccessLog {
+                expected_generation,
+            } => proxy.access_log_control(true, expected_generation).await,
+            Command::CollectArtifacts {
+                dry_run,
+                min_age_seconds,
+                max_entries,
+                max_delete_files,
+                expected_generation,
+            } => {
+                let report = proxy
+                    .collect_artifacts(
+                        GcOptions {
+                            dry_run,
+                            min_age_seconds,
+                            max_entries,
+                            max_delete_files,
+                        },
+                        expected_generation,
+                    )
+                    .await?;
+                Ok(report.json())
+            }
             Command::Validate { config } => {
                 proxy.validate(config).await?;
                 Ok(json!({"valid":true}))
@@ -207,7 +334,10 @@ async fn dispatch(proxy: Arc<RunningProxy>, request: Request) -> Response {
         Ok(value) => Response {
             version: 1,
             id: request.id,
-            generation,
+            generation: value
+                .get("generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(generation),
             result: Some(value),
             error: None,
         },

@@ -1,8 +1,21 @@
 #![cfg(unix)]
+mod access_log;
 mod balance;
+mod cache_control;
+pub use prost_http::cache_control::{cache_key, CacheKeyInput, CacheQuery};
 mod health;
+mod ip_connections;
 mod local_metrics;
+mod observability;
+mod proxy_clients;
+mod rate_tables;
+pub use prost_plugin::rate_table::{KeyEncoding, TableKey, TableQuery};
+pub use rate_tables::RateTableTarget;
+mod route_index;
+mod route_match;
 mod storage;
+#[cfg(test)]
+mod storage_tests;
 mod workers;
 
 use anyhow::{ensure, Context, Result};
@@ -10,7 +23,7 @@ use arc_swap::ArcSwap;
 use http::{header, HeaderName, HeaderValue, Request, Response};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
+    rt::{TokioIo, TokioTimer},
     server::conn::auto,
 };
 use prost_config::{Config, Listener, Protocol, Upstream};
@@ -22,6 +35,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     fs::File,
+    io::Read,
     net::SocketAddr,
     path::PathBuf,
     sync::{atomic::Ordering, Arc, Mutex, Weak},
@@ -38,6 +52,7 @@ static FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto"
 
 pub use prost_config;
 pub use prost_plugin;
+pub use storage::{GcOptions, GcReport};
 
 pub struct Metrics {
     pub registry: prometheus::Registry,
@@ -47,12 +62,51 @@ pub struct Metrics {
     pub bytes: prometheus::IntCounter,
     pub commits: prometheus::IntCounter,
     pub latency: prometheus::Histogram,
+    tls_latency: prometheus::Histogram,
+    transaction_latency: [prometheus::Histogram; 3],
+    gc_runs: prometheus::IntCounterVec,
+    gc_files: prometheus::IntCounter,
+    gc_bytes: prometheus::IntCounter,
+    gc_seconds: prometheus::Histogram,
 }
 impl Metrics {
     fn new() -> Result<Self> {
         let registry = prometheus::Registry::new();
+        let transaction_latency = prometheus::HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "prost_config_transaction_seconds",
+                "Runtime operation duration including coordinator wait",
+            ),
+            &["operation"],
+        )?;
+        registry.register(Box::new(transaction_latency.clone()))?;
         let m = Self {
             registry,
+            gc_runs: prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "prost_artifact_gc_runs_total",
+                    "Artifact collection results",
+                ),
+                &["mode", "result"],
+            )?,
+            gc_files: prometheus::IntCounter::new(
+                "prost_artifact_gc_deleted_files_total",
+                "Successfully unlinked managed files",
+            )?,
+            gc_bytes: prometheus::IntCounter::new(
+                "prost_artifact_gc_deleted_bytes_total",
+                "Bytes in successfully unlinked managed files",
+            )?,
+            gc_seconds: prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
+                "prost_artifact_gc_seconds",
+                "Collection including coordinator wait",
+            ))?,
+            tls_latency: prometheus::Histogram::with_opts(prometheus::HistogramOpts::new(
+                "prost_tls_handshake_seconds",
+                "Downstream TLS handshake duration excluding rejected admission",
+            ))?,
+            transaction_latency: ["apply", "endpoint_patch", "validate"]
+                .map(|operation| transaction_latency.with_label_values(&[operation])),
             connections: prometheus::IntGauge::new(
                 "prost_connections",
                 "Active accepted connections",
@@ -75,6 +129,11 @@ impl Metrics {
         m.registry.register(Box::new(m.bytes.clone()))?;
         m.registry.register(Box::new(m.commits.clone()))?;
         m.registry.register(Box::new(m.latency.clone()))?;
+        m.registry.register(Box::new(m.tls_latency.clone()))?;
+        m.registry.register(Box::new(m.gc_runs.clone()))?;
+        m.registry.register(Box::new(m.gc_files.clone()))?;
+        m.registry.register(Box::new(m.gc_bytes.clone()))?;
+        m.registry.register(Box::new(m.gc_seconds.clone()))?;
         Ok(m)
     }
 }
@@ -84,17 +143,33 @@ pub struct Snapshot {
     upstreams: BTreeMap<String, Arc<PreparedUpstream>>,
     listeners: BTreeMap<String, Arc<PreparedListener>>,
     original_hash_key: bool,
+    artifact_hashes: std::collections::HashSet<std::ffi::OsString>,
 }
 struct PreparedUpstream {
+    dns: Option<Arc<prost_transport::DnsResolver>>,
+    http: Option<Arc<prost_http::HttpResources>>,
     config: Upstream,
     tls: Arc<rustls::ClientConfig>,
+    health_tls: Arc<rustls::ClientConfig>,
     client: Arc<ClientPool>,
     health: Vec<Arc<health::State>>,
     balancer: balance::Balancer,
     targets: Vec<prost_http::Target>,
     passive_statuses: Option<Box<[u64; 4]>>,
+    observed: Vec<Arc<observability::Endpoint>>,
+    observed_group: Arc<observability::Upstream>,
 }
 impl PreparedUpstream {
+    fn selection_error(&self, error: anyhow::Error) -> anyhow::Error {
+        if let Some(reason) = error.downcast_ref::<balance::Rejection>() {
+            self.observed_group.rejected[match reason {
+                balance::Rejection::Unavailable => 0,
+                balance::Rejection::Capacity => 1,
+            }]
+            .fetch_add(1, Ordering::Relaxed);
+        }
+        error
+    }
     #[inline]
     fn failed_status(&self, status: u16) -> bool {
         self.passive_statuses.as_ref().is_some_and(|mask| {
@@ -104,12 +179,17 @@ impl PreparedUpstream {
     }
 }
 struct PreparedListener {
+    connection_admission: Vec<usize>,
+    ip_capacity: Arc<ip_connections::IpConnections>,
+    passthrough: Option<Arc<prost_transport::ClientHelloGuard>>,
     config: Listener,
     tls: Option<Arc<rustls::ServerConfig>>,
     capacity: Arc<Semaphore>,
     plugins: Arc<Vec<PreparedPlugin>>,
     routes: Vec<Arc<Vec<PreparedPlugin>>>,
     route_order: Vec<usize>,
+    route_index: route_index::RouteIndex,
+    route_matches: Vec<route_match::RouteMatch>,
     default_upstream: Option<Arc<PreparedUpstream>>,
     route_upstreams: Vec<Arc<PreparedUpstream>>,
     has_hooks: bool,
@@ -117,13 +197,59 @@ struct PreparedListener {
     route_uri_filters: Vec<bool>,
 }
 struct ConnectionInfo {
+    addresses: prost_transport::ProxyAddresses,
+    proxy_clients: proxy_clients::Clients,
+    transport_peer: SocketAddr,
+    headers_seen: std::sync::atomic::AtomicBool,
+    first_headers: tokio::sync::Notify,
     peer: SocketAddr,
     peer_text: String,
     forwarded_for: HeaderValue,
     forwarded_proto: HeaderValue,
     _lease: ConnectionLease,
 }
+trait HttpMode {
+    fn response(
+        proxy: Arc<RunningProxy>,
+        id: Arc<str>,
+        info: Arc<ConnectionInfo>,
+        request: Request<Incoming>,
+        guard: bool,
+    ) -> impl std::future::Future<Output = std::result::Result<Response<Body>, Infallible>>
+           + Send
+           + 'static;
+}
+struct PlainHttp;
+struct LoggedHttp;
+impl HttpMode for PlainHttp {
+    async fn response(
+        proxy: Arc<RunningProxy>,
+        id: Arc<str>,
+        info: Arc<ConnectionInfo>,
+        request: Request<Incoming>,
+        guard: bool,
+    ) -> std::result::Result<Response<Body>, Infallible> {
+        let mut response = proxy.handle_http(id, info, request, None).await;
+        if guard {
+            prost_http::h2_deadline::observe_response(&mut response);
+        }
+        Ok(response)
+    }
+}
+impl HttpMode for LoggedHttp {
+    async fn response(
+        proxy: Arc<RunningProxy>,
+        id: Arc<str>,
+        info: Arc<ConnectionInfo>,
+        request: Request<Incoming>,
+        guard: bool,
+    ) -> std::result::Result<Response<Body>, Infallible> {
+        Ok(proxy.handle_http_logged(id, info, request, guard).await)
+    }
+}
 struct ConnectionLease {
+    _ip: Option<ip_connections::Permit>,
+    audit: Option<Arc<access_log::Ticket>>,
     _global: OwnedSemaphorePermit,
     _local: OwnedSemaphorePermit,
     _plugins: Vec<OwnedSemaphorePermit>,
@@ -138,9 +264,13 @@ struct Binding {
     cancel: CancellationToken,
 }
 pub struct RunningProxy {
+    proxy_connections: Arc<Semaphore>,
+    access_log: Option<Arc<access_log::Logger>>,
     current: ArcSwap<Snapshot>,
     path: PathBuf,
-    _lock: File,
+    _lock: storage::ConfigLock,
+    artifacts: Arc<storage::ArtifactStore>,
+    last_gc: Mutex<Option<serde_json::Value>>,
     registry: Arc<PluginRegistry>,
     coordinator: AsyncMutex<()>,
     bindings: Mutex<BTreeMap<String, Binding>>,
@@ -156,6 +286,7 @@ pub struct RunningProxy {
     pub metrics: Metrics,
     workers: Option<Arc<workers::Workers>>,
     worker_count: usize,
+    observed: observability::Runtime,
 }
 pub struct ProxyBuilder {
     path: PathBuf,
@@ -176,6 +307,13 @@ impl ProxyBuilder {
         let path = std::fs::canonicalize(&self.path).context("config path must exist")?;
         let lock = storage::lock(&path)?;
         let raw = Config::parse(&std::fs::read_to_string(&path)?)?;
+        let artifacts = Arc::new(storage::ArtifactStore::open(&raw.runtime.artifact_dir)?);
+        let access_log = raw
+            .runtime
+            .access_log
+            .as_ref()
+            .map(|config| access_log::Logger::start(config, &path, &artifacts.path))
+            .transpose()?;
         let metrics = Metrics::new()?;
         let worker_count = if raw.runtime.worker_local {
             if raw.runtime.io_workers == 0 {
@@ -198,9 +336,11 @@ impl ProxyBuilder {
             None
         };
         let registry = Arc::new(self.registry);
+        registry.observe_plugins(raw.runtime.observe_plugins);
         let r = registry.clone();
+        let store = artifacts.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
-            prepare(storage::stage(raw)?, &r, None, worker_count)
+            prepare(storage::stage(raw, &store)?, &r, None, worker_count)
         })
         .await??;
         let mut sockets = Vec::new();
@@ -216,20 +356,22 @@ impl ProxyBuilder {
         };
         let encoded = snapshot.config.encode()?;
         let persist_path = path.clone();
+        let store = artifacts.clone();
         ensure!(
-            tokio::task::spawn_blocking(move || storage::atomic_write(
-                &persist_path,
-                encoded.as_bytes()
-            ))
-            .await??,
+            tokio::task::spawn_blocking(move || store.persist(&persist_path, encoded.as_bytes()))
+                .await??,
             "initial directory fsync failed"
         );
         let runtime = snapshot.config.runtime.clone();
         let snapshot = Arc::new(snapshot);
         let p = Arc::new(RunningProxy {
+            proxy_connections: Arc::new(Semaphore::new(runtime.max_proxy_connections)),
+            access_log,
             current: ArcSwap::from(snapshot.clone()),
             path,
             _lock: lock,
+            artifacts,
+            last_gc: Mutex::new(None),
             registry,
             coordinator: AsyncMutex::new(()),
             bindings: Mutex::new(BTreeMap::new()),
@@ -245,7 +387,11 @@ impl ProxyBuilder {
             metrics,
             workers,
             worker_count,
+            observed: observability::Runtime::default(),
         });
+        p.metrics
+            .registry
+            .register(Box::new(observability::Exporter::new(Arc::downgrade(&p))?))?;
         for (id, socket) in sockets {
             p.start_listener(id, socket);
         }
@@ -279,26 +425,84 @@ fn prepare(
         } else {
             prost_transport::client_tls(u.tls.as_ref())?
         };
+        let health_tls = if u.health_check.tls.is_none() {
+            tls.clone()
+        } else if let Some(old) =
+            old.filter(|old| old.config.health_check.tls == u.health_check.tls)
+        {
+            old.health_tls.clone()
+        } else {
+            prost_transport::client_tls(u.health_check.tls.as_ref())?
+        };
+        let observed_group = old
+            .map(|u| u.observed_group.clone())
+            .unwrap_or_else(|| Arc::new(observability::Upstream::new(worker_count)));
+        let dns = u
+            .dns
+            .as_ref()
+            .map(|policy| {
+                old.filter(|old| pool_compatible(&old.config, u))
+                    .and_then(|old| old.dns.clone())
+                    .map(Ok)
+                    .unwrap_or_else(|| prost_transport::DnsResolver::new(policy.clone()))
+            })
+            .transpose()?;
         let client = if let Some(old) = old.filter(|old| pool_compatible(&old.config, u)) {
             old.client.clone()
         } else {
-            Arc::new(ClientPool::new(u, tls.clone(), worker_count)?)
+            Arc::new(ClientPool::new_with_dns(
+                u,
+                tls.clone(),
+                worker_count,
+                observed_group.pool.clone(),
+                dns.clone(),
+            )?)
         };
         let balancer = balance::Balancer::new(u, old)?;
+        let observed: Vec<_> = u
+            .endpoints
+            .iter()
+            .map(|e| {
+                old.and_then(|u| {
+                    u.config
+                        .endpoints
+                        .iter()
+                        .position(|p| p.id == e.id && p.address == e.address)
+                        .map(|i| u.observed[i].clone())
+                })
+                .unwrap_or_else(|| {
+                    Arc::new(observability::Endpoint::new(
+                        worker_count,
+                        config.runtime.worker_local,
+                    ))
+                })
+            })
+            .collect();
         upstreams.insert(
             name.clone(),
             Arc::new(PreparedUpstream {
+                dns,
+                http: u.http.as_ref().map(|policy| {
+                    old.filter(|old| {
+                        old.config.http.as_ref() == Some(policy) && pool_compatible(&old.config, u)
+                    })
+                    .and_then(|old| old.http.clone())
+                    .unwrap_or_else(|| prost_http::HttpResources::new(policy.clone()))
+                }),
                 config: u.clone(),
+                health_tls,
                 tls,
                 client,
                 health: u
                     .endpoints
                     .iter()
-                    .map(|endpoint| {
-                        previous
+                    .enumerate()
+                    .map(|(index, endpoint)| {
+                        let state = previous
                             .and_then(|s| s.upstreams.get(name))
                             .filter(|old| {
                                 old.config.tls == u.tls
+                                    && old.config.send_proxy_v2 == u.send_proxy_v2
                                     && old.config.health_check == u.health_check
                                     && old.config.http2 == u.http2
                             })
@@ -310,16 +514,17 @@ fn prepare(
                                         e.id == endpoint.id && e.address == endpoint.address
                                     })
                                     .map(|i| {
-                                        Arc::new(if old.config.passive_health == u.passive_health {
+                                        if old.config.passive_health == u.passive_health {
                                             old.health[i].snapshot()
                                         } else {
                                             old.health[i].reconfigure(u.passive_health.as_ref())
-                                        })
+                                        }
                                     })
                             })
-                            .unwrap_or_else(|| {
-                                Arc::new(health::State::new(u.passive_health.as_ref()))
-                            })
+                            .unwrap_or_else(|| health::State::new(u.passive_health.as_ref()));
+                        let mut state = state;
+                        state.observed = observed[index].health.clone();
+                        Arc::new(state)
                     })
                     .collect(),
                 balancer,
@@ -339,6 +544,8 @@ fn prepare(
                         }
                         mask
                     }),
+                observed,
+                observed_group,
             }),
         );
     }
@@ -388,6 +595,8 @@ fn prepare(
                         route.host == r.host
                             && route.path_prefix == r.path_prefix
                             && route.priority == r.priority
+                            && route.methods == r.methods
+                            && route.headers == r.headers
                     })
                 });
                 prepare_plugins(
@@ -399,6 +608,15 @@ fn prepare(
             })
             .collect::<Result<_>>()?;
         let mut route_order: Vec<usize> = (0..l.routes.len()).collect();
+        let route_matches = l
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                route_match::RouteMatch::compile(r)
+                    .with_context(|| format!("listener {} route {i}", l.id))
+            })
+            .collect::<Result<Vec<_>>>()?;
         route_order.sort_by_key(|i| {
             (
                 std::cmp::Reverse(l.routes[*i].priority),
@@ -420,11 +638,32 @@ fn prepare(
         listeners.insert(
             l.id.clone(),
             Arc::new(PreparedListener {
+                connection_admission: l
+                    .plugins
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| {
+                        matches!(p.name.as_str(), "connection_rate" | "connection_window")
+                            .then_some(i)
+                    })
+                    .collect(),
+                ip_capacity: previous_l
+                    .map(|old| old.ip_capacity.clone())
+                    .unwrap_or_default(),
+                passthrough: if l.tls_passthrough {
+                    Some(Arc::new(prost_transport::ClientHelloGuard::new(
+                        l.tls_passthrough_settings.clone().unwrap_or_default(),
+                    )?))
+                } else {
+                    None
+                },
                 config: l.clone(),
                 tls,
                 capacity,
                 plugins,
                 routes,
+                route_index: route_index::RouteIndex::new(l, &route_order),
+                route_matches,
                 route_order,
                 default_upstream,
                 route_upstreams,
@@ -435,8 +674,11 @@ fn prepare(
         );
     }
     let original_hash_key = upstreams.values().any(|u| u.balancer.needs_original());
-    let hash = storage::hash(config.encode()?.as_bytes());
+    let encoded = config.encode()?;
+    let hash = storage::hash(encoded.as_bytes());
+    let artifact_hashes = storage::references(&config);
     Ok(Snapshot {
+        artifact_hashes,
         config,
         hash,
         upstreams,
@@ -445,11 +687,18 @@ fn prepare(
     })
 }
 fn pool_compatible(a: &Upstream, b: &Upstream) -> bool {
+    if a.dns != b.dns {
+        return false;
+    }
     // Match every setting captured by prost_http::client. Selection, health and
     // per-request idle timeouts can change while the existing pool remains valid.
     a.tls == b.tls
+        && a.send_proxy_v2 == b.send_proxy_v2
         && a.http2 == b.http2
         && a.connect_timeout_ms == b.connect_timeout_ms
+        && a.write_timeout_ms == b.write_timeout_ms
+        && a.observe_connection_reuse == b.observe_connection_reuse
+        && a.observe_pool_state == b.observe_pool_state
         && a.pool_max_idle_per_host == b.pool_max_idle_per_host
         && a.pool_idle_timeout_ms == b.pool_idle_timeout_ms
         && a.http1_max_buf_size == b.http1_max_buf_size
@@ -508,20 +757,150 @@ impl RunningProxy {
             (name, endpoints)
         }).collect();
         let balancers:BTreeMap<_,_>=snapshot.upstreams.iter().map(|(name,u)|(name,serde_json::json!({"algorithm":u.config.balance,"hash_key":if u.config.balance=="consistent_hash" {Some(u.config.hash_key.as_deref().unwrap_or("$remote_addr"))} else {None},"hash_points":u.balancer.points()}))).collect();
-        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": self.workers.is_some(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers})
+        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": self.workers.is_some(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers, "artifact_gc":self.last_gc.lock().unwrap().clone(), "access_log": self.access_log.as_ref().map(|log|log.status())})
     }
     pub async fn validate(self: &Arc<Self>, text: String) -> Result<()> {
+        let p = self.clone();
+        // A cancelled caller cannot release the coordinator while blocking
+        // artifact staging is still running and a GC could otherwise start.
+        tokio::spawn(async move { p.validate_inner(text).await }).await?
+    }
+    pub async fn access_log_control(
+        self: &Arc<Self>,
+        reopen: bool,
+        expected: u64,
+    ) -> Result<serde_json::Value> {
+        let p = self.clone();
+        tokio::spawn(async move {
+            let _guard = p.coordinator.lock().await;
+            ensure!(!p.shutdown.is_cancelled(), "proxy shutting down");
+            ensure!(
+                p.snapshot().config.generation == expected,
+                "generation_conflict"
+            );
+            let log = p.access_log.as_ref().context("access log is disabled")?;
+            let epoch = log.control(reopen).await?;
+            Ok(serde_json::json!({"reopened":reopen,"epoch":epoch,"generation":expected}))
+        })
+        .await?
+    }
+    async fn validate_inner(self: &Arc<Self>, text: String) -> Result<()> {
+        let mut observation = observability::Transaction::new(
+            &self.observed,
+            &self.metrics.transaction_latency[2],
+            2,
+        );
+        let result = async {
+            let _guard = self.coordinator.lock().await;
+            let old = self.snapshot();
+            let config = Config::parse(&text)?;
+            self.compatible(&config, &old)?;
+            let registry = self.registry.clone();
+            let worker_count = self.worker_count;
+            let store = self.artifacts.clone();
+            tokio::task::spawn_blocking(move || {
+                prepare(
+                    storage::stage(config, &store)?,
+                    &registry,
+                    Some(&old),
+                    worker_count,
+                )
+            })
+            .await??;
+            Ok(())
+        }
+        .await;
+        observation.finish(&result, true);
+        result
+    }
+    /// Explicit, bounded collection; no file watcher or periodic config scan.
+    pub async fn collect_artifacts(
+        self: &Arc<Self>,
+        options: GcOptions,
+        expected: u64,
+    ) -> Result<GcReport> {
+        let p = self.clone();
+        tokio::spawn(async move {
+            let _timer = p.metrics.gc_seconds.start_timer();
+            let result = p.collect_artifacts_inner(options, expected).await;
+            let outcome = match &result {
+                Ok(report) if report.errors == 0 => "success",
+                Ok(_) => "partial",
+                Err(_) => "error",
+            };
+            p.metrics
+                .gc_runs
+                .with_label_values(&[
+                    if options.dry_run {
+                        "dry_run"
+                    } else {
+                        "collect"
+                    },
+                    outcome,
+                ])
+                .inc();
+            if let Ok(report) = &result {
+                p.metrics.gc_files.inc_by(report.deleted_files);
+                p.metrics.gc_bytes.inc_by(report.deleted_bytes);
+            }
+            result
+        })
+        .await?
+    }
+    async fn collect_artifacts_inner(
+        self: &Arc<Self>,
+        options: GcOptions,
+        expected: u64,
+    ) -> Result<GcReport> {
         let _guard = self.coordinator.lock().await;
-        let old = self.snapshot();
-        let config = Config::parse(&text)?;
-        self.compatible(&config, &old)?;
-        let registry = self.registry.clone();
-        let worker_count = self.worker_count;
-        tokio::task::spawn_blocking(move || {
-            prepare(storage::stage(config)?, &registry, Some(&old), worker_count)
+        ensure!(!self.shutdown.is_cancelled(), "proxy shutting down");
+        let current = self.snapshot();
+        ensure!(current.config.generation == expected, "generation_conflict");
+        let live: Vec<_> = {
+            let mut generations = self.generations.lock().unwrap();
+            generations.retain(|generation| generation.strong_count() > 0);
+            generations.iter().filter_map(Weak::upgrade).collect()
+        };
+        let store = self.artifacts.clone();
+        let path = self.path.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let mut file = File::open(&path)?;
+            ensure!(
+                file.metadata()?.len() <= 4 * 1024 * 1024,
+                "managed config exceeds GC read limit"
+            );
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= 4 * 1024 * 1024,
+                "managed config exceeds GC read limit"
+            );
+            ensure!(
+                storage::hash(&bytes) == current.hash,
+                "managed_config_changed: use Runtime API before collecting artifacts"
+            );
+            // Repair/confirm durability before removing files required by an
+            // older on-disk config after a previously failed directory fsync.
+            if !options.dry_run {
+                file.sync_all()?;
+                File::open(path.parent().context("config parent")?)?.sync_all()?;
+            }
+            let mut protected = std::collections::HashSet::new();
+            for snapshot in live.iter().chain(std::iter::once(&current)) {
+                protected.extend(snapshot.artifact_hashes.iter().cloned());
+            }
+            if path.parent() == Some(store.path.as_path()) {
+                if let Some(name) = path.file_name() {
+                    protected.insert(name.to_os_string());
+                }
+            }
+            store.collect(&protected, options, current.config.generation, live.len())
         })
         .await??;
-        Ok(())
+        *self.last_gc.lock().unwrap() = Some(report.json());
+        Ok(report)
     }
     fn compatible(&self, config: &Config, old: &Snapshot) -> Result<()> {
         ensure!(!self.shutdown.is_cancelled(), "proxy shutting down");
@@ -550,7 +929,19 @@ impl RunningProxy {
     /// Detached coordinator task completes commits even if the requesting client disconnects.
     pub async fn apply(self: &Arc<Self>, text: String, expected: u64) -> Result<serde_json::Value> {
         let p = self.clone();
-        tokio::spawn(async move { p.commit(text, expected).await }).await?
+        tokio::spawn(async move {
+            let mut observation =
+                observability::Transaction::new(&p.observed, &p.metrics.transaction_latency[0], 0);
+            let result = p.commit(text, expected).await;
+            let durable = result
+                .as_ref()
+                .ok()
+                .and_then(|v| v["durable"].as_bool())
+                .unwrap_or(true);
+            observation.finish(&result, durable);
+            result
+        })
+        .await?
     }
     pub async fn set_enabled(
         self: &Arc<Self>,
@@ -560,26 +951,38 @@ impl RunningProxy {
     ) -> Result<serde_json::Value> {
         let p = self.clone();
         tokio::spawn(async move {
-            let _guard = p.coordinator.lock().await;
-            let snapshot = p.snapshot();
-            ensure!(
-                snapshot.config.generation == expected,
-                "generation_conflict"
-            );
-            let (upstream, id) = endpoint
-                .split_once('/')
-                .context("endpoint must be upstream/id")?;
-            let mut config = snapshot.config.clone();
-            let e = config
-                .upstreams
-                .get_mut(upstream)
-                .context("unknown upstream")?
-                .endpoints
-                .iter_mut()
-                .find(|e| e.id == id)
-                .context("unknown endpoint")?;
-            e.enabled = enabled;
-            p.commit_locked(config, expected).await
+            let mut observation =
+                observability::Transaction::new(&p.observed, &p.metrics.transaction_latency[1], 1);
+            let result = async {
+                let _guard = p.coordinator.lock().await;
+                let snapshot = p.snapshot();
+                ensure!(
+                    snapshot.config.generation == expected,
+                    "generation_conflict"
+                );
+                let (upstream, id) = endpoint
+                    .split_once('/')
+                    .context("endpoint must be upstream/id")?;
+                let mut config = snapshot.config.clone();
+                let e = config
+                    .upstreams
+                    .get_mut(upstream)
+                    .context("unknown upstream")?
+                    .endpoints
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .context("unknown endpoint")?;
+                e.enabled = enabled;
+                p.commit_locked(config, expected).await
+            }
+            .await;
+            let durable = result
+                .as_ref()
+                .ok()
+                .and_then(|v| v["durable"].as_bool())
+                .unwrap_or(true);
+            observation.finish(&result, durable);
+            result
         })
         .await?
     }
@@ -599,10 +1002,11 @@ impl RunningProxy {
         let registry = self.registry.clone();
         let previous = old.clone();
         let worker_count = self.worker_count;
+        let store = self.artifacts.clone();
         let new = Arc::new(
             tokio::task::spawn_blocking(move || {
                 prepare(
-                    storage::stage(config)?,
+                    storage::stage(config, &store)?,
                     &registry,
                     Some(&previous),
                     worker_count,
@@ -623,12 +1027,16 @@ impl RunningProxy {
         }
         let path = self.path.clone();
         let encoded = new.config.encode()?;
+        let store = self.artifacts.clone();
         let durable =
-            tokio::task::spawn_blocking(move || storage::atomic_write(&path, encoded.as_bytes()))
-                .await??;
+            tokio::task::spawn_blocking(move || store.persist(&path, encoded.as_bytes())).await??;
         // No fallible preparation past this point.
         self.current.store(new.clone());
-        self.generations.lock().unwrap().push(Arc::downgrade(&new));
+        {
+            let mut generations = self.generations.lock().unwrap();
+            generations.retain(|generation| generation.strong_count() > 0);
+            generations.push(Arc::downgrade(&new));
+        }
         self.bindings.lock().unwrap().retain(|id, b| {
             if !new.listeners.contains_key(id) {
                 b.cancel.cancel();
@@ -674,14 +1082,19 @@ impl RunningProxy {
                 let local = match listener.capacity.clone().try_acquire_owned() { Ok(v)=>v,Err(_)=>continue };
                 let plugin_permits = match connection_permits(&listener.plugins) { Ok(v)=>v,Err(_)=>continue };
                 p.metrics.connections.inc();
-                let lease = ConnectionLease { _global:global, _local:local, _plugins:plugin_permits, active:p.metrics.connections.clone() };
+                let audit = if listener.config.protocol == Protocol::Tcp && listener.config.access_log {
+                    p.access_log.as_ref().filter(|log| log.sample()).map(|log| access_log::Ticket::tcp(log.clone(), &peer.to_string(), &id, snapshot.config.generation))
+                } else { None };
+                let lease = ConnectionLease { _ip:None, audit, _global:global, _local:local, _plugins:plugin_permits, active:p.metrics.connections.clone() };
                 let p2 = p.clone();
                 let id = id.clone();
+                let audit = lease.audit.clone();
                 p.tasks.spawn(async move {
                     let result = tokio::select! {
                         _ = p2.force.cancelled() => Ok(()),
                         r = p2.connection(id,stream,peer,snapshot,listener,lease) => r,
                     };
+                    if let Some(audit) = &audit { audit.finish(None,if result.is_err() { "error" } else { "aborted" }); }
                     if let Err(e) = result { p2.metrics.errors.inc(); tracing::debug!(error=%e,%peer,"connection ended with error"); }
                 });
             }
@@ -692,44 +1105,109 @@ impl RunningProxy {
         self: &Arc<Self>,
         id: String,
         stream: TcpStream,
-        peer: SocketAddr,
+        mut peer: SocketAddr,
         snapshot: Arc<Snapshot>,
         listener: Arc<PreparedListener>,
-        lease: ConnectionLease,
+        mut lease: ConnectionLease,
     ) -> Result<()> {
+        let mut addresses = prost_transport::ProxyAddresses {
+            source: peer,
+            destination: stream.local_addr()?,
+        };
         prost_transport::configure_socket(&stream)?;
         let mut io: prost_transport::BoxStream = Box::new(stream);
+        let transport_peer = peer;
+        if let Some(config) = &listener.config.proxy_protocol {
+            addresses =
+                prost_transport::read_proxy_addresses(&mut io, peer, addresses.destination, config)
+                    .await?;
+            peer = addresses.source;
+            if let Some(audit) = &lease.audit {
+                audit.peer(&peer.to_string());
+            }
+        }
+        lease._ip = Some(
+            listener
+                .ip_capacity
+                .acquire(peer.ip(), listener.config.max_connections_per_ip)?,
+        );
+        if listener.config.protocol == Protocol::Tcp {
+            invoke_http_plugins(
+                &listener.plugins,
+                Phase::new("connection", peer.ip()),
+                None,
+                None,
+            )
+            .await?;
+        } else {
+            for index in &listener.connection_admission {
+                invoke_http_plugins(
+                    std::slice::from_ref(&listener.plugins[*index]),
+                    Phase::new("connection", peer.ip()),
+                    None,
+                    None,
+                )
+                .await?;
+            }
+        }
+        let mut selected_upstream = listener.config.upstream.clone();
+        if let Some(guard) = &listener.passthrough {
+            let inspected = guard.inspect_routed(io).await?;
+            io = inspected.stream;
+            if let Some(upstream) = inspected.upstream {
+                selected_upstream = Some(upstream);
+            }
+        }
         if let Some(tls) = &listener.tls {
             let _permit = self
                 .handshakes
                 .clone()
                 .try_acquire_owned()
+                .inspect_err(|_| {
+                    self.observed.tls[3].fetch_add(1, Ordering::Relaxed);
+                })
                 .context("handshake capacity")?;
-            io = Box::new(
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    tokio_rustls::TlsAcceptor::from(tls.clone()).accept(io),
-                )
-                .await??,
-            );
+            let mut timer =
+                observability::Handshake::new(&self.observed, &self.metrics.tls_latency);
+            let result = tokio::time::timeout(
+                Duration::from_millis(listener.config.tls_handshake_timeout_ms),
+                tokio_rustls::TlsAcceptor::from(tls.clone()).accept(io),
+            )
+            .await;
+            io = Box::new(match result {
+                Ok(Ok(stream)) => {
+                    timer.finish(0);
+                    let mut stream = stream;
+                    stream.get_mut().1.set_buffer_limit(Some(
+                        listener.config.tls.as_ref().unwrap().buffer_limit_bytes,
+                    ));
+                    stream
+                }
+                Ok(Err(error)) => {
+                    timer.finish(1);
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    timer.finish(2);
+                    return Err(error.into());
+                }
+            });
         }
         let mut event = Event {
             abi_version: 1,
             hook: "connection".into(),
             peer: peer.to_string(),
-            upstream: listener.config.upstream.clone(),
+            upstream: selected_upstream,
             headers: BTreeMap::new(),
             config: serde_json::Value::Null,
         };
-        if listener.config.protocol == Protocol::Tcp {
-            invoke_http_plugins(
-                &listener.plugins,
-                Phase::new("connection", peer.ip()),
-                Some(&mut event),
-                None,
-            )
-            .await?;
-        } else if listener.has_hooks {
+        if let Some(ms) = listener.config.client_write_timeout_ms.filter(|ms| *ms > 0) {
+            io = Box::new(prost_transport::TimedWrite::new(
+                io,
+                Duration::from_millis(ms),
+            ));
+        }
+        if listener.config.protocol == Protocol::Tcp || listener.has_hooks {
             invoke(&listener.plugins, &mut event, None).await?;
         }
         if listener.config.protocol == Protocol::Tcp {
@@ -739,29 +1217,70 @@ impl RunningProxy {
                 .upstreams
                 .get(event.upstream.as_ref().context("no upstream selected")?)
                 .context("plugin selected unknown upstream")?;
-            let selection = u.balancer.select_tcp(u, peer.ip())?;
+            let selection = u
+                .balancer
+                .select_tcp(u, peer.ip())
+                .map_err(|e| u.selection_error(e))?;
             let index = selection.index;
-            let backend = match prost_transport::connect(
+            ensure!(
+                !listener.config.tls_passthrough || u.config.tls.is_none(),
+                "passthrough plugin selected a TLS-wrapped upstream"
+            );
+            let _proxy_permit = if u.config.send_proxy_v2 {
+                Some(
+                    self.proxy_connections
+                        .clone()
+                        .try_acquire_owned()
+                        .context("PROXY transport capacity")?,
+                )
+            } else {
+                None
+            };
+            if let Some(audit) = &lease.audit {
+                audit.upstream(
+                    event.upstream.as_deref(),
+                    Some(&u.config.endpoints[index].address),
+                );
+            }
+            u.observed[index].selected();
+            let backend = match prost_transport::connect_tcp_resolved(
                 &u.config.endpoints[index].address,
                 &u.config,
                 u.tls.clone(),
+                Some(addresses),
+                &u.observed[index].tcp_retries,
+                u.dns.as_deref(),
             )
             .await
             {
                 Ok(v) => v,
                 Err(e) => {
+                    if let Some(audit) = &lease.audit {
+                        audit.finish(None, "error");
+                    }
+                    u.observed[index].error();
                     u.health[index].passive_failure();
                     return Err(e);
                 }
             };
-            let result = prost_transport::relay(
+            let result = prost_transport::relay_with_timeouts(
                 io,
                 backend,
                 Duration::from_millis(u.config.idle_timeout_ms),
+                u.config
+                    .half_close_timeout_ms
+                    .filter(|ms| *ms > 0)
+                    .map(Duration::from_millis),
             )
             .await;
             if let Ok(bytes) = &result {
                 self.metrics.bytes.inc_by(*bytes);
+            }
+            if let Some(audit) = &lease.audit {
+                audit.finish(
+                    result.as_ref().ok().copied(),
+                    if result.is_ok() { "complete" } else { "error" },
+                );
             }
             drop(selection);
             event.hook = "end".into();
@@ -769,6 +1288,11 @@ impl RunningProxy {
             return result.map(|_| ());
         }
         let info = Arc::new(ConnectionInfo {
+            addresses,
+            proxy_clients: proxy_clients::Clients::new(self.proxy_connections.clone()),
+            transport_peer,
+            headers_seen: std::sync::atomic::AtomicBool::new(false),
+            first_headers: tokio::sync::Notify::new(),
             peer,
             peer_text: event.peer,
             forwarded_for: HeaderValue::from_str(&peer.ip().to_string())?,
@@ -781,21 +1305,80 @@ impl RunningProxy {
         });
         let id: Arc<str> = id.into();
         let h2 = listener.config.http2_settings.clone();
+        let header_timeout = listener.config.header_read_timeout_ms;
+        let keepalive_timeout = listener.config.keepalive_idle_timeout_ms.unwrap_or(0);
         drop(snapshot);
         drop(listener);
+        if self.access_log.is_some() {
+            Box::pin(self.serve_http::<LoggedHttp>(
+                io,
+                info,
+                id,
+                h2,
+                header_timeout,
+                keepalive_timeout,
+            ))
+            .await
+        } else {
+            self.serve_http::<PlainHttp>(io, info, id, h2, header_timeout, keepalive_timeout)
+                .await
+        }
+    }
+    async fn serve_http<M: HttpMode>(
+        self: &Arc<Self>,
+        io: prost_transport::BoxStream,
+        info: Arc<ConnectionInfo>,
+        id: Arc<str>,
+        h2: prost_config::Http2Settings,
+        header_timeout: u64,
+        keepalive_timeout: u64,
+    ) -> Result<()> {
+        let io: prost_transport::BoxStream = if h2.header_read_timeout_ms > 0 {
+            Box::new(prost_transport::H2HeaderDeadline::new(
+                io,
+                Duration::from_millis(h2.header_read_timeout_ms),
+            ))
+        } else {
+            io
+        };
+        let stream_write_timeout = h2.stream_write_timeout_ms;
+        let (io, clock) = if keepalive_timeout > 0 {
+            let (io, clock) =
+                prost_http::keepalive::HeaderClock::wrap(io, header_timeout, keepalive_timeout);
+            (io, Some(clock))
+        } else {
+            (io, None)
+        };
         let p = self.clone();
+        let first_info = info.clone();
         let service = service_fn(move |request| {
+            if !info.headers_seen.load(Ordering::Relaxed) {
+                info.headers_seen.store(true, Ordering::Relaxed);
+                info.first_headers.notify_one();
+            }
             let p = p.clone();
             let id = id.clone();
             let info = info.clone();
-            async move { Ok::<_, Infallible>(p.handle_http(id, info, request).await) }
+            M::response(p, id, info, request, stream_write_timeout > 0)
         });
-        let mut builder = auto::Builder::new(TokioExecutor::new());
+        let mut builder = auto::Builder::new(prost_http::h2_deadline::H2Executor::new(
+            stream_write_timeout,
+            self.observed.h2_write_timeouts.clone(),
+        ));
         builder
             .http1()
             .timer(TokioTimer::new())
-            .header_read_timeout(Duration::from_secs(10))
+            .header_read_timeout((header_timeout > 0 || keepalive_timeout > 0).then(|| {
+                Duration::from_millis(if header_timeout > 0 {
+                    header_timeout
+                } else {
+                    keepalive_timeout
+                })
+            }))
             .max_buf_size(32768);
+        if let Some(clock) = &clock {
+            builder.http1().timer(clock.clone());
+        }
         builder
             .http2()
             .timer(TokioTimer::new())
@@ -807,21 +1390,106 @@ impl RunningProxy {
             .max_send_buf_size(32768);
         let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
         tokio::pin!(connection);
+        if header_timeout > 0 {
+            // Covers auto protocol detection and the first H2 request as well.
+            tokio::select! {
+                result = &mut connection => { result.map_err(|e| anyhow::anyhow!(e))?; return Ok(()); },
+                _ = first_info.first_headers.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(header_timeout)) => anyhow::bail!("initial request headers timeout"),
+                _ = self.shutdown.cancelled() => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await.map_err(|e| anyhow::anyhow!(e))?;
+                    return Ok(());
+                },
+            }
+        }
+        drop(first_info);
         tokio::select! {
             result = &mut connection => { result.map_err(|e| anyhow::anyhow!(e))?; },
+            _ = async {if let Some(clock)=&clock {clock.expired().await;}else{std::future::pending::<()>().await;}} => {connection.as_mut().graceful_shutdown();connection.await.map_err(|e|anyhow::anyhow!(e))?;},
             _ = self.shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); connection.await.map_err(|e| anyhow::anyhow!(e))?; },
         }
         Ok(())
+    }
+    async fn handle_http_logged(
+        self: Arc<Self>,
+        id: Arc<str>,
+        info: Arc<ConnectionInfo>,
+        request: Request<Incoming>,
+        h2_write_guard: bool,
+    ) -> Response<Body> {
+        use hyper::body::Body as _;
+        let snapshot = self.snapshot();
+        let route = snapshot
+            .listeners
+            .get(id.as_ref())
+            .and_then(|l| select_route_index(l, &request));
+        let enabled = snapshot.listeners.get(id.as_ref()).is_some_and(|l| {
+            route
+                .and_then(|i| l.config.routes[i].access_log)
+                .unwrap_or(l.config.access_log)
+        });
+        let log = self.access_log.as_ref().unwrap();
+        let audit = if enabled && log.path_enabled(request.uri().path()) && log.sample() {
+            let path = if log.config.include_query {
+                request.uri().path_and_query().map_or("/", |p| p.as_str())
+            } else {
+                request.uri().path()
+            };
+            Some(access_log::Ticket::http(
+                log.clone(),
+                &info.peer_text,
+                &id,
+                snapshot.config.generation,
+                request.method().as_str(),
+                format!("{:?}", request.version()),
+                path,
+            ))
+        } else {
+            None
+        };
+        let head = request.method() == http::Method::HEAD;
+        // Pass the already selected snapshot directly. Extensions would allocate
+        // a map and a type-erased context box even for sampled-out requests.
+        let context = access_log::RequestContext {
+            snapshot,
+            route,
+            audit: audit.clone(),
+        };
+        let mut response = self.handle_http(id, info, request, Some(context)).await;
+        if h2_write_guard {
+            prost_http::h2_deadline::observe_response(&mut response);
+        }
+        let Some(audit) = audit else {
+            return response;
+        };
+        audit.headers(response.status().as_u16());
+        if audit.is_tunnel() {
+            return response;
+        }
+        if head
+            || response.status().is_informational()
+            || matches!(response.status().as_u16(), 204 | 304)
+            || response.body().is_end_stream()
+        {
+            audit.finish(Some(0), "complete");
+            return response;
+        }
+        response.map(|body| body.observe(audit))
     }
     async fn handle_http(
         self: Arc<Self>,
         id: Arc<str>,
         info: Arc<ConnectionInfo>,
         mut request: Request<Incoming>,
+        context: Option<access_log::RequestContext>,
     ) -> Response<Body> {
         self.metrics.requests.inc();
         let _timer = local_metrics::Timer::new(&self.metrics.latency);
-        let snapshot = self.snapshot();
+        let (snapshot, route_override, audit) = match context {
+            Some(context) => (context.snapshot, Some(context.route), context.audit),
+            None => (self.snapshot(), None, None),
+        };
         let peer = info.peer.ip();
         let downstream_version = request.version();
         let head_request = request.method() == http::Method::HEAD;
@@ -830,13 +1498,7 @@ impl RunningProxy {
         let result = async {
             let permit = self.requests.clone().try_acquire_owned().context("request capacity")?;
             let l = snapshot.listeners.get(id.as_ref()).context("listener removed")?;
-            let route_index = if l.route_order.is_empty() { None } else {
-                let host = request_host(&request);
-                l.route_order.iter().copied().find(|i| {
-                    let r = &l.config.routes[*i];
-                    r.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(host)) && request.uri().path().starts_with(&r.path_prefix)
-                })
-            };
+            let route_index = route_override.unwrap_or_else(|| select_route_index(l,&request));
             let selected = route_index.map(|i| &l.route_upstreams[i]).or(l.default_upstream.as_ref());
             selected_route = route_index;
             let route_plugins = route_index.map(|i|l.routes[i].as_slice());
@@ -851,7 +1513,7 @@ impl RunningProxy {
                 if needs & prost_plugin::NEEDS_REQUEST_HEADERS != 0 {for p in l.plugins.iter().chain(route_plugins.unwrap_or_default()){p.copy_header_inputs(false,request.headers(),&mut request_headers);}}
                 header_context=Some(HeaderContext{remote_addr:info.forwarded_for.clone(),scheme:if l.tls.is_some(){"https"}else{"http"},method:request.method().clone(),uri:request.uri().clone(),current_uri:None,host:HeaderValue::from_str(&request_host(&request).to_ascii_lowercase())?,request_id,request_headers,upstream_addr:None,upstream_headers:http::HeaderMap::new()});
             }
-            if !l.config.trusted_proxies.iter().any(|cidr| cidr.contains(&info.peer.ip())) {
+            if !l.config.trusted_proxies.iter().any(|cidr| cidr.contains(&info.transport_peer.ip())) {
                 let names: Vec<_> = request.headers().keys().filter(|n| n.as_str() == "forwarded" || n.as_str().starts_with("x-forwarded-")).cloned().collect();
                 for name in names { request.headers_mut().remove(name); }
             }
@@ -890,20 +1552,59 @@ impl RunningProxy {
             let u = if let Some(event) = &event {
                 snapshot.upstreams.get(event.upstream.as_ref().context("no upstream")?).context("plugin selected unknown upstream")?
             } else { selected.context("no matching upstream")? };
+            let upstream_name = event.as_ref().and_then(|e|e.upstream.as_deref()).or_else(||route_index.map(|i|l.config.routes[i].upstream.as_str())).or(l.config.upstream.as_deref());
+            if let Some(audit) = &audit { audit.upstream(upstream_name, None); }
             // Local protocol rejections must not be counted as backend failures.
             anyhow::ensure!(request.method() != http::Method::CONNECT, "CONNECT unsupported");
-            let selection = u.balancer.select_http(u,peer,&request,header_context.as_ref().map(|c|&c.uri))?;
-            let index=selection.index;
-            if let Some(ctx)=&mut header_context {ctx.upstream_addr=Some(HeaderValue::from_str(&u.config.endpoints[index].address)?);}
-            let mut outcome = match prost_http::forward(request,&u.targets[index],&u.config,u.client.current(),permit,http_keepalive(snapshot.clone(),info,selection.lease),end_hook).await {
-                Ok(v)=>v, Err(e)=>{u.health[index].passive_failure(); return Err(e);}
+            let route = route_index.map(|i| &l.config.routes[i]);
+            let request_policy = prost_http::RequestPolicy {
+                max_bytes: route.and_then(|r| r.max_request_body_bytes).or(l.config.max_request_body_bytes),
+                idle_timeout_ms: route.and_then(|r| r.request_body_timeout_ms).or(l.config.request_body_timeout_ms),
             };
-            if u.failed_status(outcome.response.status().as_u16()) {u.health[index].passive_failure();}
+            request_policy.check(request.body())?;
+            let options = prost_http::ForwardOptions { request_policy, notify_completion: end_hook };
+            let compression = u.http.as_ref().filter(|p|p.compression_enabled()).map(|_| (request.method().clone(),request.headers().get_all(header::ACCEPT_ENCODING).iter().filter_map(|v|v.to_str().ok()).collect::<Vec<_>>().join(",")));
+            let selection = u.balancer.select_http(u,peer,&request,header_context.as_ref().map(|c|&c.uri));
+            let mut outcome = match selection {
+            Err(e) => {
+                let cached = if matches!(e.downcast_ref::<balance::Rejection>(),Some(balance::Rejection::Unavailable)) {u.http.as_ref().and_then(|p|p.unavailable(&request))} else {None};
+                cached.ok_or_else(||u.selection_error(e))?.respond(permit,http_keepalive(snapshot.clone(),info,None),options)
+            },
+            Ok(selection) => {
+            let index=selection.index;
+            if let Some(audit) = &audit { audit.upstream(upstream_name,Some(&u.config.endpoints[index].address)); }
+            u.observed[index].selected();
+            if let Some(ctx)=&mut header_context {ctx.upstream_addr=Some(HeaderValue::from_str(&u.config.endpoints[index].address)?);}
+            let forward = async {
+                if let Some(dns)=&u.dns {let _=dns.endpoint(&u.config.endpoints[index].address).await;}
+                let dynamic=if u.dns.is_some() {Some(u.client.current_dns()?)} else {None};
+                let scoped_client = if u.config.send_proxy_v2 { Some(info.proxy_clients.get(u,upstream_name.context("upstream name")?,info.addresses)?) } else { None };
+                let client=scoped_client.as_ref().or(dynamic.as_ref()).unwrap_or_else(||u.client.current());
+                if let Some(policy)=&u.http {
+                    Box::pin(policy.forward(request,&u.targets[index],&u.config,client,permit,http_keepalive(snapshot.clone(),info,selection.lease),options)).await
+                } else { prost_http::forward(request,&u.targets[index],&u.config,client,permit,http_keepalive(snapshot.clone(),info,selection.lease),options).await }
+            };
+            let outcome = match forward.await {
+                Ok(v)=>v, Err(e)=>{if !e.downcast_ref::<prost_http::HttpFailure>().is_some_and(|e| e.is_client()) && !e.chain().any(|cause|cause.is::<prost_http::ProxyCapacity>()) {u.observed[index].error();u.health[index].passive_failure();} return Err(e);}
+            };
+            if let Some(status)=outcome.origin_status() {
+                u.observed[index].response(status);
+                if u.failed_status(status) {u.health[index].passive_failure();}
+            } else if outcome.origin_transport_failed() {
+                u.observed[index].error();u.health[index].passive_failure();
+            }
+            outcome
+            }};
             if let Some(tunnel) = outcome.tunnel.take() {
+                let audit = audit.clone();
+                if let Some(audit) = &audit { audit.arm_tunnel(); }
                 let force = self.force.clone();
                 self.tasks.spawn(async move {
                     let mut tunnel = tunnel;
-                    tokio::select! { _ = force.cancelled() => { tunnel.abort(); let _ = tunnel.await; }, _ = &mut tunnel => {} }
+                    tokio::select! {
+                        _ = force.cancelled() => { tunnel.abort(); let _ = tunnel.await; if let Some(audit) = &audit { audit.finish(None,"aborted"); } },
+                        result = &mut tunnel => { if let Some(audit) = &audit { match result { Ok(report) => audit.finish(report.bytes,if report.error { "error" } else { "complete" }),Err(_) => audit.finish(None,"aborted") } } }
+                    }
                 });
             }
             if needs & prost_plugin::NEEDS_UPSTREAM_HEADERS != 0 {if let Some(ctx)=&mut header_context {for p in l.plugins.iter().chain(route_plugins.unwrap_or_default()){p.copy_header_inputs(true,outcome.response.headers(),&mut ctx.upstream_headers);}}}
@@ -916,6 +1617,7 @@ impl RunningProxy {
                 prost_http::sanitize(outcome.response.headers_mut(),upgraded,false);
             }
             attach_trailers(&mut outcome.response,&l.plugins,route_plugins,overrides.1,header_context.as_ref(),head_request,downstream_version)?;
+            if let Some((method,accepted))=&compression { u.http.as_ref().unwrap().compress(method,accepted,&mut outcome.response); }
             if let Some(mut event) = event.take() {
                 if let Some(completion)=outcome.completion.take() {
                 let listener=l.clone();
@@ -939,6 +1641,23 @@ impl RunningProxy {
         match result {
             Ok(response) => response,
             Err(e) => {
+                if let Some(failure) = e.downcast_ref::<prost_http::HttpFailure>() {
+                    if !failure.is_client() {
+                        self.metrics.errors.inc();
+                    }
+                    let mut response = prost_http::response(failure.status(), failure.message());
+                    apply_local_headers(
+                        &mut response,
+                        &snapshot,
+                        &id,
+                        selected_route,
+                        peer,
+                        header_context.as_ref(),
+                        (head_request, downstream_version),
+                    )
+                    .await;
+                    return response;
+                }
                 if let Some(redirect) = e.downcast_ref::<NativeRedirect>() {
                     let mut response = prost_http::response(redirect.0.status, "");
                     response
@@ -1052,9 +1771,13 @@ impl RunningProxy {
                             use prometheus::Encoder;
                             let response = if request.uri().path() == "/metrics" {
                                 let mut buffer=Vec::new();
-                                let _=prometheus::TextEncoder::new().encode(&p.metrics.registry.gather(),&mut buffer);
-                                let text=String::from_utf8_lossy(&buffer).to_string();
-                                Response::new(http_body_util::Full::new(hyper::body::Bytes::from(text)))
+                                let encoder=prometheus::TextEncoder::new();
+                                if encoder.encode(&p.metrics.registry.gather(),&mut buffer).is_ok() {
+                                    Response::builder().header(http::header::CONTENT_TYPE,encoder.format_type())
+                                        .body(http_body_util::Full::new(hyper::body::Bytes::from(buffer))).unwrap()
+                                } else {
+                                    Response::builder().status(500).body(http_body_util::Full::new(hyper::body::Bytes::new())).unwrap()
+                                }
                             } else { Response::builder().status(404).body(http_body_util::Full::new(hyper::body::Bytes::new())).unwrap() };
                             Ok::<_,Infallible>(response)
                         }
@@ -1080,6 +1803,11 @@ impl RunningProxy {
         if let Some(workers) = &self.workers {
             let workers = workers.clone();
             let _ = tokio::task::spawn_blocking(move || workers.join()).await;
+        }
+        if let Some(log) = &self.access_log {
+            if let Err(error) = log.shutdown().await {
+                tracing::warn!(%error, "access log shutdown incomplete");
+            }
         }
     }
 }
@@ -1116,6 +1844,28 @@ fn request_host(request: &Request<Incoming>) -> &str {
     } else {
         host.split(':').next().unwrap_or(host)
     }
+}
+fn select_route_index(listener: &PreparedListener, request: &Request<Incoming>) -> Option<usize> {
+    if listener.route_order.is_empty() {
+        return None;
+    }
+    let host = request_host(request);
+    if listener.route_order.len() > 32 {
+        return listener
+            .route_index
+            .select(&listener.config, host, request.uri().path(), |i| {
+                listener.route_matches[i].matches(request.method(), request.headers())
+            });
+    }
+    listener.route_order.iter().copied().find(|i| {
+        let route = &listener.config.routes[*i];
+        route
+            .host
+            .as_ref()
+            .is_none_or(|h| h.eq_ignore_ascii_case(host))
+            && request.uri().path().starts_with(&route.path_prefix)
+            && listener.route_matches[*i].matches(request.method(), request.headers())
+    })
 }
 #[derive(Debug)]
 struct FilterRejection {

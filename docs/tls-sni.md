@@ -2,7 +2,7 @@
 
 Prost chọn certificate bằng SNI trong ClientHello cho cả listener HTTP và TCP.
 TLS upstream vẫn cấu hình độc lập. Routing HTTP tiếp tục theo Host/authority và
-path; SNI chỉ chọn certificate, không tự tạo route hoặc ràng buộc Host với SNI.
+path/method/header; SNI chỉ chọn certificate, không tự tạo HTTP route hoặc ràng buộc Host với SNI.
 
 ```toml
 [listeners.tls]
@@ -69,7 +69,8 @@ Request/HTTP2 stream mới trên kết nối đang mở vẫn lấy route/plugin
 
 Sau restart daemon dùng artifact đã commit, không phụ thuộc file nguồn còn tồn
 tại. Private key nằm trong artifact hạn chế quyền; export chỉ chứa đường dẫn.
-Đây là TLS termination, chưa có TLS passthrough, mTLS hoặc tự cấp certificate ACME.
+Đây là TLS termination theo SNI. mTLS hai phía và TCP TLS passthrough cố định
+upstream được mô tả trong [mvp-bundle.md](mvp-bundle.md); chưa có ACME.
 
 ## Kiểm tra Docker trong WSL
 

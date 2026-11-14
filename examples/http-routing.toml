@@ -1,0 +1,46 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+io_workers = 2
+drain_seconds = 30
+
+[upstreams.default]
+[[upstreams.default.endpoints]]
+id = "one"
+address = "127.0.0.1:8088"
+
+[upstreams.api]
+[[upstreams.api.endpoints]]
+id = "one"
+address = "127.0.0.1:8089"
+
+[[listeners]]
+id = "web"
+address = "0.0.0.0:8080"
+protocol = "http"
+upstream = "default"
+
+[[listeners.routes]]
+host = "api.example.test"
+path_prefix = "/api/"
+priority = 20
+methods = ["GET", "HEAD"]
+headers = [{ name = "x-release", equals = "canary", ignore_case = true }]
+upstream = "api"
+
+[[listeners.routes]]
+path_prefix = "/events/"
+priority = 10
+methods = ["POST"]
+upstream = "api"
+[[listeners.routes.headers]]
+name = "content-type"
+prefix = "application/json"
+[[listeners.routes.headers]]
+name = "x-tenant"
+matches = "^tenant-[0-9]+$"
+[[listeners.routes.headers]]
+name = "x-disabled"
+present = false

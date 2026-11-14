@@ -35,11 +35,20 @@ pub(crate) struct Guard {
     pub completion: Completion,
 }
 /// Keep both the config generation and accepted-connection admission alive.
+#[derive(Clone)]
 pub struct KeepAlive {
     _generation: Arc<dyn Send + Sync>,
     _connection: Arc<dyn Send + Sync>,
 }
 impl KeepAlive {
+    pub(crate) fn with_activity(mut self, activity: Arc<crate::pool_stats::Activity>) -> Self {
+        self._generation = Arc::new((self._generation, activity));
+        self
+    }
+    pub(crate) fn with_admission(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self._generation = Arc::new((self._generation, permit));
+        self
+    }
     pub fn new<T: Send + Sync + 'static, U: Send + Sync + 'static>(
         generation: Arc<T>,
         connection: Arc<U>,
@@ -65,9 +74,12 @@ pin_project! {
 pin_project! {
     #[project = KindProj]
     enum Kind {
+        Custom { inner: Pin<Box<dyn HttpBody<Data=Bytes, Error=Error> + Send>>, guard: Option<Guard> },
         Static { #[pin] inner: Full<Bytes> },
         Incoming { #[pin] inner: Incoming },
         Buffered { #[pin] inner: Full<Bytes>, guard: Guard },
+        Observed { inner: crate::observe::Observed },
+        Upload { inner: Option<Pin<Box<Body>>>, watch: crate::upload::UploadWatch, guard: Option<Guard> },
         Trailers { inner: Pin<Box<Body>>, trailers: Option<http::HeaderMap>, finished: bool, guard: Option<Guard> },
         Stream {
             #[pin] inner: Incoming,
@@ -80,9 +92,40 @@ pin_project! {
     }
 }
 impl Body {
+    pub(crate) fn custom<B: HttpBody<Data = Bytes, Error = Error> + Send + 'static>(
+        mut base: Body,
+        wrap: impl FnOnce(Body) -> B,
+    ) -> Self {
+        let guard = base.take_guard();
+        Self {
+            inner: Kind::Custom {
+                inner: Box::pin(wrap(base)),
+                guard,
+            },
+        }
+    }
+    /// Optional wrapper; disabled logging does not allocate an observer/body box.
+    pub fn observe(self, observer: Arc<dyn crate::BodyObserver>) -> Self {
+        Self {
+            inner: Kind::Observed {
+                inner: crate::observe::Observed::new(self, observer),
+            },
+        }
+    }
     /// Optional wrapper allocated only when a native trailer rule is active.
     pub fn with_trailers(mut self, trailers: http::HeaderMap) -> Self {
-        let guard = match &mut self.inner {
+        let guard = self.take_guard();
+        Self {
+            inner: Kind::Trailers {
+                inner: Box::pin(self),
+                trailers: Some(trailers),
+                finished: false,
+                guard,
+            },
+        }
+    }
+    fn take_guard(&mut self) -> Option<Guard> {
+        match &mut self.inner {
             Kind::Buffered { guard, .. } | Kind::Stream { guard, .. } => Some(std::mem::replace(
                 guard,
                 Guard {
@@ -91,13 +134,18 @@ impl Body {
                     completion: Completion(None),
                 },
             )),
+            Kind::Upload { guard, .. }
+            | Kind::Trailers { guard, .. }
+            | Kind::Custom { guard, .. } => guard.take(),
             _ => None,
-        };
+        }
+    }
+    pub(crate) fn with_upload(mut self, watch: crate::upload::UploadWatch) -> Self {
+        let guard = self.take_guard();
         Self {
-            inner: Kind::Trailers {
-                inner: Box::pin(self),
-                trailers: Some(trailers),
-                finished: false,
+            inner: Kind::Upload {
+                inner: Some(Box::pin(self)),
+                watch,
                 guard,
             },
         }
@@ -148,6 +196,42 @@ impl HttpBody for Body {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         match self.project().inner.project() {
+            KindProj::Custom { inner, guard } => {
+                let result = inner.as_mut().poll_frame(cx);
+                if matches!(&result, Poll::Ready(None) | Poll::Ready(Some(Err(_))))
+                    || inner.is_end_stream()
+                {
+                    if let Some(mut guard) = guard.take() {
+                        guard.finish();
+                    }
+                }
+                result
+            }
+            KindProj::Observed { inner } => Pin::new(inner).poll_frame(cx),
+            KindProj::Upload {
+                inner,
+                watch,
+                guard,
+            } => {
+                let Some(body) = inner else {
+                    return Poll::Ready(None);
+                };
+                if let Some(error) = watch.poll_failure(cx) {
+                    inner.take();
+                    if let Some(guard) = guard {
+                        guard.finish();
+                    }
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+                let frame = body.as_mut().poll_frame(cx);
+                if matches!(&frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+                    inner.take();
+                    if let Some(guard) = guard {
+                        guard.finish();
+                    }
+                }
+                frame
+            }
             KindProj::Trailers {
                 inner,
                 trailers,
@@ -226,6 +310,9 @@ impl HttpBody for Body {
                         Poll::Ready(frame.map(|r| r.map_err(|e| Box::new(e) as Error)))
                     }
                     Poll::Pending => {
+                        if timeout.is_zero() {
+                            return Poll::Pending;
+                        }
                         if idle.is_none() {
                             idle.as_mut().set(Some(tokio::time::sleep(*timeout)));
                         }
@@ -247,6 +334,13 @@ impl HttpBody for Body {
     }
     fn is_end_stream(&self) -> bool {
         match &self.inner {
+            Kind::Custom { inner, .. } => inner.is_end_stream(),
+            Kind::Observed { inner } => inner.is_end_stream(),
+            Kind::Upload { inner, watch, .. } => {
+                inner.is_none()
+                    || (watch.0.failure().is_none()
+                        && inner.as_ref().is_none_or(|b| b.is_end_stream()))
+            }
             Kind::Trailers { finished, .. } => *finished,
             Kind::Static { inner } | Kind::Buffered { inner, .. } => inner.is_end_stream(),
             Kind::Incoming { inner } => inner.is_end_stream(),
@@ -255,6 +349,11 @@ impl HttpBody for Body {
     }
     fn size_hint(&self) -> SizeHint {
         match &self.inner {
+            Kind::Custom { inner, .. } => inner.size_hint(),
+            Kind::Observed { inner } => inner.size_hint(),
+            Kind::Upload { inner, .. } => inner
+                .as_ref()
+                .map_or_else(SizeHint::default, |b| b.size_hint()),
             Kind::Trailers { .. } => SizeHint::default(),
             Kind::Static { inner } | Kind::Buffered { inner, .. } => inner.size_hint(),
             Kind::Incoming { inner } => inner.size_hint(),

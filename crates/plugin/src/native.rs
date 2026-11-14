@@ -35,6 +35,9 @@ pub struct Redirect {
     pub location: http::HeaderValue,
 }
 pub trait NativeFilter: Send + Sync {
+    fn rate_table(&self) -> Option<&dyn crate::rate_table::RateTable> {
+        None
+    }
     fn uses_request_uri(&self) -> bool {
         false
     }
@@ -131,5 +134,9 @@ impl NativeFilter for IpAccess {
     }
 }
 
+mod host;
 mod rate;
+mod window;
+pub(crate) use host::HostAccess;
 pub(crate) use rate::RateLimit;
+pub(crate) use window::ConnectionWindow;

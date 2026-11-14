@@ -140,10 +140,11 @@ def preflight(target, case):
                 raise RuntimeError(f"{target}: dynamic headers/expiry failed: {dump!r}")
 
 
-def command(target, case, count, logfile=None):
+def command(target, case, count, logfile=None, duration=0):
     path, protocol, _, clients, streams, _ = CASES[case]
     args = ["h2load", "-n", str(count), "-c", str(min(clients, count)), "-m", str(streams), "-t", "2",
             "--connection-active-timeout=120", "--connection-inactivity-timeout=30", "-w", "20", "-W", "23"]
+    if duration: args[1:3] = ["-D", str(duration)]
     if protocol in ("h1", "tls-h1"):
         args += ["--h1"]
     if case == "h2_upload_1m":
@@ -157,29 +158,50 @@ def command(target, case, count, logfile=None):
     return args + [url_for(target, case)]
 
 
-def parse(raw, count, size, log):
+def parse(raw, count, size, log, timed=False):
     requests = re.search(r"requests: (\d+) total, (\d+) started, (\d+) done, (\d+) succeeded, (\d+) failed, (\d+) errored, (\d+) timeout", raw)
     throughput = re.search(r"([\d.]+) req/s", raw)
     data = re.search(r"\((\d+)\) data", raw)
     if not requests or not throughput or not data:
         raise RuntimeError("unrecognized h2load output; raw output preserved")
     total, started, done, succeeded, failed, errored, timeout = map(int, requests.groups())
+    if timed: count = done
     failures = max(count - succeeded, failed, errored, timeout)
+    failures = max(failures, abs(total-done) if timed else max(abs(count-total),abs(count-started),abs(count-done)))
+    if timed and started < done: failures = max(failures, 1)
     actual_bytes = int(data[1])
-    if actual_bytes != count * size:
+    if not (count * size <= actual_bytes <= started * size if timed else actual_bytes == count * size):
         failures = max(failures, 1)
     records = [line.split() for line in log.read_text().splitlines() if len(line.split()) == 3]
     failures = max(failures, abs(count-len(records)), sum(row[1] != "200" for row in records))
     latencies = sorted(int(row[2]) / 1000 for row in records)
     p99 = latencies[min(len(latencies)-1, math.ceil(len(latencies)*0.99)-1)] if latencies else None
     return {"requests": count, "started": started, "done": done, "succeeded": succeeded, "failures": failures,
+            "unfinished_at_deadline": max(0, started-done) if timed else 0,
             "response_bytes": actual_bytes, "expected_response_bytes": count*size,
             "rps": float(throughput[1]), "p99_ms": p99,
             "response_mib_per_second": float(throughput[1])*size/1048576,
             "latency_samples": len(latencies)}
 
 
-def measure(target, case, output, scale):
+def thread_cpu(pid):
+    result = {}
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            fields = (task/"stat").read_text().rsplit(")", 1)[1].split()
+            name = (task/"comm").read_text().strip()
+            # CPU affinity does not reserve a core. Record runnable-but-not-running
+            # time so host contention is visible alongside request tail latency.
+            scheduled = [int(value) for value in (task/"schedstat").read_text().split()]
+            # A thread can exit between these procfs reads. Publish only a
+            # complete observation, never a partially populated dictionary.
+            result[task.name] = {"name": name, "ticks": int(fields[11])+int(fields[12]),
+                                 **dict(zip(("run_ns", "wait_ns", "timeslices"), scheduled))}
+        except (FileNotFoundError, ProcessLookupError): pass
+    return result
+
+
+def measure(target, case, output, scale, duration=0):
     _, _, count, _, _, size = CASES[case]
     count = max(128, int(count * scale))
     preflight(target, case)
@@ -190,6 +212,8 @@ def measure(target, case, output, scale):
     if target != "backend":
         containers.append(Container(container_name("backend")))
     baseline = {c.name: c.sample() for c in containers}
+    threads_before = thread_cpu(containers[0].pid)
+    pressure_before = Path("/proc/pressure/cpu").read_text()
     samples = []
     # h2load writes one record per request. Keep that hot file on Linux tmpfs/ext4;
     # writing each record through /mnt/* (Windows/WSL bridge) distorts throughput.
@@ -199,8 +223,8 @@ def measure(target, case, output, scale):
     rawfile = output.with_suffix(".stdout.txt")
     started = time.monotonic()
     with rawfile.open("w") as stream:
-        process = subprocess.Popen(command(target, case, count, logfile), stdout=stream, stderr=subprocess.STDOUT)
-        deadline = started + 180
+        process = subprocess.Popen(command(target, case, count, logfile, duration), stdout=stream, stderr=subprocess.STDOUT)
+        deadline = started + max(180, duration+30)
         while process.poll() is None:
             samples.append({"elapsed": time.monotonic()-started, "containers": {c.name: c.sample() for c in containers}})
             if time.monotonic() > deadline:
@@ -210,8 +234,12 @@ def measure(target, case, output, scale):
             time.sleep(0.05)
     elapsed = time.monotonic()-started
     final = {c.name: c.sample() for c in containers}
+    threads_after = thread_cpu(containers[0].pid)
+    pressure_after = Path("/proc/pressure/cpu").read_text()
     raw = rawfile.read_text()
-    result = parse(raw, count, size, logfile)
+    result = parse(raw, count, size, logfile, timed=bool(duration))
+    count = result["requests"]
+    if count == 0: raise RuntimeError("no completed requests")
     output.with_suffix(".requests.tsv").write_bytes(logfile.read_bytes())
     logfile.unlink()
     if process.returncode:
@@ -222,13 +250,18 @@ def measure(target, case, output, scale):
         points = [baseline[name], final[name]] + [s["containers"][name] for s in samples]
         cpu_us = final[name]["cpu_usec"]-baseline[name]["cpu_usec"]
         resources[name] = {"cpu_us_per_request": cpu_us/count, "cpu_percent": cpu_us/elapsed/10000,
+                           "cpu_periods": final[name]["cpu_periods"]-baseline[name]["cpu_periods"],
+                           "cpu_throttled_periods": final[name]["cpu_throttled_periods"]-baseline[name]["cpu_throttled_periods"],
+                           "cpu_throttled_usec": final[name]["cpu_throttled_usec"]-baseline[name]["cpu_throttled_usec"],
                            "working_set_peak_mib": max(s["working_set_bytes"] for s in points)/1048576,
                            "anon_peak_mib": max(s["anon_bytes"] for s in points)/1048576,
                            "tasks_peak": max(s["tasks"] for s in points), "baseline": baseline[name], "final": final[name]}
-    result.update({"target": target, "case": case, "command": command(target, case, count, logfile),
+    result.update({"target": target, "case": case, "command": command(target, case, count, logfile, duration),
+                   "duration_seconds":duration,"thread_cpu_ticks":{tid:{"name":value["name"], **{key:value[key]-threads_before.get(tid,{}).get(key,0) for key in ("ticks", "run_ns", "wait_ns", "timeslices")}} for tid,value in threads_after.items()},
+                   "host_cpu_pressure": {"before": pressure_before, "after": pressure_after},
                    "wall_seconds": elapsed, "resources": resources,
                    "images": {c.name: c.info["Image"] for c in containers},
-                   "limits": {c.name: {"cpu_nano": c.info["HostConfig"]["NanoCpus"], "memory": c.info["HostConfig"]["Memory"]} for c in containers},
+                   "limits": {c.name: {"cpu_nano": c.info["HostConfig"]["NanoCpus"], "cpuset": c.info["HostConfig"]["CpusetCpus"], "cpu_max": (c.group/"cpu.max").read_text().strip(), "memory": c.info["HostConfig"]["Memory"]} for c in containers},
                    "samples": samples})
     output.write_text(json.dumps(result, indent=2)+"\n")
     print(f"{case} {target}: {result['rps']:.0f} req/s p99={result['p99_ms']}ms failures={result['failures']}", flush=True)

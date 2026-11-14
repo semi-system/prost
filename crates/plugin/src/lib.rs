@@ -1,6 +1,8 @@
 use anyhow::{bail, ensure, Context, Result};
 mod headers;
+pub mod metrics;
 mod native;
+pub mod rate_table;
 pub use headers::{
     HeaderContext, REQUEST_HEADERS as NEEDS_REQUEST_HEADERS, REQUEST_ID as NEEDS_REQUEST_ID,
     UPSTREAM_HEADERS as NEEDS_UPSTREAM_HEADERS,
@@ -36,6 +38,8 @@ pub trait NativePlugin: Send + Sync {
     fn on_event(&self, event: &Event) -> Result<Action>;
 }
 pub struct PluginRegistry {
+    observed: std::sync::atomic::AtomicBool,
+    metrics: std::sync::Mutex<BTreeMap<String, Arc<metrics::PluginMetrics>>>,
     #[cfg(feature = "wasm")]
     engine: once_cell::sync::OnceCell<Engine>,
     #[cfg(feature = "wasm")]
@@ -46,6 +50,8 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            observed: std::sync::atomic::AtomicBool::new(false),
+            metrics: Default::default(),
             #[cfg(feature = "wasm")]
             engine: once_cell::sync::OnceCell::new(),
             #[cfg(feature = "wasm")]
@@ -71,6 +77,38 @@ impl PluginRegistry {
     }
     pub fn prepare(&self, p: &Plugin) -> Result<PreparedPlugin> {
         let plugin = self.prepare_inner(p)?;
+        let plugin = if self.observed.load(std::sync::atomic::Ordering::Relaxed) {
+            let stats = self
+                .metrics
+                .lock()
+                .unwrap()
+                .entry(p.name.clone())
+                .or_default()
+                .clone();
+            match plugin {
+                PreparedPlugin::Fast(inner) => {
+                    PreparedPlugin::Fast(Arc::new(metrics::MeasuredFilter {
+                        inner,
+                        metrics: stats,
+                    }))
+                }
+                PreparedPlugin::Native(inner) => {
+                    PreparedPlugin::Native(Arc::new(metrics::MeasuredNative {
+                        inner,
+                        metrics: stats,
+                    }))
+                }
+                PreparedPlugin::Limit(inner) => PreparedPlugin::MeasuredLimit(inner, stats),
+                #[cfg(feature = "wasm")]
+                PreparedPlugin::Wasm(mut w) => {
+                    Arc::get_mut(&mut w).unwrap().metrics = Some(stats);
+                    PreparedPlugin::Wasm(w)
+                }
+                other => other,
+            }
+        } else {
+            plugin
+        };
         Ok(if let Some(hooks) = &p.hooks {
             PreparedPlugin::Filtered(
                 Arc::new(plugin),
@@ -80,9 +118,36 @@ impl PluginRegistry {
             plugin
         })
     }
+    pub fn observe_plugins(&self, enabled: bool) {
+        self.observed
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn plugin_metrics(&self) -> Vec<(String, metrics::PluginSnapshot)> {
+        self.metrics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, stats)| (name.clone(), stats.snapshot()))
+            .collect()
+    }
     fn prepare_inner(&self, p: &Plugin) -> Result<PreparedPlugin> {
         let value = || serde_json::to_value(&p.config);
         match p.name.as_str() {
+            "connection_window" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(
+                    native::ConnectionWindow::new(value()?)?,
+                )))
+            }
+            "host_acl" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(native::HostAccess::new(
+                    value()?,
+                )?)))
+            }
+            "connection_rate" => {
+                return Ok(PreparedPlugin::Fast(Arc::new(
+                    native::RateLimit::connections(value()?)?,
+                )))
+            }
             "rewrite" => {
                 return Ok(PreparedPlugin::Fast(Arc::new(headers::Rewrite::new(
                     value()?,
@@ -126,6 +191,7 @@ impl PluginRegistry {
             let module = Module::from_file(engine, p.module.as_ref().context("module required")?)?;
             let config = serde_json::to_value(&p.config)?;
             let prepared = Wasm {
+                metrics: None,
                 engine: engine.clone(),
                 module,
                 config,
@@ -139,6 +205,7 @@ impl PluginRegistry {
 }
 #[derive(Clone)]
 pub enum PreparedPlugin {
+    MeasuredLimit(Arc<Semaphore>, Arc<metrics::PluginMetrics>),
     Fast(Arc<dyn NativeFilter>),
     Filtered(Arc<PreparedPlugin>, u8),
     Limit(Arc<Semaphore>),
@@ -157,6 +224,13 @@ fn hook_bit(hook: &str) -> u8 {
     }
 }
 impl PreparedPlugin {
+    pub fn rate_table(&self) -> Option<&dyn rate_table::RateTable> {
+        match self {
+            Self::Fast(filter) => filter.rate_table(),
+            Self::Filtered(plugin, _) => plugin.rate_table(),
+            _ => None,
+        }
+    }
     pub fn uses_request_uri(&self) -> bool {
         if !self.has_hook("request_headers") {
             return false;
@@ -246,7 +320,7 @@ impl PreparedPlugin {
     pub fn has_event_hooks(&self) -> bool {
         match self {
             Self::Filtered(inner, _) => self.has_hooks() && inner.has_event_hooks(),
-            Self::Fast(_) | Self::Limit(_) => false,
+            Self::Fast(_) | Self::Limit(_) | Self::MeasuredLimit(..) => false,
             _ => true,
         }
     }
@@ -294,7 +368,7 @@ impl PreparedPlugin {
         }
         match plugin {
             Self::Fast(filter) => FilterHook::from_str(hook).is_some_and(|h| filter.applies_to(h)),
-            Self::Limit(_) => false,
+            Self::Limit(_) | Self::MeasuredLimit(..) => false,
             _ => true,
         }
     }
@@ -304,6 +378,15 @@ impl PreparedPlugin {
             plugin = inner;
         }
         match plugin {
+            Self::MeasuredLimit(s, metrics) => {
+                let mut call = metrics.start("connection");
+                let result = s
+                    .clone()
+                    .try_acquire_owned()
+                    .context("plugin connection limit");
+                call.finish(&result, result.is_err());
+                result.map(Some)
+            }
             Self::Limit(s) => Ok(Some(
                 s.clone()
                     .try_acquire_owned()
@@ -322,29 +405,38 @@ impl PreparedPlugin {
         }
         match plugin {
             Self::Filtered(_, _) => unreachable!("filters unwrapped"),
-            Self::Limit(_) | Self::Fast(_) => Ok(Action::default()),
+            Self::Limit(_) | Self::MeasuredLimit(..) | Self::Fast(_) => Ok(Action::default()),
             Self::Native(p) => p.on_event(event),
             #[cfg(feature = "wasm")]
             Self::Wasm(w) => {
-                let permit = w
-                    .capacity
-                    .clone()
-                    .try_acquire_owned()
-                    .context("WASM capacity exhausted")?;
-                let w = w.clone();
-                let mut event = event.clone();
-                event.config = w.config.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    w.call(&event)
-                })
-                .await?
+                let mut observation = w.metrics.as_ref().map(|m| m.start(&event.hook));
+                let result = async {
+                    let permit = w
+                        .capacity
+                        .clone()
+                        .try_acquire_owned()
+                        .context("WASM capacity exhausted")?;
+                    let w = w.clone();
+                    let mut event = event.clone();
+                    event.config = w.config.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        w.call(&event)
+                    })
+                    .await?
+                }
+                .await;
+                if let Some(call) = &mut observation {
+                    call.finish(&result, result.as_ref().is_ok_and(|a: &Action| a.deny));
+                }
+                result
             }
         }
     }
 }
 #[cfg(feature = "wasm")]
 pub struct Wasm {
+    metrics: Option<Arc<metrics::PluginMetrics>>,
     engine: Engine,
     module: Module,
     config: serde_json::Value,

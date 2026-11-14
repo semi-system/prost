@@ -1,5 +1,5 @@
 use crate::PreparedUpstream;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use http::Request;
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
+mod mail;
 
 #[derive(Clone, Default)]
 struct Window {
@@ -31,6 +32,7 @@ pub(crate) struct State {
     successes: AtomicU32,
     active_healthy: AtomicBool,
     passive: Passive,
+    pub observed: Arc<crate::observability::Health>,
 }
 impl State {
     pub fn snapshot(&self) -> Self {
@@ -61,6 +63,7 @@ impl State {
             successes: AtomicU32::new(self.successes.load(Ordering::Relaxed)),
             active_healthy: AtomicBool::new(self.active_healthy.load(Ordering::Relaxed)),
             passive,
+            observed: self.observed.clone(),
         }
     }
     pub fn new(policy: Option<&prost_config::PassiveHealth>) -> Self {
@@ -78,10 +81,12 @@ impl State {
                     state: Mutex::new(Window::default()),
                 },
             },
+            observed: Arc::new(crate::observability::Health::default()),
         }
     }
     pub fn reconfigure(&self, policy: Option<&prost_config::PassiveHealth>) -> Self {
-        let state = Self::new(policy);
+        let mut state = Self::new(policy);
+        state.observed = self.observed.clone();
         let active = self.active_healthy.load(Ordering::Relaxed);
         state.active_healthy.store(active, Ordering::Relaxed);
         state.healthy.store(active, Ordering::Relaxed);
@@ -94,6 +99,7 @@ impl State {
         state
     }
     pub fn observe(&self, ok: bool, policy: &prost_config::HealthCheck) {
+        self.observed.probes[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
         if ok {
             self.failures.store(0, Ordering::Relaxed);
             if self.successes.fetch_add(1, Ordering::Relaxed) >= policy.rise - 1 {
@@ -113,8 +119,11 @@ impl State {
     pub fn passive_failure(&self) {
         match &self.passive {
             Passive::Legacy => {
+                self.observed.failures.fetch_add(1, Ordering::Relaxed);
                 self.successes.store(0, Ordering::Relaxed);
-                self.healthy.store(false, Ordering::Relaxed);
+                if self.healthy.swap(false, Ordering::Relaxed) {
+                    self.observed.ejections.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Passive::Disabled => {}
             Passive::Windowed {
@@ -122,6 +131,7 @@ impl State {
                 timeout,
                 state,
             } => {
+                self.observed.failures.fetch_add(1, Ordering::Relaxed);
                 let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                 let now = Instant::now();
                 // In-flight failures never extend an existing ejection. A fresh
@@ -140,6 +150,7 @@ impl State {
                 if state.failures.len() >= *max_fails {
                     state.failures.clear();
                     state.until = Some(now + *timeout);
+                    self.observed.ejections.fetch_add(1, Ordering::Relaxed);
                     self.successes.store(0, Ordering::Relaxed);
                     self.healthy.store(false, Ordering::Relaxed);
                 }
@@ -204,17 +215,59 @@ pub(crate) async fn probe(upstream: &PreparedUpstream, index: usize) -> bool {
     let policy = &upstream.config.health_check;
     tokio::time::timeout(Duration::from_millis(policy.timeout_ms), async {
         let endpoint = &upstream.config.endpoints[index];
-        let tls = if policy.path.is_some() && upstream.config.http2 {
-            let mut tls = (*upstream.tls).clone();
+        let is_http =
+            policy.path.is_some() || policy.protocol == prost_config::HealthProtocol::Http;
+        let starttls = matches!(
+            policy.protocol,
+            prost_config::HealthProtocol::SmtpStarttls
+                | prost_config::HealthProtocol::ImapStarttls
+                | prost_config::HealthProtocol::Pop3Starttls
+        );
+        let tls_config = policy.tls.as_ref().or(upstream.config.tls.as_ref());
+        let tls = if is_http && upstream.config.http2 {
+            let mut tls = (*upstream.health_tls).clone();
             tls.alpn_protocols = vec![b"h2".to_vec()];
             Arc::new(tls)
         } else {
-            upstream.tls.clone()
+            upstream.health_tls.clone()
         };
-        let stream = prost_transport::connect(&endpoint.address, &upstream.config, tls).await?;
-        let Some(path) = &policy.path else {
+        let address = if let Some(port) = policy.port {
+            format!(
+                "{}:{port}",
+                endpoint
+                    .address
+                    .rsplit_once(':')
+                    .context("health endpoint address")?
+                    .0
+            )
+        } else {
+            endpoint.address.clone()
+        };
+        let stream = prost_transport::connect_plain_resolved(
+            &address,
+            upstream.config.connect_timeout_ms,
+            policy
+                .send_proxy_v2
+                .unwrap_or(upstream.config.send_proxy_v2),
+            None,
+            upstream.dns.as_deref(),
+        )
+        .await?;
+        let stream = if starttls {
+            stream
+        } else {
+            prost_transport::upgrade_tls(stream, tls_config, tls.clone()).await?
+        };
+        if !matches!(
+            policy.protocol,
+            prost_config::HealthProtocol::Connect | prost_config::HealthProtocol::Http
+        ) {
+            return mail::probe(stream, policy, tls_config, tls).await;
+        }
+        if !is_http {
             return Ok::<_, anyhow::Error>(true);
-        };
+        }
+        let path = policy.path.as_deref().unwrap_or("/");
         let host = policy.host.as_deref().unwrap_or(&endpoint.address);
         let request = Request::builder()
             .uri(path)

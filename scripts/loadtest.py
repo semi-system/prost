@@ -37,8 +37,12 @@ class Container:
 
     def sample(self):
         memory = counters(self.group / "memory.stat")
+        cpu = counters(self.group / "cpu.stat")
         total = int((self.group / "memory.current").read_text())
-        return {"cpu_usec": counters(self.group / "cpu.stat")["usage_usec"],
+        return {"cpu_usec": cpu["usage_usec"],
+                "cpu_periods": cpu.get("nr_periods", 0),
+                "cpu_throttled_periods": cpu.get("nr_throttled", 0),
+                "cpu_throttled_usec": cpu.get("throttled_usec", 0),
                 "memory_bytes": total,
                 "working_set_bytes": max(0, total - memory.get("inactive_file", 0)),
                 "anon_bytes": memory.get("anon", 0),

@@ -22,9 +22,216 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "support/artifacts.rs"]
+mod artifacts;
+#[path = "support/bundle.rs"]
+mod bundle;
+#[path = "support/bundle_metrics.rs"]
+mod bundle_metrics;
+#[path = "support/cache_control.rs"]
+mod cache_control;
+#[path = "support/cache_freshness.rs"]
+mod cache_freshness;
+#[path = "support/edge.rs"]
+mod edge;
+#[path = "support/http_routing.rs"]
+mod http_routing;
+#[path = "support/limits.rs"]
+mod limits;
+#[path = "support/logging.rs"]
+mod logging;
+#[path = "support/passthrough_routes.rs"]
+mod passthrough_routes;
+#[path = "support/pool_metrics.rs"]
+mod pool_metrics;
+#[path = "support/rate_tables.rs"]
+mod rate_tables;
+#[path = "support/rusty.rs"]
+mod rusty;
+#[path = "support/timeouts.rs"]
+mod timeouts;
+
 struct Server {
     address: SocketAddr,
     task: JoinHandle<()>,
+}
+fn metric(p: &RunningProxy, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    p.metrics
+        .registry
+        .gather()
+        .iter()
+        .find(|f| f.get_name() == name)
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| {
+                    labels.iter().all(|(key, val)| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == *key && l.get_value() == *val)
+                    })
+                })
+                .map(|m| {
+                    if m.has_counter() {
+                        m.get_counter().get_value()
+                    } else {
+                        m.get_gauge().get_value()
+                    }
+                })
+        })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_counters_survive_apply_and_release_old_resources() -> Result<()> {
+    let backend = http_server("data").await;
+    let mut fixture = Fixture::new(Protocol::Http, backend.address);
+    fixture.config.runtime.io_workers = 2;
+    fixture.config.runtime.metrics_address = Some(free_address());
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
+    let p = fixture.start().await;
+    let io = TcpStream::connect(fixture.address()).await?;
+    let (mut client, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
+    let driver = tokio::spawn(connection);
+    let request = |path: &str| {
+        Request::builder()
+            .uri(format!("http://localhost{path}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    };
+    for i in 0..16 {
+        client
+            .send_request(request(if i % 2 == 0 { "/" } else { "/status/503" }))
+            .await?
+            .into_body()
+            .collect()
+            .await?;
+    }
+    let endpoint = [("upstream", "main"), ("endpoint", "one")];
+    assert_eq!(
+        metric(&p, "prost_upstream_selections_total", &endpoint),
+        Some(16.)
+    );
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_responses_total",
+            &[("upstream", "main"), ("endpoint", "one"), ("class", "5xx")]
+        ),
+        Some(8.)
+    );
+    assert_eq!(metric(&p, "prost_upstream_active", &endpoint), None);
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_active_tracking",
+            &[("upstream", "main")]
+        ),
+        Some(0.)
+    );
+    let old = Arc::downgrade(&p.snapshot());
+    let mut held = client.send_request(request("/hold")).await?;
+    assert_eq!(
+        held.body_mut().frame().await.unwrap()?.into_data().unwrap(),
+        "data"
+    );
+    let mut next = p.snapshot().config.clone();
+    next.upstreams
+        .get_mut("main")
+        .unwrap()
+        .pool_max_idle_per_host = 32;
+    assert!(p.validate("bad toml".into()).await.is_err());
+    p.validate(next.encode()?).await?;
+    assert!(p.apply("bad toml".into(), 0).await.is_err());
+    assert!(p.apply(next.encode()?, 999).await.is_err());
+    p.apply(next.encode()?, 0).await?;
+    assert_eq!(metric(&p, "prost_live_generations", &[]), Some(2.));
+    assert_eq!(
+        metric(&p, "prost_snapshot_http_client_pools", &[]),
+        Some(2.)
+    );
+    assert_eq!(
+        metric(&p, "prost_snapshot_http_worker_clients", &[]),
+        Some(4.)
+    );
+    assert_eq!(metric(&p, "prost_requests_active", &[]), Some(1.));
+    assert_eq!(
+        metric(&p, "prost_upstream_selections_total", &endpoint),
+        Some(17.)
+    );
+    for (op, result, count) in [
+        ("apply", "success", 1.),
+        ("apply", "error", 1.),
+        ("apply", "conflict", 1.),
+        ("validate", "success", 1.),
+        ("validate", "error", 1.),
+    ] {
+        assert_eq!(
+            metric(
+                &p,
+                "prost_config_transactions_total",
+                &[("operation", op), ("result", result)]
+            ),
+            Some(count)
+        );
+    }
+    // Exercise the HTTP exposition, not just registry.gather().
+    let io = TcpStream::connect(fixture.config.runtime.metrics_address.unwrap()).await?;
+    let (mut scrape, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let scrape_driver = tokio::spawn(connection);
+    let response = scrape
+        .send_request(
+            Request::builder()
+                .uri("/metrics")
+                .body(Full::new(Bytes::new()))?,
+        )
+        .await?;
+    assert!(response.headers()[http::header::CONTENT_TYPE]
+        .to_str()?
+        .starts_with("text/plain"));
+    let body = response.into_body().collect().await?.to_bytes();
+    let text = std::str::from_utf8(&body)?;
+    assert!(text.contains("prost_config_generation 1"));
+    assert!(!text.contains("/status/503"));
+    drop(scrape);
+    scrape_driver.abort();
+    drop(held);
+    timeout(Duration::from_secs(2), async {
+        while old.upgrade().is_some() || metric(&p, "prost_requests_active", &[]) != Some(0.) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert_eq!(metric(&p, "prost_live_generations", &[]), Some(1.));
+    assert_eq!(
+        metric(&p, "prost_snapshot_http_client_pools", &[]),
+        Some(1.)
+    );
+    let mut next = p.snapshot().config.clone();
+    next.upstreams.get_mut("main").unwrap().endpoints[0].id = "replacement".into();
+    p.apply(next.encode()?, 1).await?;
+    assert_eq!(
+        metric(&p, "prost_upstream_selections_total", &endpoint),
+        None
+    );
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_selections_total",
+            &[("upstream", "main"), ("endpoint", "replacement")]
+        ),
+        Some(0.)
+    );
+    drop(client);
+    driver.abort();
+    let weak = Arc::downgrade(&p);
+    p.shutdown().await;
+    drop(p);
+    assert!(
+        weak.upgrade().is_none(),
+        "metrics exporter must not retain the daemon"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -131,6 +338,7 @@ async fn native_header_variables_h1_h2_trailers_and_bodyless_responses() -> Resu
         (http::Method::GET, "/status/204", 204),
         (http::Method::GET, "/status/304", 304),
     ] {
+        h1.ready().await?;
         let response = h1
             .send_request(
                 Request::builder()
@@ -1188,6 +1396,11 @@ async fn compiled_routes_preserve_precedence_and_refresh_upstream_bindings() -> 
         .insert("other".into(), fixture.config.upstreams["main"].clone());
     fixture.config.upstreams.get_mut("other").unwrap().endpoints[0].address = b.address.to_string();
     let route = |host: Option<&str>, prefix: &str, priority, upstream: &str| prost_config::Route {
+        methods: vec![],
+        headers: vec![],
+        access_log: None,
+        max_request_body_bytes: None,
+        request_body_timeout_ms: None,
         host: host.map(str::to_owned),
         path_prefix: prefix.into(),
         priority,
@@ -1297,6 +1510,11 @@ async fn plugin_end_hook_waits_for_body_and_survives_fast_path_changes() -> Resu
     let backend = http_server("body").await;
     let mut fixture = Fixture::new(Protocol::Http, backend.address);
     fixture.config.listeners[0].routes = vec![prost_config::Route {
+        methods: vec![],
+        headers: vec![],
+        access_log: None,
+        max_request_body_bytes: None,
+        request_body_timeout_ms: None,
         host: None,
         path_prefix: "/".into(),
         priority: 0,
@@ -1407,7 +1625,17 @@ async fn http_server(label: &'static str) -> Server {
                     let seen = request.headers().get("x-test-plugin").cloned();
                     let forwarded = request.headers().get("x-forwarded-for").cloned();
                     let body: http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible> =
-                        if request.uri().path() == "/grpc" {
+                        if request.uri().path() == "/hold" {
+                            StreamBody::new(
+                                futures_util::stream::once(async move {
+                                    Ok::<_, Infallible>(Frame::data(Bytes::from_static(
+                                        label.as_bytes(),
+                                    )))
+                                })
+                                .chain(futures_util::stream::pending()),
+                            )
+                            .boxed_unsync()
+                        } else if request.uri().path() == "/grpc" {
                             let mut trailers = http::HeaderMap::new();
                             trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
                             let frames = vec![
@@ -1457,6 +1685,13 @@ async fn http_server(label: &'static str) -> Server {
                         .and_then(|v| v.parse::<u16>().ok())
                     {
                         *response.status_mut() = http::StatusCode::from_u16(status).unwrap();
+                    }
+                    if request.method() == http::Method::HEAD
+                        || matches!(response.status().as_u16(), 204 | 304)
+                    {
+                        *response.body_mut() = Full::new(Bytes::new())
+                            .map_err(|e| match e {})
+                            .boxed_unsync();
                     }
                     if path == "/slow" {
                         response
@@ -1892,7 +2127,9 @@ fn named_connector(
     alpn: &[&[u8]],
 ) -> Result<tokio_rustls::TlsConnector> {
     let mut client = (*prost_transport::client_tls(Some(&prost_config::ClientTls {
+        policy: None,
         server_name: "localhost".into(),
+        identity: None,
         ca_certificate: Some(cert.certificate.clone()),
     }))?)
     .clone();
@@ -2019,7 +2256,9 @@ async fn tls_termination_rotation_and_artifact_restart() -> Result<()> {
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let client = prost_transport::client_tls(Some(&prost_config::ClientTls {
+        policy: None,
         server_name: "localhost".into(),
+        identity: None,
         ca_certificate: Some(tls.certificate.clone()),
     }))?;
     let connector = tokio_rustls::TlsConnector::from(client);
@@ -2030,16 +2269,32 @@ async fn tls_termination_rotation_and_artifact_restart() -> Result<()> {
         )
         .await?;
     roundtrip(&mut io, b"tls old").await?;
+    assert_eq!(
+        metric(&p, "prost_tls_handshakes_total", &[("result", "success")]),
+        Some(1.)
+    );
+    let mut bad = TcpStream::connect(fixture.address()).await?;
+    bad.write_all(b"GET / HTTP/1.1\r\n\r\n").await?;
+    timeout(Duration::from_secs(2), async {
+        while metric(&p, "prost_tls_handshakes_total", &[("result", "error")]) != Some(1.) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    drop(bad);
     let old_cert = io.get_ref().1.peer_certificates().unwrap()[0].clone();
     let replacement_dir = fixture.dir.path().join("replacement");
     std::fs::create_dir(&replacement_dir)?;
     let replacement = certificate(&replacement_dir)?;
     let mut config = p.snapshot().config.clone();
     config.listeners[0].tls = Some(replacement.clone());
+    config.listeners[0].tls.as_mut().unwrap().buffer_limit_bytes = 65536;
     p.apply(config.encode()?, 0).await?;
     roundtrip(&mut io, b"still old session").await?;
     let client = prost_transport::client_tls(Some(&prost_config::ClientTls {
+        policy: None,
         server_name: "localhost".into(),
+        identity: None,
         ca_certificate: Some(replacement.certificate.clone()),
     }))?;
     let connector = tokio_rustls::TlsConnector::from(client);
@@ -2054,9 +2309,21 @@ async fn tls_termination_rotation_and_artifact_restart() -> Result<()> {
     // Source files can disappear; committed artifacts remain usable after restart.
     std::fs::remove_file(replacement.certificate)?;
     std::fs::remove_file(replacement.private_key)?;
+    let stalled = TcpStream::connect(fixture.address()).await?;
+    timeout(Duration::from_secs(2), async {
+        while metric(&p, "prost_tls_handshakes_active", &[]) != Some(1.) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
     drop(io);
     drop(new);
     p.shutdown().await;
+    assert_eq!(
+        metric(&p, "prost_tls_handshakes_total", &[("result", "cancelled")]),
+        Some(1.)
+    );
+    drop(stalled);
     drop(p);
     let p = fixture.start().await;
     let mut io = connector
@@ -2094,7 +2361,9 @@ async fn tls_upstream_verified_and_bad_certificate_rejected() -> Result<()> {
     let upstream = fixture.config.upstreams.get_mut("main").unwrap();
     upstream.endpoints[0].address = server.address.to_string();
     upstream.tls = Some(prost_config::ClientTls {
+        policy: None,
         server_name: "localhost".into(),
+        identity: None,
         ca_certificate: Some(tls.certificate),
     });
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
@@ -2154,8 +2423,11 @@ async fn https_upstream_protocol_and_alpn_follow_config_after_apply() -> Result<
     let _server = Server { address, task };
     let upstream = fixture.config.upstreams.get_mut("main").unwrap();
     upstream.endpoints[0].address = address.to_string();
+    upstream.observe_connection_reuse = true;
     upstream.tls = Some(prost_config::ClientTls {
+        policy: None,
         server_name: "localhost".into(),
+        identity: None,
         ca_certificate: Some(tls.certificate),
     });
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
@@ -2185,6 +2457,14 @@ async fn https_upstream_protocol_and_alpn_follow_config_after_apply() -> Result<
         assert_eq!(response.headers()["x-alpn"], if h2 { "h2" } else { "h1" });
         assert_eq!(response.into_body().collect().await?.to_bytes(), "protocol");
     }
+    assert_eq!(
+        metric(
+            &p,
+            "prost_http_upstream_tls_connect_success_total",
+            &[("upstream", "main")]
+        ),
+        Some(3.)
+    );
     drop(client);
     driver.abort();
     p.shutdown().await;
@@ -2547,6 +2827,14 @@ async fn backup_http2_capacity_hot_update_cancel_and_restart() -> Result<()> {
     assert_eq!(rejected.status(), 503);
     assert_eq!(rejected.headers()["x-always"], "filtered");
     rejected.into_body().collect().await?;
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_rejections_total",
+            &[("upstream", "main"), ("reason", "capacity")]
+        ),
+        Some(1.)
+    );
     assert!(p.status()["upstreams"]["main"]
         .as_array()
         .unwrap()
@@ -2803,6 +3091,22 @@ async fn passive_http_status_window_backup_recovery_update_and_restart() -> Resu
     let state = &p.status()["upstreams"]["main"][0];
     assert_eq!(state["healthy"], false);
     assert_eq!(state["passive_health"]["ejected"], true);
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_passive_failures_total",
+            &[("upstream", "main"), ("endpoint", "one")]
+        ),
+        Some(2.)
+    );
+    assert_eq!(
+        metric(
+            &p,
+            "prost_upstream_passive_ejections_total",
+            &[("upstream", "main"), ("endpoint", "one")]
+        ),
+        Some(1.)
+    );
     assert!(
         state["passive_health"]["cooldown_remaining_ms"]
             .as_u64()

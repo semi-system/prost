@@ -26,8 +26,9 @@ and Windows bind-mounted config directories have not been qualified.
 The managed config and lock file must live in a writable directory. Artifacts
 (certificates, keys, CA bundles, WASM) are copied by SHA-256 into the managed
 artifact directory; saved config points there. Validation may stage unreferenced
-artifacts, but does not publish config. Artifact garbage collection is deferred:
-do not delete files referenced by the managed config or live generations.
+artifacts, but does not publish config. Explicit `artifacts.gc` serializes with
+preparation and protects the current config and live generations. The store has
+one exclusive daemon owner; see [artifact-gc.md](artifact-gc.md).
 
 Request cancellation cannot interrupt a started apply transaction. After a lost
 response, inspect `status` and compare its generation/hash before retrying.
@@ -120,7 +121,28 @@ packaging and profile-driven optimizations are later experiments, not MVP claims
 
 The MVP has integration coverage, not a production certification. Soak 24 hours,
 hardware benchmarks against nginx, fuzz campaigns, dependency/security review,
-fine-grained plugin/pool/TLS metrics, admin groups and fault-injection testing of
-crash/ENOSPC/fsync boundaries remain later work. Metrics currently expose active
+per-instance plugin histograms, private pool queue/hit-miss statistics, admin groups and power-loss/storage-controller qualification
+remain later work. Process-crash, injected fsync and confined tmpfs ENOSPC tests
+are described in [artifact-gc.md](artifact-gc.md). Metrics currently expose active
 connections, HTTP requests, traffic errors, stream bytes, commits and time to
 response headers.
+Detailed current endpoint, passive health, admission, downstream TLS, transaction
+and snapshot/process metrics are available; see [observability.md](observability.md).
+Heap/RSS profiling and the tested TLS buffer tradeoff are documented in
+[memory-profiling.md](memory-profiling.md).
+
+HTTP request body limits and separate upload/header/response-body/socket-write
+deadlines are described in [http-limits.md](http-limits.md). These preserve
+streaming, apply route policy per request snapshot, and keep client body faults
+out of upstream passive health. Opt-in H2 header-block deadlines and per-stream
+DATA completion budgets now use public IO/Executor/body hooks, including a
+partially queued final frame; see [mvp-bundle.md](mvp-bundle.md).
+
+Native access logging uses an opt-in bounded queue and a separate buffered writer;
+explicit Runtime API flush/reopen supports rotation without file watching. Log
+body observation follows stream/tunnel lifetime and retains the request's original
+generation. Actual HTTP upstream transport leases expose open/close/connect/TLS
+metrics across pool replacement; response reuse tracking is optional. Duration
+includes DNS/TCP/TLS and reuse counters are not private pool hit/miss statistics.
+Configuration, failure semantics and local full-log-filesystem tests:
+[access-log.md](access-log.md).

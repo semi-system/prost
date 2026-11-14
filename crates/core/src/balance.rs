@@ -28,6 +28,20 @@ pub(crate) struct Selection {
     pub index: usize,
     pub lease: Option<Lease>,
 }
+#[derive(Debug)]
+pub(crate) enum Rejection {
+    Unavailable,
+    Capacity,
+}
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "no healthy endpoints",
+            Self::Capacity => "endpoint capacity exhausted",
+        })
+    }
+}
+impl std::error::Error for Rejection {}
 #[derive(Clone)]
 pub(crate) struct OriginalPath(pub http::uri::PathAndQuery);
 pub(crate) struct Key<'a> {
@@ -209,7 +223,7 @@ impl Ring {
                 .iter()
                 .enumerate()
                 .any(|(i, _)| available(i)),
-            "no available endpoints"
+            Rejection::Unavailable
         );
         let mut seen = [false; 256];
         let mut visited = 0;
@@ -227,7 +241,7 @@ impl Ring {
                 break;
             }
         }
-        bail!("no available endpoints")
+        Err(Rejection::Unavailable.into())
     }
 }
 struct LoadState {
@@ -402,9 +416,20 @@ impl Balancer {
         let _guard = state.gate.lock().unwrap_or_else(|e| e.into_inner());
         let mut allowed = [false; 256];
         let mut loads = [0; 256];
+        let mut healthy = false;
         for (i, e) in upstream.config.endpoints.iter().enumerate() {
             loads[i] = state.loads[i].load(Ordering::Relaxed);
-            allowed[i] = eligible(upstream, i) && (e.max_active == 0 || loads[i] < e.max_active);
+            let available = eligible(upstream, i);
+            healthy |= available;
+            allowed[i] = available && (e.max_active == 0 || loads[i] < e.max_active);
+        }
+        if !allowed.iter().any(|b| *b) {
+            return Err(if healthy {
+                Rejection::Capacity
+            } else {
+                Rejection::Unavailable
+            }
+            .into());
         }
         if self.has_backup {
             prefer_primary(upstream, &mut allowed);
@@ -480,7 +505,7 @@ impl Balancer {
             .filter(|(i, _)| allowed[*i])
             .map(|(_, e)| u64::from(e.weight))
             .sum();
-        ensure!(total > 0, "no available endpoints");
+        ensure!(total > 0, Rejection::Unavailable);
         let mut ticket = self.counter.fetch_add(1, Ordering::Relaxed) % total;
         for (i, e) in u.config.endpoints.iter().enumerate() {
             if allowed[i] {
@@ -507,7 +532,7 @@ impl Balancer {
     }
     fn round_robin(&self, u: &PreparedUpstream) -> Result<usize> {
         if u.config.endpoints.len() == 1 {
-            ensure!(eligible(u, 0), "no healthy endpoints");
+            ensure!(eligible(u, 0), Rejection::Unavailable);
             return Ok(0);
         }
         let total: u64 = u
@@ -518,7 +543,7 @@ impl Balancer {
             .filter(|(i, _)| eligible(u, *i))
             .map(|(_, e)| u64::from(e.weight))
             .sum();
-        ensure!(total > 0, "no healthy endpoints");
+        ensure!(total > 0, Rejection::Unavailable);
         let mut ticket = self.counter.fetch_add(1, Ordering::Relaxed) % total;
         for (i, e) in u.config.endpoints.iter().enumerate() {
             if eligible(u, i) {
@@ -528,7 +553,7 @@ impl Balancer {
                 ticket -= u64::from(e.weight);
             }
         }
-        bail!("endpoint health changed during selection")
+        Err(Rejection::Unavailable.into())
     }
 }
 fn prefer_primary(u: &PreparedUpstream, allowed: &mut [bool; 256]) {

@@ -7,8 +7,21 @@ use std::{
     path::PathBuf,
 };
 
+mod dns;
+#[cfg(test)]
+mod encoding_tests;
+mod http_policy;
+pub use dns::DnsPolicy;
+mod logging;
+mod route_match;
+pub use http_policy::{Cache, Compression, HttpPolicy, Retry};
+pub use route_match::RouteHeader;
 mod tls;
-pub use tls::{NamedCertificate, ServerTls};
+pub use logging::{AccessLog, LogFormat};
+pub use tls::{
+    NamedCertificate, PassthroughRoute, PassthroughSettings, ServerTls, TlsMinimum, TlsPolicy,
+};
+pub const MAX_CONFIG_BYTES: usize = 3 * 1024 * 1024;
 
 fn yes() -> bool {
     true
@@ -61,6 +74,9 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
+    pub max_proxy_connections: usize,
+    pub observe_plugins: bool,
+    pub access_log: Option<AccessLog>,
     pub admin_socket: PathBuf,
     pub artifact_dir: PathBuf,
     pub metrics_address: Option<SocketAddr>,
@@ -73,6 +89,9 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            max_proxy_connections: 4096,
+            observe_plugins: false,
+            access_log: None,
             admin_socket: socket(),
             artifact_dir: artifacts(),
             metrics_address: None,
@@ -87,6 +106,18 @@ impl Default for Runtime {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Upstream {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_retry: Option<TcpRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_close_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_proxy_v2: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observe_pool_state: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpPolicy>,
     pub endpoints: Vec<Endpoint>,
     #[serde(default = "balance")]
     pub balance: String,
@@ -100,6 +131,17 @@ pub struct Upstream {
     pub connect_timeout_ms: u64,
     #[serde(default = "idle_ms")]
     pub idle_timeout_ms: u64,
+    /// None retains the legacy total request-to-response-header idle timeout.
+    /// Some starts a deadline after upload EOF; zero disables that deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_header_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_timeout_ms: Option<u64>,
+    /// Counts first/reused responses on actual transports, not pool hit/miss.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observe_connection_reuse: bool,
     #[serde(default = "health_ms")]
     pub health_interval_ms: u64,
     #[serde(default)]
@@ -119,7 +161,27 @@ pub struct Upstream {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct TcpRetry {
+    pub max_attempts: u32,
+    pub timeout_ms: u64,
+    pub backoff_ms: u64,
+}
+impl Default for TcpRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            timeout_ms: 9000,
+            backoff_ms: 10,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct HealthCheck {
+    pub protocol: HealthProtocol,
+    pub port: Option<u16>,
+    pub tls: Option<ClientTls>,
+    pub send_proxy_v2: Option<bool>,
     /// None checks TCP/TLS connectivity; Some performs GET and checks response status.
     pub path: Option<String>,
     pub host: Option<String>,
@@ -127,6 +189,19 @@ pub struct HealthCheck {
     pub timeout_ms: u64,
     pub fall: u32,
     pub rise: u32,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthProtocol {
+    #[default]
+    Connect,
+    Http,
+    Smtp,
+    SmtpStarttls,
+    Imap,
+    ImapStarttls,
+    Pop3,
+    Pop3Starttls,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -147,6 +222,10 @@ impl Default for PassiveHealth {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            protocol: HealthProtocol::Connect,
+            port: None,
+            tls: None,
+            send_proxy_v2: None,
             path: None,
             host: None,
             expected_status: 200,
@@ -159,6 +238,8 @@ impl Default for HealthCheck {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Http2Settings {
+    pub header_read_timeout_ms: u64,
+    pub stream_write_timeout_ms: u64,
     pub initial_stream_window_size: u32,
     pub initial_connection_window_size: u32,
     pub max_concurrent_streams: u32,
@@ -167,6 +248,8 @@ pub struct Http2Settings {
 impl Default for Http2Settings {
     fn default() -> Self {
         Self {
+            header_read_timeout_ms: 0,
+            stream_write_timeout_ms: 0,
             initial_stream_window_size: 65535,
             initial_connection_window_size: 1048576,
             max_concurrent_streams: 128,
@@ -176,6 +259,8 @@ impl Default for Http2Settings {
 }
 impl Http2Settings {
     fn validate(&self) -> Result<()> {
+        validate_timeout(Some(self.header_read_timeout_ms))?;
+        validate_timeout(Some(self.stream_write_timeout_ms))?;
         ensure!(
             (65535..=16777216).contains(&self.initial_stream_window_size)
                 && (65535..=16777216).contains(&self.initial_connection_window_size)
@@ -209,9 +294,19 @@ fn is_zero(value: &u64) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientTls {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<TlsPolicy>,
     pub server_name: String,
     #[serde(default)]
     pub ca_certificate: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ClientIdentity>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientIdentity {
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +317,20 @@ pub enum Protocol {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_passthrough_settings: Option<PassthroughSettings>,
+    #[serde(default)]
+    pub max_connections_per_ip: usize,
+    #[serde(default = "connect_ms")]
+    pub tls_handshake_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocol>,
+    #[serde(default)]
+    pub tls_passthrough: bool,
+    #[serde(default = "yes")]
+    pub access_log: bool,
     pub id: String,
     pub address: SocketAddr,
     pub protocol: Protocol,
@@ -231,6 +340,15 @@ pub struct Listener {
     pub tls: Option<ServerTls>,
     #[serde(default = "max_conn")]
     pub max_connections: usize,
+    #[serde(default = "header_ms")]
+    pub header_read_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_write_timeout_ms: Option<u64>,
+    /// Zero means unlimited; route values override listener values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_timeout_ms: Option<u64>,
     #[serde(default)]
     pub trusted_proxies: Vec<IpNet>,
     #[serde(default)]
@@ -240,9 +358,33 @@ pub struct Listener {
     #[serde(default)]
     pub http2_settings: Http2Settings,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyProtocol {
+    pub trusted_peers: Vec<IpNet>,
+    pub timeout_ms: u64,
+}
+impl Default for ProxyProtocol {
+    fn default() -> Self {
+        Self {
+            trusted_peers: Vec::new(),
+            timeout_ms: 2000,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<RouteHeader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_log: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_timeout_ms: Option<u64>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default = "root")]
@@ -255,6 +397,16 @@ pub struct Route {
 }
 fn root() -> String {
     "/".into()
+}
+fn header_ms() -> u64 {
+    10_000
+}
+fn validate_timeout(value: Option<u64>) -> Result<()> {
+    ensure!(
+        value.is_none_or(|v| v <= 86_400_000),
+        "timeout must be 0..86400000 ms"
+    );
+    Ok(())
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,15 +421,19 @@ pub struct Plugin {
 }
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
-        ensure!(text.len() <= 3 * 1024 * 1024, "config exceeds 3 MiB");
+        ensure!(text.len() <= MAX_CONFIG_BYTES, "config exceeds 3 MiB");
         let c: Self = toml::from_str(text).context("invalid TOML")?;
         c.validate()?;
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(log) = &self.runtime.access_log {
+            log.validate()?;
+        }
         ensure!(self.schema_version == 1, "unsupported schema_version");
         ensure!(
-            (1..=1_000_000).contains(&self.runtime.max_connections)
+            (1..=1_000_000).contains(&self.runtime.max_proxy_connections)
+                && (1..=1_000_000).contains(&self.runtime.max_connections)
                 && (1..=1_000_000).contains(&self.runtime.max_requests),
             "runtime limits must be 1..1000000"
         );
@@ -300,6 +456,41 @@ impl Config {
         let mut ids = HashSet::new();
         let mut addresses = HashSet::new();
         for (name, u) in &self.upstreams {
+            if let Some(retry) = &u.tcp_retry {
+                ensure!(
+                    (1..=8).contains(&retry.max_attempts)
+                        && (1..=60000).contains(&retry.timeout_ms)
+                        && retry.backoff_ms <= 1000,
+                    "invalid TCP retry budgets"
+                );
+            }
+            validate_timeout(u.half_close_timeout_ms)?;
+            for tls in [u.tls.as_ref(), u.health_check.tls.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(policy) = &tls.policy {
+                    policy.validate()?;
+                }
+                ensure!(!tls.server_name.is_empty(), "TLS server_name is required");
+                if let Some(id) = &tls.identity {
+                    ensure!(
+                        !id.certificate.as_os_str().is_empty()
+                            && !id.private_key.as_os_str().is_empty(),
+                        "client identity requires certificate and key"
+                    );
+                }
+            }
+            if let Some(policy) = &u.http {
+                policy.validate()?;
+            }
+            if let Some(id) = u.tls.as_ref().and_then(|t| t.identity.as_ref()) {
+                ensure!(
+                    !id.certificate.as_os_str().is_empty()
+                        && !id.private_key.as_os_str().is_empty(),
+                    "client identity requires certificate and key"
+                );
+            }
             valid_id(name)?;
             ensure!(
                 matches!(
@@ -322,6 +513,9 @@ impl Config {
                 u.connect_timeout_ms > 0 && u.idle_timeout_ms > 0 && u.health_interval_ms >= 100,
                 "invalid timeouts"
             );
+            validate_timeout(u.response_header_timeout_ms)?;
+            validate_timeout(u.response_body_timeout_ms)?;
+            validate_timeout(u.write_timeout_ms)?;
             ensure!(
                 u.pool_max_idle_per_host <= 4096 && u.pool_idle_timeout_ms > 0,
                 "invalid upstream pool limits"
@@ -331,6 +525,11 @@ impl Config {
                 "HTTP/1 upstream buffer must be 8192..1048576 bytes"
             );
             u.http2_settings.validate()?;
+            ensure!(
+                u.http2_settings.header_read_timeout_ms == 0
+                    && u.http2_settings.stream_write_timeout_ms == 0,
+                "H2 header/write stream deadlines belong on listener.http2_settings"
+            );
             if let Some(p) = &u.passive_health {
                 ensure!(
                     p.max_fails <= 1000 && (1..=3600000).contains(&p.fail_timeout_ms),
@@ -345,6 +544,22 @@ impl Config {
                 );
             }
             let h = &u.health_check;
+            ensure!(h.port != Some(0), "health port must be positive");
+            let starttls = matches!(
+                h.protocol,
+                HealthProtocol::SmtpStarttls
+                    | HealthProtocol::ImapStarttls
+                    | HealthProtocol::Pop3Starttls
+            );
+            ensure!(
+                !starttls || h.tls.is_some() || u.tls.is_some(),
+                "STARTTLS health checks require verified TLS settings"
+            );
+            ensure!(
+                h.path.is_none()
+                    || matches!(h.protocol, HealthProtocol::Connect | HealthProtocol::Http),
+                "HTTP path on mail health check"
+            );
             ensure!(
                 (1..=100).contains(&h.fall)
                     && (1..=100).contains(&h.rise)
@@ -405,7 +620,86 @@ impl Config {
                 ensure!(!tls.server_name.is_empty(), "TLS server_name is required");
             }
         }
+        ensure!(
+            self.listeners
+                .iter()
+                .flat_map(|l| &l.routes)
+                .flat_map(|r| &r.headers)
+                .filter(|h| h.has_regex())
+                .count()
+                <= 256,
+            "at most 256 route header regexes per config"
+        );
+        for upstream in self.upstreams.values() {
+            if let Some(dns) = &upstream.dns {
+                dns.validate()?;
+                let hosts: std::collections::BTreeSet<_> = upstream
+                    .endpoints
+                    .iter()
+                    .filter(|e| e.address.parse::<std::net::SocketAddr>().is_err())
+                    .filter_map(|e| {
+                        e.address
+                            .rsplit_once(':')
+                            .map(|(h, _)| h.trim_end_matches('.').to_ascii_lowercase())
+                    })
+                    .collect();
+                ensure!(
+                    hosts.len() <= dns.max_hosts,
+                    "DNS max_hosts is smaller than endpoint hostname count"
+                );
+            }
+        }
         for l in &self.listeners {
+            validate_timeout(l.keepalive_idle_timeout_ms)?;
+            ensure!(
+                l.protocol == Protocol::Http || l.keepalive_idle_timeout_ms.unwrap_or(0) == 0,
+                "HTTP keepalive idle timeout requires HTTP listener"
+            );
+            ensure!(
+                l.max_connections_per_ip <= 1_000_000,
+                "per-IP connection limit exceeds 1000000"
+            );
+            ensure!(
+                (1..=60000).contains(&l.tls_handshake_timeout_ms),
+                "invalid TLS handshake timeout"
+            );
+            if let Some(settings) = &l.tls_passthrough_settings {
+                ensure!(
+                    l.tls_passthrough,
+                    "passthrough settings require tls_passthrough"
+                );
+                settings.validate()?;
+                for route in &settings.routes {
+                    let upstream = self.upstreams.get(&route.upstream).with_context(|| {
+                        format!("unknown passthrough route upstream {}", route.upstream)
+                    })?;
+                    ensure!(
+                        upstream.tls.is_none(),
+                        "TLS passthrough route upstream must be plain TCP"
+                    );
+                    ensure!(
+                        upstream.balance != "consistent_hash"
+                            || upstream.hash_key.as_deref().unwrap_or("$remote_addr")
+                                == "$remote_addr",
+                        "TCP passthrough route consistent hash requires $remote_addr"
+                    );
+                }
+            }
+            ensure!(
+                !l.tls_passthrough || (l.protocol == Protocol::Tcp && l.tls.is_none()),
+                "TLS passthrough requires a TCP listener without termination"
+            );
+            if let Some(p) = &l.proxy_protocol {
+                ensure!(
+                    !p.trusted_peers.is_empty()
+                        && p.trusted_peers.len() <= 128
+                        && (1..=60000).contains(&p.timeout_ms),
+                    "PROXY protocol requires trusted_peers and bounded timeout"
+                );
+            }
+            validate_timeout(Some(l.header_read_timeout_ms))?;
+            validate_timeout(l.client_write_timeout_ms)?;
+            validate_timeout(l.request_body_timeout_ms)?;
             l.http2_settings.validate()?;
             if let Some(tls) = &l.tls {
                 tls.validate()?;
@@ -423,9 +717,16 @@ impl Config {
             );
             if l.protocol == Protocol::Tcp {
                 ensure!(
-                    !l.plugins
-                        .iter()
-                        .any(|p| matches!(p.name.as_str(), "headers" | "rate_limit" | "rewrite")),
+                    l.max_request_body_bytes.is_none()
+                        && l.request_body_timeout_ms.is_none()
+                        && l.header_read_timeout_ms == header_ms(),
+                    "HTTP body/header limits on TCP listener"
+                );
+                ensure!(
+                    !l.plugins.iter().any(|p| matches!(
+                        p.name.as_str(),
+                        "headers" | "rate_limit" | "rewrite" | "host_acl"
+                    )),
                     "HTTP filter on TCP listener"
                 );
                 ensure!(
@@ -435,6 +736,10 @@ impl Config {
             }
             if let Some(u) = &l.upstream {
                 ensure!(self.upstreams.contains_key(u), "unknown upstream {u}");
+                ensure!(
+                    !l.tls_passthrough || self.upstreams[u].tls.is_none(),
+                    "TLS passthrough upstream must be plain TCP"
+                );
                 if l.protocol == Protocol::Tcp {
                     let upstream = &self.upstreams[u];
                     ensure!(
@@ -446,6 +751,8 @@ impl Config {
                 }
             }
             for r in &l.routes {
+                r.validate_match()?;
+                validate_timeout(r.request_body_timeout_ms)?;
                 ensure!(
                     r.path_prefix.starts_with('/'),
                     "path_prefix must start with /"
@@ -457,8 +764,11 @@ impl Config {
                 );
                 validate_plugins(&r.plugins)?;
                 ensure!(
-                    !r.plugins.iter().any(|p| p.name == "connection_limit"),
-                    "connection_limit belongs on listener, not route"
+                    !r.plugins.iter().any(|p| matches!(
+                        p.name.as_str(),
+                        "connection_limit" | "connection_rate" | "connection_window"
+                    )),
+                    "connection admission plugins belong on listener, not route"
                 );
             }
             validate_plugins(&l.plugins)?;
@@ -466,9 +776,15 @@ impl Config {
         Ok(())
     }
     pub fn encode(&self) -> Result<String> {
-        Ok(toml::to_string_pretty(self)?)
+        let text = toml::to_string_pretty(self)?;
+        ensure!(
+            text.len() <= MAX_CONFIG_BYTES,
+            "serialized config exceeds 3 MiB; cannot safely restart"
+        );
+        Ok(text)
     }
 }
+
 fn valid_id(s: &str) -> Result<()> {
     ensure!(
         !s.is_empty()
@@ -493,7 +809,15 @@ fn validate_plugins(plugins: &[Plugin]) -> Result<()> {
                 "invalid or duplicate plugin hook"
             );
         }
-        if p.name == "connection_limit" {
+        if matches!(p.name.as_str(), "connection_rate" | "connection_window") {
+            ensure!(
+                p.hooks
+                    .as_ref()
+                    .is_none_or(|hooks| hooks.iter().all(|hook| hook == "connection")),
+                "connection admission filters accept only the connection hook"
+            );
+            ensure!(p.module.is_none(), "native plugin cannot specify module");
+        } else if p.name == "connection_limit" {
             ensure!(
                 p.hooks.is_none(),
                 "connection_limit does not accept hook filters"
