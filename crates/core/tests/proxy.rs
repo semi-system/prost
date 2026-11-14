@@ -830,6 +830,9 @@ async fn native_rewrite_h1_h2_keeps_route_and_stream_snapshot() -> Result<()> {
     let io = TcpStream::connect(fixture.address()).await?;
     let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
     let h1driver = tokio::spawn(conn);
+    // Body/trailer completion can precede the connection dispatcher becoming
+    // ready again. Synchronize with Hyper rather than executor scheduling.
+    h1.ready().await?;
     let response = h1.send_request(request("/old?a=1")).await?;
     assert_eq!(response.headers()["x-seen-uri"], "/new?a=1");
     assert_eq!(response.headers()["x-seen-plugin"], "/new|/old?a=1");
@@ -838,6 +841,7 @@ async fn native_rewrite_h1_h2_keeps_route_and_stream_snapshot() -> Result<()> {
     let body = response.into_body().collect().await?;
     assert_eq!(body.trailers().unwrap()["x-final-uri"], "/new");
     assert_eq!(body.to_bytes(), "main"); // Original route is retained after rewriting to /new.
+    h1.ready().await?;
     let response = h1.send_request(request("/new")).await?;
     assert_eq!(response.into_body().collect().await?.to_bytes(), "other");
     let io = TcpStream::connect(fixture.address()).await?;
@@ -860,6 +864,7 @@ async fn native_rewrite_h1_h2_keeps_route_and_stream_snapshot() -> Result<()> {
     let body = streaming.into_body().collect().await?;
     assert_eq!(body.trailers().unwrap()["x-final-uri"], "/split");
     assert_eq!(body.to_bytes(), "onetwo");
+    h1.ready().await?;
     for response in [
         h1.send_request(request("/old")).await?,
         h2.send_request(request("/old")).await?,

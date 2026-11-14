@@ -11,5 +11,6 @@ $cargoArguments = switch ($Task) {
 }
 wsl -u root --exec docker build -f "${linuxPath}/Dockerfile.dev" -t prost-dev $linuxPath
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-wsl -u root --exec docker run --rm -v "${linuxPath}:/work" -v prost-target:/work/target -v prost-cargo:/usr/local/cargo/registry -w /work -e CARGO_BUILD_JOBS=2 prost-dev @cargoArguments
+$testThreadCount = if ([string]::IsNullOrEmpty($env:RUST_TEST_THREADS)) { '4' } else { $env:RUST_TEST_THREADS }
+wsl -u root --exec docker run --rm -v "${linuxPath}:/work" -v prost-target:/work/target -v prost-cargo:/usr/local/cargo/registry -w /work -e CARGO_BUILD_JOBS=2 -e "RUST_TEST_THREADS=$testThreadCount" prost-dev @cargoArguments
 exit $LASTEXITCODE

@@ -8,4 +8,5 @@ exec docker run --rm \
     -v "$(pwd):/work" \
     -v prost-target:/work/target \
     -v prost-cargo:/usr/local/cargo/registry \
-    -w /work -e CARGO_BUILD_JOBS=2 prost-dev "$@"
+    -w /work -e CARGO_BUILD_JOBS=2 \
+    -e RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}" prost-dev "$@"

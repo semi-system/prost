@@ -97,6 +97,8 @@ sudo sh scripts/docker-dev.sh cargo build --workspace --locked
 
 Registry và `target` ở Docker named volumes trên filesystem Linux, không build
 vào `/mnt/d`. `Dockerfile.dev` cung cấp Rust, rustfmt và clippy.
+Helper PowerShell/WSL và CI mặc định chạy test với `RUST_TEST_THREADS=4`;
+có thể đặt biến môi trường này để đổi mức song song.
 `build.cmd` gọi PowerShell với execution policy chỉ áp dụng cho process hiện tại,
 không thay chính sách hệ thống. `Dockerfile` mặc định build **release** với LTO;
 muốn image debug dùng `docker build --build-arg CARGO_PROFILE=dev -t prost:debug .`.
