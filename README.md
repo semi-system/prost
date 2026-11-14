@@ -67,6 +67,15 @@ So sánh thuật toán với nginx trên bốn backend: [docs/load-balancing-ben
 
 ## Build và test bằng Docker trong WSL
 
+GitHub Actions build image release bằng
+[`abxst/actions/strict@v5`](https://github.com/abxst/actions/blob/v5/strict/action.yml)
+sau khi job test thành công. PR, nhánh phụ và chạy thủ công chỉ build/scan;
+push lên nhánh mặc định publish `ghcr.io/semi-system/prost:latest` và
+`ghcr.io/semi-system/prost:sha-<full-commit-sha>`. Dùng `GITHUB_TOKEN` với quyền
+`packages: write`, không cần PAT riêng. Image là Linux amd64, WASM tắt mặc định.
+Semgrep/Trivy giữ gate strict, kể cả CVE chưa có bản vá; findings sẽ chặn publish.
+Report được lưu trong artifact `image-security-reports` của workflow.
+
 Cần Docker Engine chạy trong WSL Ubuntu và Docker Compose v2 để chạy demo.
 Không cần cài Rust trên Windows.
 
