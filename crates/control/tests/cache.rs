@@ -55,6 +55,7 @@ address="127.0.0.1:9"
         uri: "/a?q=1".into(),
         host: Some("cache.test".into()),
         accept_encoding: vec!["gzip".into()],
+        ..Default::default()
     };
     let key = request(
         &socket,

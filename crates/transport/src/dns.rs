@@ -21,6 +21,9 @@ pub trait DnsLookup: Send + Sync {
     fn lookup(&self, host: String, max: usize) -> LookupFuture;
 }
 struct SystemLookup;
+#[cfg(test)]
+#[path = "dns_wire_tests.rs"]
+mod wire_tests;
 impl DnsLookup for SystemLookup {
     fn lookup(&self, host: String, max: usize) -> LookupFuture {
         Box::pin(async move {
@@ -63,18 +66,77 @@ pub struct DnsResolver {
     lookup: Arc<dyn DnsLookup>,
     records: Mutex<BTreeMap<String, Arc<AsyncMutex<Record>>>>,
     revision: AtomicU64,
+    wire: Option<hickory_resolver::TokioResolver>,
+    services: Mutex<BTreeMap<String, Arc<AsyncMutex<ServiceRecord>>>>,
+}
+#[derive(Clone, PartialEq)]
+struct ServiceTarget {
+    priority: u16,
+    weight: u16,
+    addresses: Vec<SocketAddr>,
+}
+struct ServiceRecord {
+    expires: Instant,
+    targets: Vec<ServiceTarget>,
+    cursor: usize,
+}
+pub fn dns_client(policy: &DnsPolicy) -> anyhow::Result<hickory_resolver::TokioResolver> {
+    use hickory_resolver::{
+        config::{ConnectionConfig, NameServerConfig, ResolverConfig},
+        net::runtime::TokioRuntimeProvider,
+        TokioResolver,
+    };
+    let mut builder = if policy.nameservers.is_empty() {
+        TokioResolver::builder_tokio()?
+    } else {
+        let servers = policy
+            .nameservers
+            .iter()
+            .map(|address| {
+                let mut udp = ConnectionConfig::udp();
+                udp.port = address.port();
+                let mut tcp = ConnectionConfig::tcp();
+                tcp.port = address.port();
+                NameServerConfig::new(address.ip(), true, vec![udp, tcp])
+            })
+            .collect();
+        TokioResolver::builder_with_config(
+            ResolverConfig::from_name_servers(servers),
+            TokioRuntimeProvider::default(),
+        )
+    };
+    let options = builder.options_mut();
+    options.cache_size = 0;
+    options.attempts = 1;
+    options.max_active_requests = 32;
+    options.timeout = Duration::from_millis(policy.timeout_ms);
+    Ok(builder.build()?)
 }
 impl DnsResolver {
     pub fn new(policy: DnsPolicy) -> anyhow::Result<Arc<Self>> {
-        Self::with_lookup(policy, Arc::new(SystemLookup))
+        let wire = if policy.authoritative_ttl || !policy.nameservers.is_empty() {
+            Some(dns_client(&policy)?)
+        } else {
+            None
+        };
+        Self::construct(policy, Arc::new(SystemLookup), wire)
     }
     pub fn with_lookup(policy: DnsPolicy, lookup: Arc<dyn DnsLookup>) -> anyhow::Result<Arc<Self>> {
+        Self::construct(policy, lookup, None)
+    }
+    fn construct(
+        policy: DnsPolicy,
+        lookup: Arc<dyn DnsLookup>,
+        wire: Option<hickory_resolver::TokioResolver>,
+    ) -> anyhow::Result<Arc<Self>> {
         policy.validate()?;
         Ok(Arc::new(Self {
             policy,
             lookup,
             records: Mutex::new(BTreeMap::new()),
             revision: AtomicU64::new(0),
+            wire,
+            services: Mutex::new(BTreeMap::new()),
         }))
     }
     pub fn revision(&self) -> u64 {
@@ -115,11 +177,27 @@ impl DnsResolver {
         };
         let mut record = record.lock().await;
         if Instant::now() >= record.expires {
-            let result = tokio::time::timeout(
-                Duration::from_millis(self.policy.timeout_ms),
-                self.lookup.lookup(host, self.policy.max_addresses),
-            )
-            .await;
+            let mut valid_until = None;
+            let result = if let Some(wire) = &self.wire {
+                match tokio::time::timeout(
+                    Duration::from_millis(self.policy.timeout_ms),
+                    wire.lookup_ip(host),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        valid_until = Some(Instant::from_std(value.valid_until()));
+                        Ok(Ok(value.iter().take(self.policy.max_addresses).collect()))
+                    }
+                    _ => Ok(Err(io::Error::other("DNS lookup failed"))),
+                }
+            } else {
+                tokio::time::timeout(
+                    Duration::from_millis(self.policy.timeout_ms),
+                    self.lookup.lookup(host, self.policy.max_addresses),
+                )
+                .await
+            };
             let mut ips = match result {
                 Ok(Ok(ips)) => ips,
                 _ => vec![],
@@ -143,6 +221,11 @@ impl DnsResolver {
                 } else {
                     self.policy.ttl_ms
                 });
+            if self.policy.authoritative_ttl && record.error.is_none() {
+                if let Some(until) = valid_until {
+                    record.expires = record.expires.min(until);
+                }
+            }
         }
         if let Some(error) = &record.error {
             return Err(io::Error::other(error.clone()));
@@ -163,12 +246,142 @@ impl DnsResolver {
         let port = port
             .parse::<u16>()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if host.starts_with('_') && host.contains("._tcp.") {
+            return self.service(host).await;
+        }
         Ok(self
             .resolve(host)
             .await?
             .into_iter()
             .map(|ip| SocketAddr::new(ip, port))
             .collect())
+    }
+    async fn service(&self, name: &str) -> io::Result<Vec<SocketAddr>> {
+        if name.len() > 253 || !name.starts_with('_') || !name.contains("._tcp.") {
+            return Err(io::Error::other("invalid TCP SRV service"));
+        }
+        let wire = self
+            .wire
+            .as_ref()
+            .ok_or_else(|| io::Error::other("SRV requires wire DNS policy"))?;
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let record = {
+            let mut services = self.services.lock().unwrap();
+            if !services.contains_key(&name) {
+                if services.len() >= self.policy.max_hosts {
+                    return Err(io::Error::other("SRV cache capacity"));
+                }
+                services.insert(
+                    name.clone(),
+                    Arc::new(AsyncMutex::new(ServiceRecord {
+                        expires: Instant::now(),
+                        targets: Vec::new(),
+                        cursor: 0,
+                    })),
+                );
+            }
+            services[&name].clone()
+        };
+        let mut record = record.lock().await;
+        if record.expires <= Instant::now() {
+            let result =
+                tokio::time::timeout(Duration::from_millis(self.policy.timeout_ms), async {
+                    let answer = wire.srv_lookup(name).await.map_err(io::Error::other)?;
+                    let mut until = Instant::from_std(answer.valid_until());
+                    let mut records: Vec<_> = answer
+                        .answers()
+                        .iter()
+                        .filter_map(|record| match &record.data {
+                            hickory_resolver::proto::rr::RData::SRV(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    records.sort_by_key(|record| record.priority);
+                    let mut targets = Vec::new();
+                    let mut count = 0;
+                    for item in records.into_iter().take(self.policy.max_addresses) {
+                        if item.target.is_root() {
+                            continue;
+                        }
+                        let Ok(ips) = wire.lookup_ip(item.target.to_utf8()).await else {
+                            continue;
+                        };
+                        until = until.min(Instant::from_std(ips.valid_until()));
+                        let addresses: Vec<_> = ips
+                            .iter()
+                            .take(self.policy.max_addresses - count)
+                            .map(|ip| SocketAddr::new(ip, item.port))
+                            .collect();
+                        count += addresses.len();
+                        if !addresses.is_empty() {
+                            targets.push(ServiceTarget {
+                                priority: item.priority,
+                                weight: item.weight,
+                                addresses,
+                            });
+                        }
+                        if count >= self.policy.max_addresses {
+                            break;
+                        }
+                    }
+                    Ok::<_, io::Error>((targets, until))
+                })
+                .await;
+            let (targets, until) = match result {
+                Ok(Ok(value)) => value,
+                _ => (
+                    Vec::new(),
+                    Instant::now() + Duration::from_millis(self.policy.negative_ttl_ms),
+                ),
+            };
+            if targets != record.targets {
+                self.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            record.targets = targets;
+            record.cursor = 0;
+            record.expires = until.min(Instant::now() + Duration::from_millis(self.policy.ttl_ms));
+        }
+        if record.targets.is_empty() {
+            return Err(io::Error::other("SRV returned no usable targets"));
+        }
+        let mut addresses = Vec::new();
+        let cursor = record.cursor;
+        record.cursor = record.cursor.wrapping_add(1);
+        let mut start = 0;
+        while start < record.targets.len() {
+            let end = start
+                + record.targets[start..]
+                    .iter()
+                    .take_while(|target| target.priority == record.targets[start].priority)
+                    .count();
+            let group = &record.targets[start..end];
+            let total: usize = group.iter().map(|target| usize::from(target.weight)).sum();
+            let selected = if total == 0 {
+                cursor % group.len()
+            } else {
+                let mut ticket = cursor % total;
+                group
+                    .iter()
+                    .position(|target| {
+                        let weight = usize::from(target.weight);
+                        if ticket < weight {
+                            true
+                        } else {
+                            ticket -= weight;
+                            false
+                        }
+                    })
+                    .unwrap_or(0)
+            };
+            addresses.extend_from_slice(&group[selected].addresses);
+            for (index, target) in group.iter().enumerate() {
+                if index != selected {
+                    addresses.extend_from_slice(&target.addresses);
+                }
+            }
+            start = end;
+        }
+        Ok(addresses)
     }
     pub async fn connect(&self, address: &str) -> io::Result<TcpStream> {
         let addresses = self.endpoint(address).await?;
@@ -209,6 +422,7 @@ mod tests {
                 timeout_ms: 10,
                 max_hosts: 1,
                 max_addresses: 2,
+                ..Default::default()
             },
             Arc::new(Lookup {
                 calls: calls.clone(),

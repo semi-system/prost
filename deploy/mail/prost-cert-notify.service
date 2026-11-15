@@ -1,7 +1,10 @@
 [Unit]
 Description=Notify mail services after a committed edge certificate update
 After=docker.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/prost-cert-notify mail-smtp mail-imap
+ExecStart=/usr/local/sbin/prost-cert-notify --agent-container prost-mail-certd-1 mail-smtp mail-imap
+Restart=on-failure
+RestartSec=10s

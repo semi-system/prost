@@ -5,7 +5,9 @@ admin_socket = "/run/prost/admin.sock"
 artifact_dir = "/var/lib/prost/artifacts"
 reload_mode = "rolling"
 max_connections = 4096
-drain_seconds = 30
+# Preserve established sessions during rolling updates. A third generation is rejected until the old one drains.
+drain_seconds = 0
+metrics_address = "127.0.0.1:9090"
 [runtime.access_log]
 sink = "stdout"
 format = "json"
@@ -15,7 +17,11 @@ queue_capacity = 2048
 send_proxy_v2 = true
 connect_timeout_ms = 3000
 idle_timeout_ms = 300000
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
 health_interval_ms = 5000
+[upstreams.smtp.dns]
+authoritative_ttl = true
 [upstreams.smtp.health_check]
 protocol = "connect"
 proxy_v2_command = "local"
@@ -27,6 +33,8 @@ address = "mail-backend:1025"
 send_proxy_v2 = true
 connect_timeout_ms = 3000
 idle_timeout_ms = 300000
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
 health_interval_ms = 5000
 [upstreams.submission.health_check]
 protocol = "connect"
@@ -34,12 +42,16 @@ proxy_v2_command = "local"
 [[upstreams.submission.endpoints]]
 id = "submission"
 address = "mail-backend:1587"
+[upstreams.submission.dns]
+authoritative_ttl = true
 
 [upstreams.imap]
 send_proxy_v2 = true
 connect_timeout_ms = 3000
 # IMAP IDLE may remain silent for longer than the SMTP idle budget.
 idle_timeout_ms = 0
+write_timeout_ms = 30000
+half_close_timeout_ms = 5000
 health_interval_ms = 5000
 [upstreams.imap.health_check]
 protocol = "connect"
@@ -47,6 +59,8 @@ proxy_v2_command = "local"
 [[upstreams.imap.endpoints]]
 id = "imap"
 address = "mail-backend:1143"
+[upstreams.imap.dns]
+authoritative_ttl = true
 
 [upstreams.web]
 send_proxy_v2 = true
@@ -60,6 +74,8 @@ host = "admin.example.test"
 [[upstreams.web.endpoints]]
 id = "admin"
 address = "admin-backend:8080"
+[upstreams.web.dns]
+authoritative_ttl = true
 
 [[upstreams.acme.endpoints]]
 id = "certd"
@@ -71,6 +87,7 @@ address = "0.0.0.0:10025"
 protocol = "tcp"
 upstream = "smtp"
 max_connections_per_ip = 50
+client_write_timeout_ms = 30000
 [[listeners.plugins]]
 name = "connection_rate"
 config = {connections_per_second=10, burst=100, max_keys=100000, idle_timeout_ms=30000}
@@ -81,6 +98,7 @@ address = "0.0.0.0:10587"
 protocol = "tcp"
 upstream = "submission"
 max_connections_per_ip = 50
+client_write_timeout_ms = 30000
 
 [[listeners]]
 id = "imap"
@@ -88,6 +106,7 @@ address = "0.0.0.0:10143"
 protocol = "tcp"
 upstream = "imap"
 max_connections_per_ip = 50
+client_write_timeout_ms = 30000
 
 [[listeners]]
 id = "smtps"
@@ -95,6 +114,7 @@ address = "0.0.0.0:10465"
 protocol = "tcp"
 upstream = "smtp"
 max_connections_per_ip = 50
+client_write_timeout_ms = 30000
 tls_handshake_timeout_ms = 5000
 [listeners.tls]
 certificate = "/certificates/edge/current/fullchain.pem"
@@ -114,6 +134,7 @@ address = "0.0.0.0:10993"
 protocol = "tcp"
 upstream = "imap"
 max_connections_per_ip = 50
+client_write_timeout_ms = 30000
 tls_handshake_timeout_ms = 5000
 [listeners.tls]
 certificate = "/certificates/edge/current/fullchain.pem"
@@ -133,6 +154,7 @@ address = "0.0.0.0:10443"
 protocol = "http"
 upstream = "web"
 max_connections_per_ip = 100
+client_write_timeout_ms = 30000
 header_read_timeout_ms = 10000
 [[listeners.plugins]]
 name = "host_acl"

@@ -23,6 +23,79 @@ fn response(bytes: usize) -> Response<Body> {
 fn key(path: &str) -> [u8; 32] {
     Cache::key(&Request::builder().uri(path).body(()).unwrap()).unwrap()
 }
+#[test]
+fn local_socket_exhaustion_is_distinct_from_failed_backend_connects() {
+    for kind in [
+        std::io::ErrorKind::AddrNotAvailable,
+        std::io::ErrorKind::OutOfMemory,
+    ] {
+        let error = anyhow::Error::new(std::io::Error::from(kind)).context("wrapped connect error");
+        assert!(crate::local_capacity_error(&error));
+    }
+    assert!(!crate::local_capacity_error(
+        &std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()
+    ));
+    #[cfg(unix)]
+    for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS] {
+        assert!(crate::local_capacity_error(
+            &std::io::Error::from_raw_os_error(code).into()
+        ));
+    }
+}
+#[tokio::test]
+async fn vary_variants_and_stale_refresh_respect_singleflight_and_purge_epoch() {
+    let cache = Cache::new(prost_config::Cache {
+        vary_headers: vec!["accept-language".into()],
+        stale_while_revalidate_seconds: 5,
+        max_background_refreshes: 1,
+        ..Default::default()
+    });
+    let en = Request::builder()
+        .uri("/vary")
+        .header("accept-language", "en")
+        .body(())
+        .unwrap();
+    let vi = Request::builder()
+        .uri("/vary")
+        .header("accept-language", "vi")
+        .body(())
+        .unwrap();
+    let a = cache.variant_key(&en).unwrap();
+    let b = cache.variant_key(&vi).unwrap();
+    assert_ne!(a, b);
+    for k in [a, b] {
+        let mut r = response(3);
+        r.headers_mut()
+            .insert("vary", http::HeaderValue::from_static("Accept-Language"));
+        r.headers_mut().insert(
+            "cache-control",
+            http::HeaderValue::from_static("public,max-age=1,stale-while-revalidate=5"),
+        );
+        cache.capture(k, &mut r);
+        r.into_body().collect().await.unwrap();
+    }
+    assert!(cache.get(&a).is_some() && cache.get(&b).is_some());
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, epoch) = cache.lookup(&a);
+    let candidate = cache.candidate(&a, epoch).unwrap();
+    let (_, first) = cache.swr(&candidate).unwrap();
+    assert!(first.is_some());
+    assert!(cache.swr(&candidate).unwrap().1.is_none());
+    let (_, epoch_b) = cache.lookup(&b);
+    let cb = cache.candidate(&b, epoch_b).unwrap();
+    assert!(cache.swr(&cb).unwrap().1.is_none());
+    cache.purge(None).unwrap();
+    assert!(cache.swr(&candidate).is_none());
+    drop(first);
+    assert_eq!(cache.status().entries, 0);
+    let mut unsafe_response = response(3);
+    unsafe_response
+        .headers_mut()
+        .insert("vary", http::HeaderValue::from_static("*"));
+    cache.capture(a, &mut unsafe_response);
+    unsafe_response.into_body().collect().await.unwrap();
+    assert!(cache.get(&a).is_none());
+}
 #[tokio::test]
 async fn purge_exact_and_all_keep_leased_bytes_reserved_and_inspection_read_only() {
     let cache = Cache::new(prost_config::Cache {
@@ -151,6 +224,7 @@ fn administrative_key_matches_request_fingerprint_and_preserves_variants() {
         uri: "/object?q=1".into(),
         host: Some("Cache.Test".into()),
         accept_encoding: vec!["gzip".into(), "br".into()],
+        ..Default::default()
     };
     let request = Request::builder()
         .uri("/object?q=1")

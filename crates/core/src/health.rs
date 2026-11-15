@@ -1,5 +1,5 @@
 use crate::PreparedUpstream;
-use anyhow::{Context, Result};
+use anyhow::Context;
 use http::Request;
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -213,7 +213,7 @@ impl Drop for Driver {
 
 pub(crate) async fn probe(upstream: &PreparedUpstream, index: usize) -> bool {
     let policy = &upstream.config.health_check;
-    tokio::time::timeout(Duration::from_millis(policy.timeout_ms), async {
+    let result = tokio::time::timeout(Duration::from_millis(policy.timeout_ms), async {
         let endpoint = &upstream.config.endpoints[index];
         let is_http =
             policy.path.is_some() || policy.protocol == prost_config::HealthProtocol::Http;
@@ -290,10 +290,25 @@ pub(crate) async fn probe(upstream: &PreparedUpstream, index: usize) -> bool {
             }));
             sender.send_request(request).await?.status()
         };
-        Ok(status.as_u16() == policy.expected_status)
+        anyhow::ensure!(
+            status.as_u16() == policy.expected_status,
+            "health HTTP status {status}, expected {}",
+            policy.expected_status
+        );
+        Ok(true)
     })
-    .await
-    .is_ok_and(|r: Result<bool>| r.unwrap_or(false))
+    .await;
+    match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            tracing::warn!(endpoint=%upstream.config.endpoints[index].id, error=%format_args!("{error:#}"), "upstream health probe failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(endpoint=%upstream.config.endpoints[index].id, timeout_ms=policy.timeout_ms, "upstream health probe timed out");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

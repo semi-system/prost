@@ -54,6 +54,8 @@ mod pool_metrics;
 mod rate_tables;
 #[path = "support/rolling.rs"]
 mod rolling;
+#[path = "support/rolling_unlimited.rs"]
+mod rolling_unlimited;
 #[path = "support/timeouts.rs"]
 mod timeouts;
 #[path = "support/tls_batch.rs"]

@@ -467,10 +467,7 @@ impl Config {
             self.listeners.len() <= 128 && self.upstreams.len() <= 128,
             "too many listeners/upstreams"
         );
-        ensure!(
-            self.runtime.drain_seconds > 0 && self.runtime.drain_seconds <= 3600,
-            "invalid drain_seconds"
-        );
+        ensure!(self.runtime.drain_seconds <= 3600, "invalid drain_seconds");
         ensure!(self.runtime.io_workers <= 32, "io_workers must be 0..32");
         ensure!(
             self.runtime.admin_socket.is_absolute() && self.runtime.artifact_dir.is_absolute(),
@@ -636,6 +633,9 @@ impl Config {
                     !host.contains(['/', '@', '?', '#', ' ']),
                     "invalid endpoint host"
                 );
+                if host.starts_with('_') && host.contains("._tcp.") {
+                    ensure!(u.dns.as_ref().is_some_and(|dns|dns.authoritative_ttl || !dns.nameservers.is_empty()),"SRV endpoint requires a wire DNS policy");
+                }
                 ensure!(e.weight > 0 && e.weight <= 10000, "weight out of range");
                 sum += e.weight as u64;
             }

@@ -40,6 +40,31 @@ impl std::fmt::Display for ProxyCapacity {
     }
 }
 impl std::error::Error for ProxyCapacity {}
+/// Local socket/resource exhaustion must not eject a healthy backend.
+pub fn local_capacity_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if cause.is::<ProxyCapacity>() {
+            return true;
+        }
+        let Some(error) = cause.downcast_ref::<std::io::Error>() else {
+            return false;
+        };
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::OutOfMemory
+        ) {
+            return true;
+        }
+        #[cfg(unix)]
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS)
+        ) {
+            return true;
+        }
+        false
+    })
+}
 pub type HttpClient = Client<connector::Connector, RequestBody>;
 mod connector;
 thread_local! { static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
@@ -221,7 +246,12 @@ pub fn client_with_proxy_dns(
         "PROXY context requires send_proxy_v2"
     );
     let mut scoped = upstream.clone();
-    scoped.pool_max_idle_per_host = scoped.pool_max_idle_per_host.min(1);
+    // One HTTP/2 frontend can fan out to several HTTP/1 backend transports.
+    // Evicting all but one idle socket after each response causes TIME_WAIT
+    // churn and exhausts ephemeral ports under sustained multiplexed traffic.
+    // Identity remains frontend-scoped and the process semaphore caps all
+    // active/idle PROXY sockets together.
+    scoped.pool_max_idle_per_host = scoped.pool_max_idle_per_host.min(32);
     scoped.pool_idle_timeout_ms = scoped.pool_idle_timeout_ms.min(5000);
     client_observed(
         &scoped,
@@ -383,6 +413,7 @@ pub struct ForwardOptions {
     pub request_policy: RequestPolicy,
     pub notify_completion: bool,
 }
+#[derive(Clone)]
 pub struct Target {
     scheme: http::uri::Scheme,
     authority: http::uri::Authority,

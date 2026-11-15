@@ -60,6 +60,8 @@ async fn issue(
     spec: &Certificate,
     state: Arc<State>,
     budget: u64,
+    config: &Config,
+    store: &Store,
 ) -> Result<(String, String)> {
     let identifiers: Vec<_> = spec.domains.iter().cloned().map(Identifier::Dns).collect();
     let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
@@ -75,14 +77,35 @@ async fn issue(
             AuthorizationStatus::Pending => {}
             _ => anyhow::bail!("ACME authorization is not pending or valid"),
         }
+        let dns = spec.challenge == crate::config::Challenge::Dns01;
         let mut challenge = authorization
-            .challenge(ChallengeType::Http01)
-            .context("CA did not offer HTTP-01")?;
+            .challenge(if dns {
+                ChallengeType::Dns01
+            } else {
+                ChallengeType::Http01
+            })
+            .context("CA did not offer configured challenge")?;
         let domain = challenge.identifier().to_string().to_ascii_lowercase();
         ensure!(
-            spec.domains.contains(&domain),
+            spec.domains
+                .iter()
+                .any(|name| name.trim_start_matches("*.") == domain.trim_start_matches("*.")),
             "CA requested an unexpected identifier"
         );
+        if dns {
+            crate::dns01::present(
+                config,
+                spec,
+                store,
+                crate::dns01::Record {
+                    name: format!("_acme-challenge.{}", domain.trim_start_matches("*.")),
+                    value: challenge.key_authorization().dns_value(),
+                },
+            )
+            .await?;
+            challenge.set_ready().await?;
+            continue;
+        }
         let token = challenge.token.clone();
         ensure!(
             !token.is_empty()
@@ -237,52 +260,127 @@ pub async fn maintain(
         }
         tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
     }
-    let mut entries: Vec<_> = bundles
-        .into_iter()
-        .map(|bundle| Entry {
-            pending: !bundle.bootstrap && bundle.not_after > now() + 60,
-            bundle,
-            next: 0,
-        })
-        .collect();
-    let mut credentials = None;
-    loop {
-        let mut next = now() + 86400;
-        for (spec, entry) in config.certificates.iter().zip(&mut entries) {
-            if entry.next <= now() {
-                let result:Result<()> = async {
-                    if !entry.pending && (entry.bundle.bootstrap || entry.bundle.not_after-config.renew_before_seconds as i64<=now()) {
-                        if credentials.is_none() {credentials=Some(tokio::time::timeout(Duration::from_secs(config.order_timeout_seconds),account(&config,&store)).await??);}
-                        let (chain,key)=tokio::time::timeout(Duration::from_secs(config.order_timeout_seconds),issue(credentials.as_ref().unwrap(),spec,state.clone(),config.order_timeout_seconds)).await??;
-                        entry.bundle=store.install(spec,&chain,&key,false)?;
-                        entry.pending=true;
-                        state.issued.fetch_add(1,Ordering::Relaxed);
-                    }
-                    if entry.pending {
-                        publish(&config,spec,&entry.bundle).await?;
-                        atomic(&store.certificates.join("publication.json"),&serde_json::to_vec(&serde_json::json!({"certificate":spec.id,"not_after":entry.bundle.not_after,"published_at":now()}))?,if config.shared_certificate_group {0o640}else{0o600})?;
-                        entry.pending=false;
-                        state.published.fetch_add(1,Ordering::Relaxed);
-                        if let Err(error)=store.prune(&entry.bundle) {tracing::warn!(error=%error,"certificate history cleanup failed");}
-                        tracing::info!(certificate=%spec.id,not_after=entry.bundle.not_after,"certificate published");
-                    }
-                    Ok(())
-                }.await;
-                match result {
-                    Ok(()) => {
-                        entry.next = (entry.bundle.not_after - config.renew_before_seconds as i64)
-                            .max(now() + 60)
-                    }
-                    Err(error) => {
-                        state.failures.fetch_add(1, Ordering::Relaxed);
-                        entry.next = now() + config.retry_seconds as i64;
-                        tracing::warn!(certificate=%spec.id,error=%error,"certificate cycle failed; committed TLS retained");
-                    }
-                }
+    let credentials = Arc::new(tokio::sync::Mutex::new(None));
+    let budget = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut tasks = tokio::task::JoinSet::new();
+    let config = Arc::new(config);
+    for (spec, bundle) in config.certificates.iter().cloned().zip(bundles) {
+        let (config, store, state, credentials, budget, stop) = (
+            config.clone(),
+            store.clone(),
+            state.clone(),
+            credentials.clone(),
+            budget.clone(),
+            stop.clone(),
+        );
+        tasks.spawn(async move {
+            let mut entry = Entry {
+                pending: !bundle.bootstrap && bundle.not_after > now() + 60,
+                bundle,
+                next: 0,
+            };
+            loop {
+                let delay = Duration::from_secs((entry.next - now()).max(0) as u64);
+                tokio::select! { _=stop.cancelled()=>return, _=tokio::time::sleep(delay)=>{} }
+                let cycle = async {
+                    let _permit = budget.acquire().await.unwrap();
+                    maintain_one(&config, &spec, &mut entry, &store, &state, &credentials).await;
+                };
+                tokio::select! { _=stop.cancelled()=>return, _=cycle=>{} }
             }
-            next = next.min(entry.next);
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(error=%error,"certificate worker failed");
+            stop.cancel();
         }
-        let delay = Duration::from_secs((next - now()).max(1) as u64);
-        tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(delay)=>{}}
+    }
+}
+
+async fn maintain_one(
+    config: &Config,
+    spec: &Certificate,
+    entry: &mut Entry,
+    store: &Arc<Store>,
+    state: &Arc<State>,
+    credentials: &tokio::sync::Mutex<Option<Account>>,
+) {
+    let result: Result<()> = async {
+        if !entry.pending
+            && (entry.bundle.bootstrap
+                || entry.bundle.not_after - config.renew_before_seconds as i64 <= now())
+        {
+            crate::dns01::cleanup(config, spec, store).await?;
+            let account = {
+                let mut credentials = credentials.lock().await;
+                if credentials.is_none() {
+                    *credentials = Some(tokio::time::timeout(
+                        Duration::from_secs(config.order_timeout_seconds), account(config, store),
+                    ).await??);
+                }
+                credentials.as_ref().unwrap().clone()
+            };
+            let (chain, key) = tokio::time::timeout(
+                Duration::from_secs(config.order_timeout_seconds),
+                issue(&account, spec, state.clone(), config.order_timeout_seconds, config, store),
+            ).await??;
+            entry.bundle = store.install(spec, &chain, &key, false)?;
+            entry.pending = true;
+            state.issued.fetch_add(1, Ordering::Relaxed);
+        }
+        if entry.pending {
+            publish(config, spec, &entry.bundle).await?;
+            atomic(
+                &store.certificates.join("publication.json"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "certificate": spec.id, "not_after": entry.bundle.not_after, "published_at": now()
+                }))?,
+                if config.shared_certificate_group { 0o640 } else { 0o600 },
+            )?;
+            entry.pending = false;
+            state.certificates.write().unwrap().insert(spec.id.clone(), crate::status::CertificateStatus {
+                not_after: entry.bundle.not_after, bootstrap: entry.bundle.bootstrap,
+                published: true, published_at: now(), delivery_pending: spec.delivery.len(), last_error: None,
+            });
+            state.published.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = store.prune(&entry.bundle) {
+                tracing::warn!(error=%error, "certificate history cleanup failed");
+            }
+            tracing::info!(certificate=%spec.id, not_after=entry.bundle.not_after, "certificate published");
+        }
+        // TXT cleanup must not wait for an unavailable backend's reload ACK.
+        crate::dns01::cleanup(config, spec, store).await?;
+        if !entry.bundle.bootstrap {
+            let pending = crate::delivery::converge(store.clone(), spec, &entry.bundle).await?;
+            if let Some(value) = state.certificates.write().unwrap().get_mut(&spec.id) {
+                value.delivery_pending = pending;
+            }
+            ensure!(pending == 0, "backend certificate acknowledgments pending");
+        }
+        if let Some(value) = state.certificates.write().unwrap().get_mut(&spec.id) {
+            value.last_error = None;
+        }
+        Ok(())
+    }.await;
+    match result {
+        Ok(()) => {
+            entry.next =
+                (entry.bundle.not_after - config.renew_before_seconds as i64).max(now() + 60)
+        }
+        Err(error) => {
+            state.failures.fetch_add(1, Ordering::Relaxed);
+            let mut values = state.certificates.write().unwrap();
+            let value = values.get_mut(&spec.id).unwrap();
+            value.last_error =
+                Some("certificate cycle or backend acknowledgment failed; inspect agent logs");
+            entry.next = now()
+                + if value.published && value.delivery_pending > 0 {
+                    config.delivery_retry_seconds
+                } else {
+                    config.retry_seconds
+                } as i64;
+            tracing::warn!(certificate=%spec.id,error=%error,"certificate cycle failed; committed TLS retained");
+        }
     }
 }

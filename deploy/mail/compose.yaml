@@ -29,6 +29,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
     depends_on:
       certd: {condition: service_healthy}
     ports:

@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 pub struct State {
+    pub certificates: RwLock<std::collections::BTreeMap<String, crate::status::CertificateStatus>>,
+    pub readiness_margin: AtomicU64,
     pub tokens: RwLock<HashMap<(String, String), String>>,
     pub issued: AtomicU64,
     pub failures: AtomicU64,
@@ -39,8 +41,35 @@ pub fn response(request: &Request<Incoming>, state: &State) -> Response<Full<Byt
         (StatusCode::METHOD_NOT_ALLOWED, String::new())
     } else if path == "/healthz" {
         (StatusCode::OK, "ready\n".into())
+    } else if path == "/readyz" {
+        let ready = crate::status::ready(
+            &state.certificates.read().unwrap(),
+            state.readiness_margin.load(Ordering::Relaxed),
+        );
+        (
+            if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            if ready {
+                "certificates ready\n"
+            } else {
+                "certificates not ready\n"
+            }
+            .into(),
+        )
+    } else if path == "/certificates" {
+        (
+            StatusCode::OK,
+            serde_json::to_string(&*state.certificates.read().unwrap()).unwrap(),
+        )
     } else if path == "/metrics" {
-        (StatusCode::OK,format!("# TYPE prost_acme_issued_total counter\nprost_acme_issued_total {}\n# TYPE prost_acme_failures_total counter\nprost_acme_failures_total {}\n# TYPE prost_acme_publications_total counter\nprost_acme_publications_total {}\n",state.issued.load(Ordering::Relaxed),state.failures.load(Ordering::Relaxed),state.published.load(Ordering::Relaxed)))
+        let mut body=format!("# TYPE prost_acme_issued_total counter\nprost_acme_issued_total {}\n# TYPE prost_acme_failures_total counter\nprost_acme_failures_total {}\n# TYPE prost_acme_publications_total counter\nprost_acme_publications_total {}\n",state.issued.load(Ordering::Relaxed),state.failures.load(Ordering::Relaxed),state.published.load(Ordering::Relaxed));
+        for (id, value) in &*state.certificates.read().unwrap() {
+            body.push_str(&format!("prost_acme_certificate_not_after_seconds{{certificate=\"{id}\"}} {}\nprost_acme_certificate_bootstrap{{certificate=\"{id}\"}} {}\nprost_acme_delivery_pending{{certificate=\"{id}\"}} {}\nprost_acme_last_publication_seconds{{certificate=\"{id}\"}} {}\n",value.not_after,u8::from(value.bootstrap),value.delivery_pending,value.published_at));
+        }
+        (StatusCode::OK, body)
     } else if let (Some(token), Some(host)) =
         (path.strip_prefix("/.well-known/acme-challenge/"), host)
     {
@@ -70,7 +99,11 @@ pub fn response(request: &Request<Incoming>, state: &State) -> Response<Full<Byt
         .insert("cache-control", http::HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         "content-type",
-        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        http::HeaderValue::from_static(if path == "/certificates" {
+            "application/json"
+        } else {
+            "text/plain; charset=utf-8"
+        }),
     );
     response
 }

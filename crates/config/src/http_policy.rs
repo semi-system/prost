@@ -43,6 +43,10 @@ pub struct Cache {
     pub revalidate: bool,
     pub revalidate_retention_seconds: u64,
     pub stale_if_error_seconds: u64,
+    pub vary_headers: Vec<String>,
+    pub stale_while_revalidate_seconds: u64,
+    pub max_background_refreshes: usize,
+    pub background_refresh_timeout_ms: u64,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -54,6 +58,10 @@ impl Default for Cache {
             revalidate: false,
             revalidate_retention_seconds: 300,
             stale_if_error_seconds: 0,
+            vary_headers: Vec::new(),
+            stale_while_revalidate_seconds: 0,
+            max_background_refreshes: 4,
+            background_refresh_timeout_ms: 5000,
         }
     }
 }
@@ -102,7 +110,16 @@ impl HttpPolicy {
                     && c.max_object_bytes <= c.max_bytes
                     && (1..=86400).contains(&c.max_ttl_seconds)
                     && (1..=86400).contains(&c.revalidate_retention_seconds)
-                    && c.stale_if_error_seconds <= 86400,
+                    && c.stale_if_error_seconds <= 86400
+                    && c.stale_while_revalidate_seconds <= 86400
+                    && (1..=32).contains(&c.max_background_refreshes)
+                    && (1..=60000).contains(&c.background_refresh_timeout_ms)
+                    && c.vary_headers.len() <= 16
+                    && c.vary_headers
+                        .iter()
+                        .all(|name| http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+                            && !["authorization", "cookie", "proxy-authorization"]
+                                .contains(&name.to_ascii_lowercase().as_str())),
                 "invalid cache budget"
             );
         }

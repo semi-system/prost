@@ -55,10 +55,18 @@ impl Generation {
             .map(|(start, budget)| budget.saturating_sub(start.elapsed()))
             .unwrap_or_default()
     }
+    pub fn unlimited(&self) -> bool {
+        self.draining
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(_, budget)| budget.is_zero())
+    }
     fn status(&self) -> serde_json::Value {
         serde_json::json!({"generation":self.id,"connections":self.connections.load(Ordering::Relaxed),
             "tasks":self.tasks.len(),"draining":self.drain.is_cancelled(),
-            "drain_remaining_ms":self.drain.is_cancelled().then(||self.remaining().as_millis() as u64),
+            "drain_remaining_ms":(self.drain.is_cancelled() && !self.unlimited()).then(||self.remaining().as_millis() as u64),
+            "drain_unlimited":self.unlimited(),
             "forced":self.force.is_cancelled(),"finished":self.finished.is_cancelled()})
     }
 }

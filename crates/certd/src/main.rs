@@ -1,7 +1,11 @@
 mod agent;
 mod config;
+mod delivery;
+mod dns01;
 mod http;
+mod status;
 mod store;
+mod webhook;
 
 use anyhow::{ensure, Result};
 use clap::{Parser, Subcommand};
@@ -27,6 +31,8 @@ enum Command {
     Check {
         #[arg(long, default_value = "127.0.0.1:8088")]
         address: std::net::SocketAddr,
+        #[arg(long)]
+        certificates: bool,
     },
 }
 #[tokio::main(worker_threads = 2)]
@@ -38,7 +44,11 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    if let Command::Check { address } = args.command {
+    if let Command::Check {
+        address,
+        certificates,
+    } = args.command
+    {
         let io = tokio::time::timeout(
             Duration::from_secs(3),
             tokio::net::TcpStream::connect(address),
@@ -51,7 +61,7 @@ async fn main() -> Result<()> {
             Duration::from_secs(3),
             sender.send_request(
                 ::http::Request::builder()
-                    .uri("/healthz")
+                    .uri(if certificates { "/readyz" } else { "/healthz" })
                     .header("host", "localhost")
                     .body(http_body_util::Empty::<hyper::body::Bytes>::new())?,
             ),
@@ -78,6 +88,11 @@ async fn main() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(config.challenge_address).await?;
     let state = Arc::new(http::State::default());
+    *state.certificates.write().unwrap() = status::initial(&config, &bundles);
+    state.readiness_margin.store(
+        config.readiness_min_validity_seconds,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let stop = CancellationToken::new();
     let server = tokio::spawn(http::serve(listener, state.clone(), stop.clone()));
     let worker = tokio::spawn(agent::maintain(config, store, state, bundles, stop.clone()));

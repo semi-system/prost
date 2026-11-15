@@ -24,7 +24,16 @@ to untrusted clients. Trusted ingress PROXY protocol is opt-in separately.
 SMTP idle is 300 seconds. IMAP `idle_timeout_ms=0` disables the inactivity cutoff;
 write, handshake and half-close budgets remain bounded. Admission has per-IP
 connection caps and SMTP connection-rate limiting. Backend DNS uses bounded TTL
-and negative caching; it resolves again after expiry without a config update.
+and negative caching; this profile enables authoritative TTL queries and resolves
+again after expiry without a config update. It does not enqueue an OS resolver
+lookup for each HTTP/1 connection created by multiplexed frontend traffic.
+The profile uses `drain_seconds=0` to preserve established sessions across full
+rolling updates. A third worker generation is rejected while the previous one
+remains live; TLS-only renewal can still proceed. Process shutdown has a bounded
+30-second grace period. See [rolling-updates.md](rolling-updates.md).
+
+Certificate readiness, DNS-01/wildcards and durable backend acknowledgment are
+described in [certificate-delivery.md](certificate-delivery.md).
 
 TLS defaults allow only TLS 1.2/1.3 and ECDHE/AEAD suites. The profile disables
 session resumption/tickets and rejects missing or unknown SNI. Certificate renewal

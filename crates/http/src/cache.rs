@@ -8,7 +8,7 @@ use http::{header, HeaderMap, Request, Response, Version};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -39,6 +39,7 @@ struct State {
     evictions: u64,
     revalidations: u64,
     stale_hits: u64,
+    refreshing: HashSet<Key>,
 }
 #[derive(Clone)]
 struct Entry {
@@ -59,6 +60,7 @@ pub struct Hit {
     pub version: Version,
     pub data: Bytes,
 }
+#[derive(Clone)]
 pub(crate) struct Candidate {
     key: Key,
     epoch: u64,
@@ -117,6 +119,65 @@ impl Drop for Reservation {
     }
 }
 impl Cache {
+    pub fn variant_key<B>(&self, request: &Request<B>) -> Option<Key> {
+        Self::key_with_vary(request, &self.config.vary_headers)
+    }
+    pub fn key_with_vary<B>(request: &Request<B>, names: &[String]) -> Option<Key> {
+        let base = Self::key(request)?;
+        if names.is_empty() {
+            return Some(base);
+        }
+        let mut hash = Sha256::new();
+        hash.update(base);
+        let mut names: Vec<_> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            hash.update((name.len() as u64).to_be_bytes());
+            hash.update(name.as_bytes());
+            hash.update(
+                (request.headers().get_all(name.as_str()).iter().count() as u64).to_be_bytes(),
+            );
+            for value in request.headers().get_all(name.as_str()) {
+                hash.update((value.as_bytes().len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+        }
+        Some(hash.finalize().into())
+    }
+    pub fn swr(self: &Arc<Self>, candidate: &Candidate) -> Option<(Hit, Option<Refresh>)> {
+        let mut state = self.state.lock().unwrap();
+        if state.epoch != candidate.epoch
+            || state
+                .entries
+                .get(&candidate.key)
+                .is_none_or(|entry| entry.id != candidate.entry.id)
+            || candidate.entry.expires
+                + Duration::from_secs(swr_budget(&self.config, &candidate.entry.headers))
+                <= Instant::now()
+        {
+            return None;
+        }
+        state.hits += 1;
+        state.stale_hits += 1;
+        let refresh = if state.refreshing.len() < self.config.max_background_refreshes
+            && state.refreshing.insert(candidate.key)
+        {
+            Some(Refresh {
+                cache: self.clone(),
+                key: candidate.key,
+            })
+        } else {
+            None
+        };
+        Some((hit(&candidate.entry), refresh))
+    }
+    pub fn refresh_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.background_refresh_timeout_ms)
+    }
+    pub fn object_limit(&self) -> usize {
+        self.config.max_object_bytes
+    }
     pub fn new(config: prost_config::Cache) -> Arc<Self> {
         Arc::new(Self {
             used: Arc::new(AtomicUsize::new(0)),
@@ -305,7 +366,21 @@ impl Cache {
     pub fn capture_at(self: &Arc<Self>, key: Key, epoch: u64, response: &mut Response<Body>) {
         if response.status() != 200
             || response.headers().contains_key(header::SET_COOKIE)
-            || response.headers().contains_key(header::VARY)
+            || response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .any(|value| {
+                    value.to_str().map_or(true, |value| {
+                        value.split(',').any(|name| {
+                            !self
+                                .config
+                                .vary_headers
+                                .iter()
+                                .any(|allowed| allowed.eq_ignore_ascii_case(name.trim()))
+                        })
+                    })
+                })
             || response.headers().contains_key(header::CONTENT_RANGE)
             || response
                 .headers()
@@ -466,6 +541,7 @@ impl Cache {
             used_bytes: self.used.load(Ordering::Relaxed),
             entries: state.entries.len(),
             active_captures: state.captures,
+            background_refreshes: state.refreshing.len(),
             max_bytes: self.config.max_bytes,
             max_entries: self.config.max_entries,
             max_object_bytes: self.config.max_object_bytes,
@@ -591,7 +667,54 @@ fn stale_budget(config: &prost_config::Cache, headers: &HeaderMap) -> u64 {
     budget.unwrap_or(0).min(config.stale_if_error_seconds)
 }
 fn retention(config: &prost_config::Cache, headers: &HeaderMap) -> u64 {
-    stale_budget(config, headers).max(revalidation_budget(config, headers))
+    stale_budget(config, headers)
+        .max(revalidation_budget(config, headers))
+        .max(swr_budget(config, headers))
+}
+fn swr_budget(config: &prost_config::Cache, headers: &HeaderMap) -> u64 {
+    let mut budget = None;
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        let Ok(value) = value.to_str() else { return 0 };
+        for part in value.split(',') {
+            let (name, value) = part.trim().split_once('=').unwrap_or((part.trim(), ""));
+            if [
+                "private",
+                "no-store",
+                "no-cache",
+                "must-revalidate",
+                "proxy-revalidate",
+                "s-maxage",
+            ]
+            .iter()
+            .any(|v| name.eq_ignore_ascii_case(v))
+            {
+                return 0;
+            }
+            if name.eq_ignore_ascii_case("stale-while-revalidate") {
+                let Ok(seconds) = value.trim().trim_matches('"').parse::<u64>() else {
+                    return 0;
+                };
+                budget = Some(budget.unwrap_or(seconds).min(seconds));
+            }
+        }
+    }
+    budget
+        .unwrap_or(0)
+        .min(config.stale_while_revalidate_seconds)
+}
+pub(crate) struct Refresh {
+    cache: Arc<Cache>,
+    key: Key,
+}
+impl Drop for Refresh {
+    fn drop(&mut self) {
+        self.cache
+            .state
+            .lock()
+            .unwrap()
+            .refreshing
+            .remove(&self.key);
+    }
 }
 fn revalidation_budget(config: &prost_config::Cache, headers: &HeaderMap) -> u64 {
     if config.revalidate

@@ -1,7 +1,9 @@
 # Prost
 
-Mail edge 7 cổng, ACME HTTP-01 tự cấp/gia hạn và cấu hình Docker trung lập:
+Mail edge 7 cổng, ACME HTTP-01/DNS-01 tự cấp/gia hạn và cấu hình Docker trung lập:
 [docs/mail-edge.md](docs/mail-edge.md), [docs/acme.md](docs/acme.md).
+Wildcard, readiness và xác nhận backend đã nạp đúng cert bằng TLS fingerprint:
+[docs/certificate-delivery.md](docs/certificate-delivery.md).
 
 Xoay frontend certificate/SNI không drain phiên mail, health check PROXY v2 LOCAL
 và kiểm thử decoder PROXY v2 độc lập: [docs/tls-refresh.md](docs/tls-refresh.md).
@@ -14,7 +16,7 @@ TLS artifact từ đường dẫn, `file://`, HTTP(S), presigned URL hoặc `s3:
 [docs/tls-sources.md](docs/tls-sources.md).
 Kiểm chứng local trên image release: [docs/rolling-validation.md](docs/rolling-validation.md).
 
-DNS backend có TTL/negative TTL và cache ETag/Last-Modified, stale-on-error:
+DNS TTL/SRV, cache Vary theo allow-list, ETag/Last-Modified, stale-on-error và SWR:
 [docs/dns-cache.md](docs/dns-cache.md).
 
 Quản trị RAM cache: status/entries/key/purge qua Unix socket, chặn fill cũ ghi lại

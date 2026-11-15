@@ -13,16 +13,21 @@ max_hosts = 1024
 max_addresses = 32
 ```
 
-Đây là TTL **do người vận hành cấu hình**, không phải TTL authoritative lấy
-từ DNS server. Resolver hệ thống (`getaddrinfo`) chỉ cung cấp địa chỉ; Prost
-cache kết quả theo policy này. Không khai báo block `dns` giữ cách dial cũ.
+Mặc định đây là TTL **do người vận hành cấu hình**. Resolver hệ thống
+(`getaddrinfo`) chỉ cung cấp địa chỉ. Đặt `authoritative_ttl=true` để dùng resolver
+DNS trực tiếp: TTL hiệu lực là min(TTL trả lời DNS, `ttl_ms`), kể cả TTL bằng 0.
+`nameservers=["192.0.2.53:53"]` tùy chọn thay resolver trong resolv.conf; mỗi server
+có UDP và TCP fallback. Không khai báo block `dns` giữ cách dial cũ.
 
 Request/dial hoặc health check đầu tiên sau expiry refresh hostname. Không có
 thread polling file hay watcher cấu hình. Lookup đồng thời cùng hostname được
 gộp; negative answer/timeout được giữ theo negative TTL. Literal IPv4/IPv6 bỏ
 qua lookup. Nhiều IP được giới hạn, loại trùng và xoay thứ tự; TCP thử các địa
-chỉ theo thứ tự trong deadline kết nối. Đây chưa phải Happy Eyeballs hay bộ
-discovery SRV/HTTPS record.
+chỉ theo thứ tự trong deadline kết nối. Chưa hỗ trợ Happy Eyeballs hay discovery
+HTTPS record. TCP SRV được hỗ trợ khi bật wire DNS:
+endpoint `_smtp._tcp.example.test:1` dùng port từ SRV (port `1` chỉ là placeholder).
+Ưu tiên priority thấp trước, xoay có trọng số trong cùng priority; TTL gồm cả SRV
+và A/AAAA target, có giới hạn hostname/địa chỉ. TLS server_name vẫn cấu hình độc lập.
 
 Tối đa 32 công việc resolver hệ thống chạy đồng thời trong process. Permit
 được giữ trong blocking task cả khi caller timeout, để lookup OS chậm không
@@ -60,7 +65,7 @@ stale_if_error_seconds = 10
 Hai chức năng mặc định tắt (`revalidate=false`, stale budget bằng 0). Cache vẫn
 chỉ nhận response public có freshness rõ ràng, đủ body và nằm trong budget.
 Auth/Cookie/conditional request/range/upgrade và response private/no-store,
-Set-Cookie, Vary, trailers, gRPC vẫn bypass theo policy cũ.
+Set-Cookie, Vary chưa khai báo, trailers, gRPC vẫn bypass theo policy cũ.
 
 Entry hết freshness có ETag hoặc Last-Modified được giữ thêm tối đa
 `revalidate_retention_seconds`. Request GET phù hợp gửi If-None-Match, ưu tiên
@@ -92,8 +97,33 @@ purge hoặc thay thế. Lease của response đang gửi tiếp tục được 
 
 `prostctl cache status` thêm `revalidations` và `stale_hits`; counters và nội
 dung cache không được lưu qua restart. Xem [cache-control.md](cache-control.md)
-cho key, inspection và purge. Chưa hỗ trợ cache disk, general Vary,
-stale-while-revalidate, hoặc request cache-control nâng cao.
+cho key, inspection và purge. Cache disk và request cache-control nâng cao vẫn
+ngoài phạm vi. Vary theo allow-list và stale-while-revalidate opt-in như bên dưới.
+
+## Vary và stale-while-revalidate
+
+```toml
+[upstreams.app.http.cache]
+vary_headers = ["accept-language"]
+stale_while_revalidate_seconds = 10
+max_background_refreshes = 4
+background_refresh_timeout_ms = 5000
+```
+
+Mặc định Vary vẫn bypass. Khi khai báo allow-list, key gồm mọi giá trị của từng
+header được cấu hình, giữ thứ tự các giá trị và phân biệt thiếu header; Vary `*`
+hoặc header ngoài allow-list luôn bypass. Không cho dùng Cookie/Authorization
+làm cách bật cache nội dung cá nhân. Accept-Encoding vẫn thuộc key như trước.
+CLI `cache key --vary-header accept-language=en` phải truyền đúng các header
+được cấu hình; dùng `--vary-header accept-language` cho trường hợp thiếu header.
+
+SWR chỉ chạy khi origin cũng cho `stale-while-revalidate=N`. Trong cửa sổ
+min(N, cấu hình), request nhận bản stale ngay; mỗi key có tối đa một background
+refresh, toàn cache bị giới hạn concurrency và deadline. Body refresh được đọc
+streaming trong object budget. Timeout/lỗi không kéo dài cửa sổ stale. Response
+private/no-store mới loại representation cũ. Purge chặn publication của refresh
+đã bắt đầu trước purge. Status có `background_refreshes` để quan sát số job sống.
+Revalidation đồng bộ mô tả phía trên vẫn áp dụng khi SWR không được bật.
 
 Thiết kế đối chiếu [HTTP caching RFC 9111](https://www.rfc-editor.org/rfc/rfc9111.html)
 và [stale-if-error RFC 5861](https://www.rfc-editor.org/rfc/rfc5861.html).

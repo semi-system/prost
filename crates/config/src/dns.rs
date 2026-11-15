@@ -7,6 +7,8 @@ pub struct DnsPolicy {
     pub timeout_ms: u64,
     pub max_hosts: usize,
     pub max_addresses: usize,
+    pub authoritative_ttl: bool,
+    pub nameservers: Vec<std::net::SocketAddr>,
 }
 impl Default for DnsPolicy {
     fn default() -> Self {
@@ -16,6 +18,8 @@ impl Default for DnsPolicy {
             timeout_ms: 2000,
             max_hosts: 1024,
             max_addresses: 32,
+            authoritative_ttl: false,
+            nameservers: Vec::new(),
         }
     }
 }
@@ -28,6 +32,10 @@ impl DnsPolicy {
                 && (1..=1024).contains(&self.max_hosts)
                 && (1..=64).contains(&self.max_addresses),
             "invalid DNS policy bounds"
+        );
+        ensure!(
+            self.nameservers.len() <= 8 && self.nameservers.iter().all(|a| a.port() != 0),
+            "invalid DNS nameservers"
         );
         Ok(())
     }

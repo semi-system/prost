@@ -40,6 +40,8 @@ jobs:
           # needs sudo for cgroup sampling and creates its own nested directory.
           mkdir -p test-results/advanced-ci
           sudo python3 scripts/mail-edge-soak.py --image prost:mvp --duration 180 --clients 2 --output-dir test-results/advanced-ci/mail-edge
+          docker build -t prost:mail-stress-backend benchmarks/mail-stress
+          sudo python3 scripts/mail-edge-soak.py --image prost:mvp --backend-image prost:mail-stress-backend --dns01 --duration 400 --clients 2 --stress --stress-connections 32 --stress-streams 2 --output-dir test-results/advanced-ci/mail-dns01
           python3 scripts/sni-smoke.py --image prost:mvp --output test-results/advanced-ci/sni-smoke.json
           docker tag prost:mvp prost:advanced-release
           python3 scripts/prepare-advanced-bench.py

@@ -105,6 +105,9 @@ enum Cache {
         host: Option<String>,
         #[arg(long)]
         accept_encoding: Vec<String>,
+        /// Variant header NAME=VALUE; NAME alone records an absent header.
+        #[arg(long)]
+        vary_header: Vec<String>,
     },
     #[command(group(clap::ArgGroup::new("cache_scope").args(["key","all"]).required(true)))]
     Purge {
@@ -298,13 +301,27 @@ async fn main() -> Result<()> {
                 uri,
                 host,
                 accept_encoding,
-            } => Command::CacheKey {
-                input: CacheKeyInput {
-                    uri,
-                    host,
-                    accept_encoding,
-                },
-            },
+                vary_header,
+            } => {
+                let mut vary_headers = std::collections::BTreeMap::<String, Vec<String>>::new();
+                for header in vary_header {
+                    let (name, value) = header
+                        .split_once('=')
+                        .map_or((header.as_str(), None), |(name, value)| (name, Some(value)));
+                    let values = vary_headers.entry(name.to_ascii_lowercase()).or_default();
+                    if let Some(value) = value {
+                        values.push(value.into());
+                    }
+                }
+                Command::CacheKey {
+                    input: CacheKeyInput {
+                        uri,
+                        host,
+                        accept_encoding,
+                        vary_headers,
+                    },
+                }
+            }
             Cache::Purge {
                 upstream,
                 key,
@@ -517,6 +534,7 @@ mod tests {
                     uri,
                     host,
                     accept_encoding,
+                    ..
                 },
         } = args.command
         else {

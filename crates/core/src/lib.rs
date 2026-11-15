@@ -1116,6 +1116,8 @@ impl RunningProxy {
         let next_generation = if rolling {
             let retiring = self.retiring.lock().unwrap().clone();
             if let Some(retiring) = retiring {
+                ensure!(retiring.finished.is_cancelled() || !retiring.unlimited(),
+                    "rolling_generation_busy: an unlimited-drain generation is still active; TLS-only updates remain available");
                 retiring.finished.cancelled().await;
                 self.retiring.lock().unwrap().take();
             }
@@ -1220,10 +1222,15 @@ impl RunningProxy {
         *self.retiring.lock().unwrap() = Some(generation.clone());
         let weak = Arc::downgrade(self);
         self.tasks.spawn(async move {
-            if tokio::time::timeout(generation.remaining(), generation.tasks.wait())
-                .await
-                .is_err()
-            {
+            let expired = if generation.unlimited() {
+                generation.tasks.wait().await;
+                false
+            } else {
+                tokio::time::timeout(generation.remaining(), generation.tasks.wait())
+                    .await
+                    .is_err()
+            };
+            if expired {
                 if let Some(p) = weak.upgrade() {
                     p.observed.worker_retirements[1].fetch_add(1, Ordering::Relaxed);
                     p.observed.worker_retirements[2].fetch_add(
@@ -1783,7 +1790,7 @@ impl RunningProxy {
                 } else { prost_http::forward(request,&u.targets[index],&u.config,client,permit,http_keepalive(snapshot.clone(),info,selection.lease),options).await }
             };
             let outcome = match forward.await {
-                Ok(v)=>v, Err(e)=>{if !e.downcast_ref::<prost_http::HttpFailure>().is_some_and(|e| e.is_client()) && !e.chain().any(|cause|cause.is::<prost_http::ProxyCapacity>()) {u.observed[index].error();u.health[index].passive_failure();} return Err(e);}
+                Ok(v)=>v, Err(e)=>{if !e.downcast_ref::<prost_http::HttpFailure>().is_some_and(|e| e.is_client()) && !prost_http::local_capacity_error(&e) {u.observed[index].error();u.health[index].passive_failure();} return Err(e);}
             };
             if let Some(status)=outcome.origin_status() {
                 u.observed[index].response(status);
@@ -1899,7 +1906,7 @@ impl RunningProxy {
                     return response;
                 }
                 self.metrics.errors.inc();
-                tracing::warn!(error=%e,"HTTP proxy error");
+                tracing::warn!(error=%format_args!("{e:#}"),"HTTP proxy error");
                 let mut response = prost_http::response(503, "upstream or plugin unavailable\n");
                 apply_local_headers(
                     &mut response,
@@ -1993,7 +2000,10 @@ impl RunningProxy {
         self.shutdown.cancel();
         self.bindings.lock().unwrap().clear();
         self.tasks.close();
-        let drain = self.snapshot().config.runtime.drain_seconds;
+        let drain = match self.snapshot().config.runtime.drain_seconds {
+            0 => 30,
+            value => value,
+        };
         if tokio::time::timeout(Duration::from_secs(drain), self.tasks.wait())
             .await
             .is_err()

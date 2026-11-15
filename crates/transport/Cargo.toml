@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
+hickory-resolver.workspace = true
 anyhow.workspace = true
 prost-config = { path = "../config" }
 rustls.workspace = true

@@ -10,13 +10,26 @@ pub struct CacheKeyInput {
     pub host: Option<String>,
     #[serde(default)]
     pub accept_encoding: Vec<String>,
+    #[serde(default)]
+    pub vary_headers: std::collections::BTreeMap<String, Vec<String>>,
 }
 pub fn cache_key(input: &CacheKeyInput) -> Result<String> {
     ensure!(
         input.uri.len() <= 32768
             && input.host.as_ref().is_none_or(|s| s.len() <= 32768)
             && input.accept_encoding.len() <= 16
-            && input.accept_encoding.iter().map(String::len).sum::<usize>() <= 32768,
+            && input.accept_encoding.iter().map(String::len).sum::<usize>() <= 32768
+            && input.vary_headers.len() <= 16
+            && input
+                .vary_headers
+                .iter()
+                .all(|(name, values)| name.len() <= 256 && values.len() <= 16)
+            && input
+                .vary_headers
+                .values()
+                .map(|v| v.iter().map(String::len).sum::<usize>())
+                .sum::<usize>()
+                <= 32768,
         "cache key input exceeds bounds"
     );
     let uri: Uri = input.uri.parse().context("invalid cache key URI")?;
@@ -39,8 +52,18 @@ pub fn cache_key(input: &CacheKeyInput) -> Result<String> {
             HeaderValue::from_bytes(value.as_bytes())?,
         );
     }
+    for (name, values) in &input.vary_headers {
+        let name = http::HeaderName::from_bytes(name.as_bytes())?;
+        for value in values {
+            request
+                .headers_mut()
+                .append(name.clone(), HeaderValue::from_str(value)?);
+        }
+    }
+    let names: Vec<_> = input.vary_headers.keys().cloned().collect();
     Ok(encode_key(
-        &crate::cache::Cache::key(&request).context("request is not cache-key eligible")?,
+        &crate::cache::Cache::key_with_vary(&request, &names)
+            .context("request is not cache-key eligible")?,
     ))
 }
 pub(crate) fn encode_key(key: &[u8; 32]) -> String {
@@ -104,6 +127,7 @@ pub struct CacheStatus {
     pub used_bytes: usize,
     pub entries: usize,
     pub active_captures: usize,
+    pub background_refreshes: usize,
     pub max_bytes: usize,
     pub max_entries: usize,
     pub max_object_bytes: usize,

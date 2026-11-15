@@ -9,6 +9,8 @@ challenge_address = "0.0.0.0:8088"
 renew_before_seconds = 2592000
 retry_seconds = 300
 order_timeout_seconds = 180
+readiness_min_validity_seconds = 60
+delivery_retry_seconds = 10
 
 [[certificates]]
 id = "edge"

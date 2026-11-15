@@ -1,4 +1,7 @@
-# Automatic HTTP-01 certificates
+# Automatic ACME certificates
+
+HTTP-01 is the default. [Certificate delivery and DNS-01](certificate-delivery.md)
+documents wildcard issuance, durable backend ACK/retry, readiness and expiry metrics.
 
 `prost-certd` is a separate native process in the same Baseless image. It owns
 the ACME account and private key store, serves HTTP-01 tokens on a private
@@ -69,14 +72,17 @@ configured backend containers. Install/adapt the three
 `/usr/local/sbin/prost-cert-notify`, the units to `/etc/systemd/system`, and
 replace container names and Docker data-root path. Enable the `.path` unit.
 Run the service once manually to synchronize an already-issued certificate.
-The backend must actually implement SIGHUP reload; inspect its logs and alert
+The backend must actually implement SIGHUP reload; configure fingerprint delivery
+targets and `--agent-container` in the notification script. The service retries
+until `prost-certd check --certificates` succeeds. Inspect its logs and alert
 on unit failures. No Docker socket is mounted inside the edge or agent.
 
 The certificate symlink is prepared before the edge transaction; the publication
 marker is emitted after commit. A backend reading files on demand can observe
 the new, validated cert before the edge does. Backend notifications are event
-delivery, not a distributed atomic transaction. A host crash or failed signal
-requires checking/replaying the notification; it does not roll back edge TLS.
+delivery, not a distributed atomic transaction. The optional private delivery
+outbox retries missing verified backend ACKs after a host/agent restart; it does
+not roll back edge TLS. Without configured targets, replay remains an operator duty.
 
 ## Metrics and tests
 

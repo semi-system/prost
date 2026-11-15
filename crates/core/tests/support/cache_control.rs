@@ -99,6 +99,7 @@ fn key(uri: &str, host: Option<&str>, encoding: Option<&str>) -> String {
         uri: uri.into(),
         host: host.map(str::to_owned),
         accept_encoding: encoding.map(|s| vec![s.into()]).unwrap_or_default(),
+        ..Default::default()
     })
     .unwrap()
 }

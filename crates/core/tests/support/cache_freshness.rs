@@ -73,10 +73,18 @@ async fn backend() -> Result<Backend> {
                                 entered.notify_one();
                                 release.notified().await;
                             }
+                            if path == "/swr" && version == 2 {
+                                entered.notify_one();
+                                release.notified().await;
+                            }
                             let control = if path == "/strict" {
                                 "public,max-age=2,must-revalidate,stale-if-error=10"
-                            } else if path == "/private" && version > 1 {
+                            } else if path == "/private" && version > 1
+                                || path == "/swr" && version > 2
+                            {
                                 "private,no-store"
+                            } else if path == "/swr" {
+                                "public,max-age=1,stale-while-revalidate=10"
                             } else {
                                 "public,max-age=2,stale-if-error=10"
                             };
@@ -115,6 +123,80 @@ async fn backend() -> Result<Backend> {
         entered,
         release,
     })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_h2_swr_serves_without_waiting_singleflight_purge_and_private_replacement() -> Result<()>
+{
+    for h2 in [false, true] {
+        let backend = backend().await?;
+        let mut f = Fixture::new(Protocol::Http, backend.server.address);
+        config(&mut f);
+        let upstream = f.config.upstreams.get_mut("main").unwrap();
+        upstream.http2 = h2;
+        let cache = upstream.http.as_mut().unwrap().cache.as_mut().unwrap();
+        cache.stale_while_revalidate_seconds = 10;
+        cache.max_background_refreshes = 1;
+        std::fs::write(&f.path, f.config.encode()?)?;
+        let p = f.start().await;
+        let client = client(h2);
+        body(&client, f.address(), "/swr", 200, "body-1").await?;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        backend.version.store(2, Ordering::Relaxed);
+        timeout(
+            Duration::from_secs(1),
+            body(&client, f.address(), "/swr", 200, "body-1"),
+        )
+        .await??;
+        timeout(Duration::from_secs(3), backend.entered.notified()).await?;
+        for _ in 0..5 {
+            body(&client, f.address(), "/swr", 200, "body-1").await?;
+        }
+        assert_eq!(
+            backend.requests.lock().unwrap().len(),
+            2,
+            "only one background refresh per key"
+        );
+        p.cache_purge("main".into(), None, true, 0).await?;
+        backend.release.notify_one();
+        for _ in 0..100 {
+            if p.cache_status(Some("main".into())).await?["caches"]["main"]["status"]
+                ["background_refreshes"]
+                == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            p.cache_status(Some("main".into())).await?["caches"]["main"]["status"]["entries"],
+            0,
+            "purge fences background publication"
+        );
+        backend.version.store(1, Ordering::Relaxed);
+        body(&client, f.address(), "/swr", 200, "body-1").await?;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        backend.version.store(3, Ordering::Relaxed);
+        body(&client, f.address(), "/swr", 200, "body-1").await?;
+        for _ in 0..100 {
+            let status = p.cache_status(Some("main".into())).await?;
+            if status["caches"]["main"]["status"]["entries"] == 0
+                && status["caches"]["main"]["status"]["background_refreshes"] == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        body(&client, f.address(), "/swr", 200, "body-3").await?;
+        let calls = backend.requests.lock().unwrap().len();
+        body(&client, f.address(), "/swr", 200, "body-3").await?;
+        assert_eq!(
+            backend.requests.lock().unwrap().len(),
+            calls + 1,
+            "private replacement cannot remain stale"
+        );
+        p.shutdown().await;
+    }
+    Ok(())
 }
 fn config(f: &mut Fixture) {
     f.config.upstreams.get_mut("main").unwrap().http = Some(prost_config::HttpPolicy {

@@ -15,6 +15,13 @@ io_workers = 2
 drain_seconds = 30
 ```
 
+Đặt `drain_seconds=0` để full rolling không cắt phiên TCP/WebSocket đang mở.
+Status trả `drain_unlimited=true` và `drain_remaining_ms=null` cho thế hệ đang
+drain vô hạn. Khi vẫn có retiring generation dạng này, full apply tiếp theo trả
+`rolling_generation_busy` thay vì giữ coordinator vô hạn. Chờ phiên cũ kết thúc
+rồi gửi lại với generation mới nhất. TLS-only reload không tạo thêm worker nên
+vẫn được phép. SIGTERM luôn có deadline; với giá trị 0, shutdown dùng 30 giây.
+
 ```sh
 prostctl validate --file candidate.toml
 prostctl reload --file candidate.toml --if-generation 12

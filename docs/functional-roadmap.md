@@ -9,23 +9,24 @@ kết luận và giới hạn đã ghi, không dùng để xác nhận chức n�
 | TLS passthrough chọn upstream theo SNI | Đã bổ sung | Exact/wildcard, strict/default, PROXY/mTLS, hot apply và restart đã test |
 | Quản trị native rate table | Đã bổ sung | list/show/clear với generation, giữ phiên đang chạy |
 | Routing HTTP theo method/header | Đã bổ sung | Method list, literal/prefix/regex/presence, thứ tự match và hot update |
-| DNS backend có TTL | Đã bổ sung | TTL cấu hình, negative cache, singleflight, nhiều IP, health và đổi pool khi tập IP đổi |
+| DNS backend có TTL | Đã bổ sung | TTL cấu hình/wire DNS, SRV priority/weight/port, negative cache, singleflight và đổi pool khi tập IP đổi |
 | Quản trị/invalidation cache | Đã bổ sung | Status/entries/key, purge exact/all theo upstream, epoch chặn fill cũ và giữ memory lease |
-| HTTP cache nâng cao | Đã bổ sung revalidation/stale | ETag/Last-Modified/304, stale-if-error có giới hạn, giữ purge barrier; general Vary còn thiếu |
+| HTTP cache nâng cao | Đã bổ sung | ETag/Last-Modified/304, stale-if-error, Vary allow-list, SWR singleflight/budget và purge barrier |
 | Rolling worker generation | Đã bổ sung | Prepare/readiness trước commit, clone socket, drain có deadline, tối đa hai thế hệ |
 | Chờ và quan sát rolling | Đã bổ sung | Runtime API `reload.wait`, CLI `reload --wait`/`workers wait`, connection/task/deadline và metrics |
 | TLS artifact URI/S3 | Đã bổ sung | File/HTTP(S)/SigV4 S3, versionId, staging và restart offline từ hash artifact |
 | Frontend TLS refresh giữ phiên | Đã bổ sung | `tls.reload`, generation CAS, persist/GC, không thay worker hoặc bắt đầu drain |
 | Health PROXY v2 LOCAL | Đã bổ sung | Command configurable, 16 byte/length 0; traffic giữ PROXY/IP thật; decoder độc lập đã kiểm tra |
 | Access/session log stdout | Đã bổ sung | Sink stdout, bounded queue, flush/reopen/shutdown; rootfs không cần writable cho log |
-| ACME/cert-sync và expiry metrics | Đã bổ sung | Agent HTTP-01, batch TLS API, shared volume/notification và expiry; cần soak đủ 24 giờ và kiểm chứng ứng dụng triển khai |
+| ACME/cert-sync và expiry metrics | Đã bổ sung | HTTP-01/DNS-01, wildcard, batch TLS API, outbox ACK/retry, readiness và expiry; cần soak đủ 24 giờ |
 
 Routing hiện tại kết hợp host/path prefix/method/header với priority. Native
 header/map/rewrite tiếp tục là filter sau khi đã chọn route.
-DNS dùng resolver hệ thống với TTL cache tùy cấu hình; chưa đọc authoritative
-DNS TTL hoặc SRV record. Cache có conditional revalidation và stale-on-error
-opt-in; vẫn bypass Vary và dữ liệu không phù hợp. Cache disk và
-stale-while-revalidate chưa triển khai.
+DNS có resolver hệ thống hoặc wire DNS với TTL trả lời và SRV opt-in. Cache có
+conditional revalidation, stale-on-error, Vary theo allow-list và background SWR
+có budget; vẫn bypass dữ liệu cá nhân và Vary ngoài allow-list. Cache disk chưa
+triển khai. Agent có HTTP-01/DNS-01, wildcard, readiness và outbox xác nhận cert
+backend; xem [certificate-delivery.md](certificate-delivery.md).
 
 Các mục này không có nghĩa phải triển khai mọi directive/module của Nginx mới
 chạy được MVP. Mỗi phần cần có schema rõ, hot apply/persistence tương ứng và

@@ -24,7 +24,7 @@ mod policy;
 mod proxy_protocol;
 mod retry;
 pub use client_hello::{ClientHelloGuard, InspectedHello};
-pub use dns::{DnsLookup, DnsResolver, LookupFuture};
+pub use dns::{dns_client, DnsLookup, DnsResolver, LookupFuture};
 pub use retry::{connect_tcp, connect_tcp_resolved, DialFailure};
 mod tls;
 pub use h2_headers::H2HeaderDeadline;

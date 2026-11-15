@@ -85,7 +85,7 @@ impl HttpResources {
             return None;
         }
         let cache = self.cache.as_ref()?;
-        let key = Cache::key(request)?;
+        let key = cache.variant_key(request)?;
         let (fresh, epoch) = cache.lookup(&key);
         fresh
             .or_else(|| cache.candidate(&key, epoch).and_then(|c| cache.stale(&c)))
@@ -107,7 +107,7 @@ impl HttpResources {
         let key = self
             .cache
             .as_ref()
-            .and_then(|_| empty.then(|| Cache::key(&request)).flatten());
+            .and_then(|cache| empty.then(|| cache.variant_key(&request)).flatten());
         let (fresh, epoch) = match (&self.cache, &key) {
             (Some(cache), Some(key)) => cache.lookup(key),
             _ => (None, 0),
@@ -143,6 +143,57 @@ impl HttpResources {
             (Some(cache), Some(key)) => cache.candidate(key, epoch),
             _ => None,
         };
+        if let (Some(cache), Some(candidate), Some(key)) = (&self.cache, &candidate, key) {
+            if let Some((hit, refresh)) = cache.swr(candidate) {
+                if let Some(refresh) = refresh {
+                    let cache = cache.clone();
+                    let target = target.clone();
+                    let upstream = upstream.clone();
+                    let client = client.clone();
+                    let mut next = Request::new(None);
+                    *next.method_mut() = request.method().clone();
+                    *next.uri_mut() = request.uri().clone();
+                    *next.version_mut() = request.version();
+                    *next.headers_mut() = request.headers().clone();
+                    let keepalive = keepalive.clone();
+                    let candidate = candidate.clone();
+                    tokio::spawn(async move {
+                        let _refresh = refresh;
+                        let _ = tokio::time::timeout(cache.refresh_timeout(), async {
+                            let mut outcome = crate::forward_inner(
+                                next,
+                                &target,
+                                &upstream,
+                                &client,
+                                None,
+                                keepalive,
+                                ForwardOptions::default(),
+                            )
+                            .await?;
+                            if outcome.response.status().as_u16() < 500 {
+                                cache.invalidate(&candidate);
+                            }
+                            cache.capture_at(key, epoch, &mut outcome.response);
+                            use http_body_util::BodyExt;
+                            let mut body = Box::pin(outcome.response.into_body());
+                            let mut bytes = 0;
+                            while let Some(frame) = body.frame().await {
+                                let frame = frame.map_err(anyhow::Error::from_boxed)?;
+                                if let Some(data) = frame.data_ref() {
+                                    bytes += data.len();
+                                    if bytes > cache.object_limit() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await;
+                    });
+                }
+                return Ok(cached(hit, keepalive, options));
+            }
+        }
         let conditional = match (&self.cache, &candidate) {
             (Some(cache), Some(candidate)) if cache.can_revalidate(candidate) => {
                 candidate.condition(request.headers_mut());
@@ -262,7 +313,7 @@ fn origin_error(error: &anyhow::Error) -> bool {
     !error
         .downcast_ref::<crate::HttpFailure>()
         .is_some_and(|e| e.is_client())
-        && !error.chain().any(|c| c.is::<crate::ProxyCapacity>())
+        && !crate::local_capacity_error(error)
 }
 pub struct CachedResponse(crate::cache::Hit);
 impl CachedResponse {
