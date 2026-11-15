@@ -158,20 +158,26 @@ Retry: prost_http_retry_attempts_total đếm lần bổ sung, không gồm lầ
 
 ## Soak local
 
-Build backend fixture một lần:
+Hướng dẫn image Baseless đã publish, chạy nền trên VM và các prerequisite:
+[vm-soak.md](vm-soak.md). Build backend fixture và chuẩn bị certificate một lần:
 
 ```sh
 sudo docker build -t prost:bundle-backend benchmarks/advanced
+docker pull python:3.13-alpine
+python3 scripts/prepare-advanced-bench.py
 sudo python3 scripts/soak.py --image prost:native --duration 60 --interval 5 \
   --output-dir test-results/soak-smoke
 sudo python3 scripts/soak.py --image prost:native --duration 86400 \
   --output-dir test-results/soak-24h
 ```
 
-H1 mixed workload có kiểm tra byte, H2/TLS probes, TCP session cũ qua apply,
+H1 mixed workload có kiểm tra byte, H2/TLS probes, TCP session cũ qua rolling reload,
 rotate log, artifact GC, RSS/FD/task/generation samples. Log giữ tối đa file hiện
 tại và một file rotated. Threshold là guard cho fixture, không chứng minh capacity
-production: RSS <192 MiB, FD/task <512, live generation <=8 khi có TCP giữ gen cũ.
+production: RSS <192 MiB, FD/task <512; mỗi reload đóng phiên TCP đã kiểm tra qua
+commit rồi chờ drain, yêu cầu 1 generation còn sống và 0 forced drain.
+H1 dùng connection mới, không retry lỗi; helper riêng rotate log cho image không
+có shell. Gate tài nguyên lấy mẫu sau drain, không đo mọi đỉnh tức thời.
 Cuối bài yêu cầu 0 connection, 1 generation và 0 traffic error.
 
 progress.json ghi starting/running/passed/failed; chỉ có summary.json sau khi đủ

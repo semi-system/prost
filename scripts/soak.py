@@ -1,6 +1,8 @@
-"""Bounded local Docker/WSL soak: mixed H1, periodic H2/TLS, live TCP, hot apply,
+"""Bounded local Docker/WSL soak: mixed H1, periodic H2/TLS, live TCP, rolling reload,
 log rotation and artifact GC. Launch with --duration 86400 for the full run.
 Creates and cleans only its UUID containers/network. No CI runner required.
+Requires Linux, Python 3.11+, h2load, root and a local cgroup-v2 Docker daemon.
+Diagnostic tools run in a separate helper, never inside the production image.
 """
 import argparse
 import asyncio
@@ -36,6 +38,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="prost:native")
     parser.add_argument("--backend-image", default="prost:bundle-backend")
+    parser.add_argument("--fixture-image", default="python:3.13-alpine")
     parser.add_argument("--cert-dir", type=Path, default=ROOT / "test-results/advanced-fixtures/certs")
     parser.add_argument("--duration", type=int, default=86400)
     parser.add_argument("--concurrency", type=int, default=16)
@@ -53,13 +56,15 @@ def main():
     certs = args.cert_dir.resolve()
     name = "prost-soak-" + uuid.uuid4().hex[:10]
     backend = name + "-backend"
+    monitor = name + "-monitor"
     seed = '''schema_version=1
 [runtime]
 admin_socket="/run/prost/admin.sock"
 artifact_dir="/var/lib/prost/artifacts"
 metrics_address="127.0.0.1:9090"
 io_workers=2
-drain_seconds=2
+reload_mode="rolling"
+drain_seconds=10
 observe_plugins=true
 [runtime.access_log]
 path="/var/lib/prost/access.jsonl"
@@ -145,7 +150,15 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
         return json.loads(run("docker", "exec", name, "prostctl", *command, capture_output=True, text=True).stdout)["result"]
 
     def metrics():
-        return run("nsenter", "--target", str(Container(name).pid), "--net", "curl", "-fsS", "http://127.0.0.1:9090/metrics", capture_output=True, text=True).stdout
+        return run("docker", "exec", monitor, "python", "-c",
+                   "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:9090/metrics',timeout=5).read().decode())",
+                   capture_output=True, text=True).stdout
+
+    def rotate_log():
+        # The production image is shellless. Both paths are in its data volume;
+        # the helper uses the same UID and atomically replaces one rotated file.
+        run("docker", "exec", monitor, "python", "-c",
+            "import os; os.replace('/var/lib/prost/access.jsonl','/var/lib/prost/access.jsonl.1')")
 
     def resources():
         sample = Container(name)
@@ -165,7 +178,7 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
         if args.edge_policies:
             stats.update({"host_denials": 0, "idle_reuses": 0})
         start = time.monotonic()
-        samples = []
+        peaks = {"rss_bytes": 0, "fds": 0, "live_generations": 0}
         failure = None
 
         async def worker(index):
@@ -178,17 +191,21 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
                         async with asyncio.timeout(10):
                             if writer is None:
                                 reader, writer = await asyncio.open_connection("127.0.0.1", http_port)
-                            writer.write(f"GET {path} HTTP/1.1\r\nHost: soak.local\r\n\r\n".encode())
+                            # A rolling reload may gracefully close an idle H1
+                            # keepalive connection. Use a fresh connection for
+                            # each load request so such closes are not retried
+                            # or misreported as lost in-flight requests.
+                            writer.write(f"GET {path} HTTP/1.1\r\nHost: soak.local\r\nConnection: close\r\n\r\n".encode())
                             await writer.drain()
                             status, body, close = await response(reader)
                             assert status == 200 and len(body) == size
                             assert body == (b"0123456789abcdef" * ((size + 15)//16))[:size]
                             stats["requests"] += 1
                             stats["response_body_bytes"] += len(body)
-                            if close:
-                                writer.close()
-                                await writer.wait_closed()
-                                writer = None
+                            assert close, "HTTP/1 close was not honored"
+                            writer.close()
+                            await writer.wait_closed()
+                            writer = None
                         await asyncio.sleep(args.pause_ms / 1000)
                         count += 1
                     except Exception:
@@ -224,16 +241,8 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
         if args.edge_policies:
             await edge_probe(idle=True)
         workers = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
-        # This TCP session deliberately retains generation zero across all applies.
-        tcp_reader, tcp_writer = await asyncio.open_connection("127.0.0.1", tcp_port)
+        tcp_writer = None
         try:
-            # Prime before the backend's initial 10s ReadHeaderTimeout. Subsequent
-            # requests reuse the established keepalive session across hot applies.
-            tcp_writer.write(b"GET /bytes/34 HTTP/1.1\r\nHost: soak.local\r\n\r\n")
-            await tcp_writer.drain()
-            status, body, _ = await asyncio.wait_for(response(tcp_reader), 5)
-            assert status == 200 and len(body) == 34
-            stats["tcp_probes"] += 1
             with (out / "samples.jsonl").open("w") as records:
                 cycle = 0
                 while time.monotonic() - start < args.duration and not stop.is_set():
@@ -244,22 +253,38 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
                             worker_task.result()
                     generation = stats["updates"]
                     (out / "candidate.toml").write_text(seed.replace('"GEN"', f'"{generation+1}"').replace("weight=1", f"weight={1+(generation%2)}"))
-                    await asyncio.to_thread(ctl, "apply", "--file", "/cases/candidate.toml", "--if-generation", str(generation))
+                    # Keep a TCP session alive across one commit, then release
+                    # it before the drain deadline and wait for the old worker.
+                    # Holding it across every reload would deliberately force
+                    # termination under the rolling lifecycle being tested.
+                    tcp_reader, tcp_writer = await asyncio.open_connection("127.0.0.1", tcp_port)
+
+                    async def tcp_probe():
+                        tcp_writer.write(b"GET /bytes/34 HTTP/1.1\r\nHost: soak.local\r\n\r\n")
+                        await tcp_writer.drain()
+                        status, body, close = await asyncio.wait_for(response(tcp_reader), 5)
+                        assert status == 200 and len(body) == 34 and not close
+                        stats["tcp_probes"] += 1
+
+                    await tcp_probe()
+                    result = await asyncio.to_thread(ctl, "reload", "--file", "/cases/candidate.toml", "--if-generation", str(generation))
+                    assert result["generation"] == generation + 1, result
                     stats["updates"] += 1
+                    await tcp_probe()
+                    tcp_writer.close()
+                    await tcp_writer.wait_closed()
+                    tcp_writer = None
+                    drained = await asyncio.to_thread(ctl, "workers", "wait", "--generation", str(generation+1), "--timeout", "20")
+                    assert drained["drained"] is True, drained
                     if args.edge_policies:
                         await edge_probe()
-                    tcp_writer.write(b"GET /bytes/34 HTTP/1.1\r\nHost: soak.local\r\n\r\n")
-                    await tcp_writer.drain()
-                    status, body, _ = await asyncio.wait_for(response(tcp_reader), 5)
-                    assert status == 200 and len(body) == 34
-                    stats["tcp_probes"] += 1
                     # Bounded H2/TLS probes also exercise compression negotiation.
                     probe = await asyncio.to_thread(run, "h2load", "-n", "100", "-c", "4", "-m", "4", "-H", "accept-encoding: gzip", f"https://127.0.0.1:{https_port}/bytes/65536", capture_output=True, text=True)
                     assert "100 succeeded, 0 failed, 0 errored, 0 timeout" in probe.stdout, probe.stdout
                     stats["h2_probes"] += 100
                     await asyncio.to_thread(ctl, "access-log", "flush", "--if-generation", str(generation+1))
                     # Keep one rotated file, so a day-long run has bounded log disk use.
-                    await asyncio.to_thread(run, "docker", "exec", name, "mv", "-f", "/var/lib/prost/access.jsonl", "/var/lib/prost/access.jsonl.1")
+                    await asyncio.to_thread(rotate_log)
                     await asyncio.to_thread(ctl, "access-log", "reopen", "--if-generation", str(generation+1))
                     if cycle % 6 == 0:
                         await asyncio.to_thread(ctl, "artifacts", "gc", "--delete", "--min-age-seconds", "0", "--if-generation", str(generation+1))
@@ -268,10 +293,14 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
                     sample.update({"elapsed_seconds": elapsed, "traffic": stats.copy()})
                     records.write(json.dumps(sample) + "\n")
                     records.flush()
-                    samples.append(sample)
+                    peaks["rss_bytes"] = max(peaks["rss_bytes"], sample["rss_bytes"])
+                    peaks["fds"] = max(peaks["fds"], sample["main_process_fds"])
+                    peaks["live_generations"] = max(peaks["live_generations"], sample["status"]["live_generations"])
                     assert sample["rss_bytes"] < 192*1024*1024, "RSS budget exceeded"
                     assert sample["main_process_fds"] < 512 and sample["tasks"] < 512, "FD/task budget exceeded"
-                    assert sample["status"]["live_generations"] <= 8, "old generation accumulation"
+                    assert sample["status"]["live_generations"] == 1, "old generation accumulation after drain"
+                    assert sample["status"]["worker_generations"]["retired_total"] == stats["updates"], "worker retirement did not complete"
+                    assert sample["status"]["worker_generations"]["forced_total"] == 0, "unexpected forced drain"
                     assert sample["status"]["access_log"]["writer_alive"] == 1
                     assert sample["status"]["access_log"]["io_errors"] == 0 and sample["status"]["access_log"]["dropped_queue_full"] == 0, "unexpected access log loss"
                     manifest.update({"state": "running", "elapsed_seconds": elapsed, "traffic": stats.copy(), "latest_resources": sample})
@@ -282,8 +311,9 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
             raise
         finally:
             stop.set()
-            tcp_writer.close()
-            await tcp_writer.wait_closed()
+            if tcp_writer:
+                tcp_writer.close()
+                await tcp_writer.wait_closed()
             await asyncio.gather(*workers, return_exceptions=True)
             await asyncio.sleep(2)
             final = await asyncio.to_thread(resources)
@@ -295,7 +325,7 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
                 cache_hits=re.search(r'prost_http_cache_hits_total\{upstream="web"\} (\d+)',final_metrics)
                 assert cache_hits and int(cache_hits[1])>0, "cache was not exercised"
                 assert time.monotonic() - start >= args.duration
-                manifest.update({"state": "passed", "elapsed_seconds": time.monotonic()-start, "traffic": stats.copy(), "final": final, "max_rss_mib": max(s["rss_bytes"] for s in samples)/1048576, "max_fds": max(s["main_process_fds"] for s in samples), "max_live_generations": max(s["status"]["live_generations"] for s in samples)})
+                manifest.update({"state": "passed", "elapsed_seconds": time.monotonic()-start, "traffic": stats.copy(), "final": final, "max_rss_mib": peaks["rss_bytes"]/1048576, "max_fds": peaks["fds"], "max_live_generations": peaks["live_generations"]})
                 save(out / "summary.json", manifest)
                 save(out / "progress.json", manifest)
                 print(json.dumps({k:manifest[k] for k in ("state","elapsed_seconds","traffic","max_rss_mib","max_fds","max_live_generations")},indent=2),flush=True)
@@ -315,6 +345,12 @@ config={max_connections=1000,window_ms=1000,max_keys=1024,expire_ms=30000}
         else:
             raise RuntimeError("proxy did not become ready")
         manifest["image_id"] = json.loads(run("docker", "inspect", name, capture_output=True, text=True).stdout)[0]["Image"]
+        created.append(monitor)
+        run("docker", "run", "-d", "--name", monitor, "--network", "container:"+name,
+            "--volumes-from", name, "--user", "10001:10001", "--memory", "64m", "--cpus", "0.25",
+            args.fixture_image, "python", "-c", "import signal; signal.pause()", stdout=subprocess.DEVNULL)
+        manifest["fixture_image_id"] = json.loads(run("docker", "inspect", monitor, capture_output=True, text=True).stdout)[0]["Image"]
+        manifest["backend_image_id"] = json.loads(run("docker", "inspect", backend, capture_output=True, text=True).stdout)[0]["Image"]
         asyncio.run(workload(published(8080), published(9000), published(8443)))
     except BaseException as error:
         manifest.update({"state":"failed","error":repr(error)})
