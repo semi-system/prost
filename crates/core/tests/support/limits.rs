@@ -306,6 +306,13 @@ async fn response_header_deadline_starts_after_upload_and_timeout_returns_504() 
     let u = f.config.upstreams.get_mut("main").unwrap();
     u.response_header_timeout_ms = Some(100);
     u.idle_timeout_ms = 50;
+    // Isolate header deadlines: the expected 504 must not eject the endpoint
+    // before the final request tests disabling the deadline. Otherwise that
+    // assertion races the next active-health probe and can return 503.
+    u.passive_health = Some(prost_config::PassiveHealth {
+        max_fails: 0,
+        ..Default::default()
+    });
     f.config.listeners[0].request_body_timeout_ms = Some(1000);
     std::fs::write(&f.path, f.config.encode()?)?;
     let p = f.start().await;
