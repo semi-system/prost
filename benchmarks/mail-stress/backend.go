@@ -312,9 +312,12 @@ func web(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Length", strconv.Itoa(size))
 		for size > 0 {
 			count := min(size, len(payload))
+			// Fixed 'x' bytes, no request data or HTML; binary MIME with nosniff.
+			// nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 			if _, err = w.Write(payload[:count]); err != nil {
 				return
 			}
