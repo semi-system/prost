@@ -36,6 +36,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nghttp2-client
+          # Keep the shared report parent owned by the runner. The mail soak
+          # needs sudo for cgroup sampling and creates its own nested directory.
+          mkdir -p test-results/advanced-ci
           sudo python3 scripts/mail-edge-soak.py --image prost:mvp --duration 180 --clients 2 --output-dir test-results/advanced-ci/mail-edge
           python3 scripts/sni-smoke.py --image prost:mvp --output test-results/advanced-ci/sni-smoke.json
           docker tag prost:mvp prost:advanced-release
