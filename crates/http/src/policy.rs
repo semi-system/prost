@@ -310,10 +310,7 @@ impl HttpResources {
     }
 }
 fn origin_error(error: &anyhow::Error) -> bool {
-    !error
-        .downcast_ref::<crate::HttpFailure>()
-        .is_some_and(|e| e.is_client())
-        && !crate::local_capacity_error(error)
+    crate::client_request_failure(error).is_none() && !crate::local_capacity_error(error)
 }
 pub struct CachedResponse(crate::cache::Hit);
 impl CachedResponse {

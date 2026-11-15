@@ -1790,7 +1790,7 @@ impl RunningProxy {
                 } else { prost_http::forward(request,&u.targets[index],&u.config,client,permit,http_keepalive(snapshot.clone(),info,selection.lease),options).await }
             };
             let outcome = match forward.await {
-                Ok(v)=>v, Err(e)=>{if !e.downcast_ref::<prost_http::HttpFailure>().is_some_and(|e| e.is_client()) && !prost_http::local_capacity_error(&e) {u.observed[index].error();u.health[index].passive_failure();} return Err(e);}
+                Ok(v)=>v, Err(e)=>{if prost_http::client_request_failure(&e).is_none() && !prost_http::local_capacity_error(&e) {u.observed[index].error();u.health[index].passive_failure();} return Err(e);}
             };
             if let Some(status)=outcome.origin_status() {
                 u.observed[index].response(status);
@@ -1848,7 +1848,9 @@ impl RunningProxy {
         match result {
             Ok(response) => response,
             Err(e) => {
-                if let Some(failure) = e.downcast_ref::<prost_http::HttpFailure>() {
+                if let Some(failure) = prost_http::client_request_failure(&e)
+                    .or_else(|| e.downcast_ref::<prost_http::HttpFailure>().copied())
+                {
                     if !failure.is_client() {
                         self.metrics.errors.inc();
                     }

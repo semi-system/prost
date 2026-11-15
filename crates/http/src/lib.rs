@@ -40,6 +40,16 @@ impl std::fmt::Display for ProxyCapacity {
     }
 }
 impl std::error::Error for ProxyCapacity {}
+/// Hyper wraps producer errors in its client error. Inspect the source chain,
+/// including the unconfigured upload path that has no UploadState allocation.
+pub fn client_request_failure(error: &anyhow::Error) -> Option<HttpFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<HttpFailure>()
+            .copied()
+            .filter(|failure| failure.is_client())
+    })
+}
 /// Local socket/resource exhaustion must not eject a healthy backend.
 pub fn local_capacity_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {

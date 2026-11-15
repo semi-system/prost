@@ -37,6 +37,47 @@ async fn upload_backend() -> Server {
     });
     Server { address, task }
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfigured_upload_cancellation_does_not_eject_healthy_backend() -> Result<()> {
+    let backend = upload_backend().await;
+    let mut f = Fixture::new(Protocol::Http, backend.address);
+    // No upload/header policy: exercise RequestBody::Plain, not Guarded.
+    f.config
+        .upstreams
+        .get_mut("main")
+        .unwrap()
+        .health_interval_ms = 60000;
+    std::fs::write(&f.path, f.config.encode()?)?;
+    let p = f.start().await;
+    let labels = [("upstream", "main"), ("endpoint", "one")];
+    let mut io = TcpStream::connect(f.address()).await?;
+    io.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\npartial")
+        .await?;
+    timeout(Duration::from_secs(2), async {
+        while metric(&p, "prost_upstream_selections_total", &labels) != Some(1.) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    io.shutdown().await?;
+    let mut discarded = Vec::new();
+    let _ = timeout(Duration::from_secs(2), io.read_to_end(&mut discarded)).await;
+    drop(io);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(p.status()["upstreams"]["main"][0]["healthy"], true);
+    assert_eq!(
+        metric(&p, "prost_upstream_passive_ejections_total", &labels).unwrap_or(0.),
+        0.
+    );
+    assert!(raw_response(
+        f.address(),
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .await?
+    .starts_with("HTTP/1.1 200"));
+    p.shutdown().await;
+    Ok(())
+}
 pub(super) async fn raw_response(address: SocketAddr, data: &[u8]) -> Result<String> {
     let mut io = TcpStream::connect(address).await?;
     io.write_all(data).await?;

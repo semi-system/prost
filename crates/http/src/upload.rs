@@ -188,7 +188,7 @@ impl Body for RequestBody {
             Self::Empty => Poll::Ready(None),
             Self::Plain(inner) => Pin::new(inner)
                 .poll_frame(cx)
-                .map(|f| f.map(|r| r.map_err(|e| Box::new(e) as Error))),
+                .map(|f| f.map(|r| r.map_err(|_| Box::new(HttpFailure::InvalidBody) as Error))),
             Self::Guarded(inner) => Pin::new(&mut **inner).poll_frame(cx),
         }
     }
