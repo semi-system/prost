@@ -35,9 +35,14 @@ response, inspect `status` and compare its generation/hash before retrying.
 Generation is persisted inside the config. Endpoint enable/disable updates the
 same durable config, not an independent volatile overlay.
 
-Existing TCP sessions and WebSocket tunnels retain their resources. HTTP reads
-the latest snapshot at the start of each request/HTTP2 stream. Response bodies
-retain the snapshot until completion or cancellation. Listener identity and
+The default rolling mode creates a ready worker generation before commit, then
+transfers accepts on duplicated listener FDs and drains the old generation.
+Connections retain their generation snapshot; HTTP/1 closes keepalive after the
+current response and HTTP/2 sends GOAWAY while draining streams. TCP/WebSocket
+sessions finish or reach the configured drain deadline. At most two worker
+generations coexist. These workers are threads/runtimes in the same process.
+Explicit `reload_mode="hot"` retains per-request/HTTP2-stream snapshot updates.
+See [rolling-updates.md](rolling-updates.md). Listener identity and
 protocol on an occupied address cannot change in place. Runtime settings require
 restart. TCP and HTTP listeners are separate; this version does not multiplex
 arbitrary protocols on the same port.
@@ -45,7 +50,8 @@ arbitrary protocols on the same port.
 ## HTTP and plugins
 
 Hyper forwards bodies incrementally with bounded protocol buffers. Upstream
-clients reuse pools when transport/client settings and endpoint identity are compatible. gRPC uses
+clients reuse compatible pools in hot mode; rolling mode creates fresh transport
+pools for each worker generation. gRPC uses
 explicit `http2 = true` on the upstream, including h2c. WebSocket supports the
 HTTP/1.1 upgrade handshake. CONNECT and RFC8441 extended CONNECT are outside MVP.
 The configured upstream idle timeout also bounds waiting for response headers;

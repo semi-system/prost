@@ -15,8 +15,7 @@ async fn host_acl_h1_h2_redirect_order_and_hot_update() -> Result<()> {
     std::fs::write(&f.path, f.config.encode()?)?;
     let p = f.start().await;
     let (mut h1, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(conn);
     for (host, path, status) in [
         ("PUBLIC.TEST:8080", "/", 200),
@@ -96,8 +95,7 @@ async fn h1_keepalive_is_longer_than_header_budget_and_closes_without_408() -> R
     std::fs::write(&f.path, f.config.encode()?)?;
     let p = f.start().await;
     let (mut client, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(conn);
     let request = || {
         Request::builder()
@@ -154,8 +152,7 @@ async fn idle_budget_does_not_cancel_h1_response_body_or_h2_connections() -> Res
             .unwrap()
     };
     let (mut h1, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(conn);
     assert_eq!(
         h1.send_request(request("/slow"))
@@ -411,7 +408,7 @@ async fn https_keepalive_reuses_beyond_header_budget_and_sends_clean_tls_close()
             TcpStream::connect(f.address()).await?,
         )
         .await?;
-    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     let request = || {
         Request::builder()

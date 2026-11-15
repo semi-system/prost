@@ -44,6 +44,21 @@ def wait_backend(label):
     raise AssertionError(f"backend did not become {label}")
 
 
+def restart():
+    subprocess.run([*compose, "restart", "prost"], check=True)
+    # Docker reporting "Started" does not mean the admin socket, listener and
+    # backend health probes are ready. Wait here; business assertions run once.
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            ctl("status")
+            http_status()
+            return
+        except (subprocess.CalledProcessError, OSError, ValueError):
+            time.sleep(0.1)
+    raise AssertionError("daemon did not become ready after restart")
+
+
 ctl("apply", "--file", "/examples/prost.toml")
 wait_backend("blue")
 ctl("validate", "--file", "/examples/native-headers.toml")
@@ -114,7 +129,7 @@ state = ctl("status")["result"]
 assert state["balancers"]["web"]["algorithm"] == "least_conn"
 assert state["balancers"]["sticky"]["hash_points"] == 320
 assert all(e["active"] == 0 for e in state["upstreams"]["web"])
-subprocess.run([*compose, "restart", "prost"], check=True)
+restart()
 assert [sticky(f"session-{i}") for i in range(32)] == owners
 ctl("validate", "--file", "/examples/upstream-capacity.toml")
 ctl("apply", "--file", "/examples/upstream-capacity.toml")
@@ -140,7 +155,7 @@ state = ctl("status")["result"]["upstreams"]["web"][0]
 assert not state["healthy"] and state["passive_health"]["ejected"]
 wait_backend("green")
 # A restart keeps the policy but resets observations, not a persistent admin disable.
-subprocess.run([*compose, "restart", "prost"], check=True)
+restart()
 wait_backend("blue")
 assert not ctl("status")["result"]["upstreams"]["web"][0]["passive_health"]["ejected"]
 ctl("apply", "--file", "/examples/prost.toml")
@@ -169,7 +184,7 @@ ctl("upstream", "enable", "web/green")
 wait_backend("green")
 
 generation = ctl("status")["generation"]
-subprocess.run([*compose, "restart", "prost"], check=True)
+restart()
 wait_backend("green")
 assert ctl("status")["generation"] == generation
 print("PASS: native headers/maps/conditions/rate limit/rewrite/redirect, least_conn/hash affinity/disable/restart, backup/capacity/passive health, HTTP, TCP, validate, atomic apply, live session")

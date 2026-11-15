@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::{net::SocketAddr, sync::Mutex, thread::JoinHandle, time::Duration};
+use std::{net::SocketAddr, os::fd::AsFd, sync::Mutex, thread::JoinHandle, time::Duration};
 use tokio::{net::TcpListener, runtime::Handle};
 use tokio_util::sync::CancellationToken;
 
@@ -8,7 +8,19 @@ pub(crate) struct Workers {
     stop: CancellationToken,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
-pub(crate) struct BoundListener(pub Vec<(Handle, TcpListener)>);
+pub(crate) struct BoundListener {
+    pub sockets: Vec<(Handle, TcpListener)>,
+    pub masters: Vec<std::net::TcpListener>,
+}
+impl BoundListener {
+    fn new(sockets: Vec<(Handle, TcpListener)>) -> Result<Self> {
+        let masters = sockets
+            .iter()
+            .map(|(_, s)| Ok(std::net::TcpListener::from(s.as_fd().try_clone_to_owned()?)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self { sockets, masters })
+    }
+}
 
 impl Workers {
     pub fn new(count: usize, latency: prometheus::Histogram) -> Result<Self> {
@@ -35,6 +47,7 @@ impl Workers {
                             super::local_metrics::flush();
                         });
                         runtime.shutdown_timeout(Duration::from_secs(1));
+                        super::local_metrics::flush();
                     },
                     Err(error)=>{let _=tx.send(Err(error.to_string()));}
                 }
@@ -50,6 +63,31 @@ impl Workers {
     }
     pub fn stop(&self) {
         self.stop.cancel();
+    }
+    pub async fn ready(&self) -> Result<()> {
+        for handle in &self.handles {
+            tokio::time::timeout(Duration::from_secs(3), handle.spawn(async {}))
+                .await
+                .context("worker readiness timeout")??;
+        }
+        Ok(())
+    }
+    pub fn attach(&self, masters: &[std::net::TcpListener]) -> Result<BoundListener> {
+        anyhow::ensure!(
+            masters.len() == self.handles.len(),
+            "listener worker count mismatch"
+        );
+        let sockets = self
+            .handles
+            .iter()
+            .zip(masters)
+            .map(|(handle, master)| {
+                let socket = master.try_clone()?;
+                let _guard = handle.enter();
+                Ok((handle.clone(), TcpListener::from_std(socket)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        BoundListener::new(sockets)
     }
     pub fn join(&self) {
         self.stop();
@@ -74,7 +112,7 @@ impl Workers {
             let listener = TcpListener::from_std(socket.into())?;
             sockets.push((handle.clone(), listener));
         }
-        Ok(BoundListener(sockets))
+        BoundListener::new(sockets)
     }
 }
 impl Drop for Workers {
@@ -86,9 +124,19 @@ impl Drop for Workers {
 pub(crate) async fn bind(address: SocketAddr, workers: Option<&Workers>) -> Result<BoundListener> {
     match workers {
         Some(workers) => workers.bind(address),
-        None => Ok(BoundListener(vec![(
-            Handle::current(),
-            TcpListener::bind(address).await?,
-        )])),
+        None => BoundListener::new(vec![(Handle::current(), TcpListener::bind(address).await?)]),
     }
+}
+pub(crate) fn attach(
+    masters: &[std::net::TcpListener],
+    workers: Option<&Workers>,
+) -> Result<BoundListener> {
+    if let Some(workers) = workers {
+        return workers.attach(masters);
+    }
+    anyhow::ensure!(masters.len() == 1, "shared runtime listener count mismatch");
+    BoundListener::new(vec![(
+        Handle::current(),
+        TcpListener::from_std(masters[0].try_clone()?)?,
+    )])
 }

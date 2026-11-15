@@ -123,6 +123,8 @@ config={response={set={x-policy-generation="0"}}}
         checks.append("scope/generation validation, exact purge preserves other variants and all purge invalidates lookup")
         (out/"candidate.toml").write_text(seed.replace('x-policy-generation="0"','x-policy-generation="1"'))
         ctl("apply","--file","/cases/candidate.toml","--if-generation","0")
+        # A rolling generation closes old keepalive after its current response.
+        frontend.close();frontend=connection(port)
         assert status()["epoch"]==2
         get(hit=True,generation="1");assert origin_count()==5
         ctl("cache","purge","web","--all","--if-generation","0",failure="generation_conflict")

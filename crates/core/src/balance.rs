@@ -588,7 +588,9 @@ mod tests {
             text+=&format!("[[upstreams.main.endpoints]]\nid=\"node-{i}\"\naddress=\"127.0.0.1:{}\"\nweight={weight}\n",20000+i);
         }
         text+="[[listeners]]\nid=\"http\"\naddress=\"127.0.0.1:18080\"\nprotocol=\"http\"\nupstream=\"main\"\n";
-        Config::parse(&text).unwrap()
+        let mut config = Config::parse(&text).unwrap();
+        config.runtime.reload_mode = prost_config::ReloadMode::Hot;
+        config
     }
     fn snapshot(config: Config, old: Option<&Snapshot>) -> Result<Snapshot> {
         prepare(config, &prost_plugin::PluginRegistry::new()?, old, 1)
@@ -596,6 +598,24 @@ mod tests {
     fn owner(u: &PreparedUpstream, key: u32) -> Result<String> {
         let selected = u.balancer.select(u, Key::tcp(IpAddr::V4(key.into())))?;
         Ok(u.config.endpoints[selected.index].id.clone())
+    }
+    #[tokio::test]
+    async fn rolling_replaces_transports_but_keeps_shared_endpoint_admission() -> Result<()> {
+        for algorithm in ["round_robin", "least_conn", "consistent_hash"] {
+            let mut config = config(algorithm, &[1]);
+            config.runtime.reload_mode = prost_config::ReloadMode::Rolling;
+            config.upstreams.get_mut("main").unwrap().endpoints[0].max_active = 1;
+            let first = snapshot(config, None)?;
+            let old = &first.upstreams["main"];
+            let held = old.balancer.select_tcp(old, "127.0.0.1".parse()?)?;
+            let second = snapshot(first.config.clone(), Some(&first))?;
+            let new = &second.upstreams["main"];
+            assert!(!Arc::ptr_eq(&old.client, &new.client));
+            assert!(new.balancer.select_tcp(new, "127.0.0.1".parse()?).is_err());
+            drop(held);
+            assert!(new.balancer.select_tcp(new, "127.0.0.1".parse()?).is_ok());
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn passive_policy_validation_mask_and_compatible_health_copy() -> Result<()> {

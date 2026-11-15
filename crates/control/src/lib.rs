@@ -43,6 +43,11 @@ pub enum Command {
         expected_generation: u64,
     },
     Status,
+    #[serde(rename = "reload.wait")]
+    WaitWorkers {
+        generation: u64,
+        timeout_ms: u64,
+    },
     #[serde(rename = "config.export")]
     Export,
     #[serde(rename = "cache.status")]
@@ -228,17 +233,23 @@ impl ControlServer {
         let token = cancel.clone();
         let tracker = tasks.clone();
         let capacity = Arc::new(Semaphore::new(32));
+        let wait_capacity = Arc::new(Semaphore::new(8));
         tasks.spawn(async move {
             loop {
                 let accepted=tokio::select!{_=token.cancelled()=>break,a=listener.accept()=>a};
                 let Ok((mut io,_))=accepted else {continue};
                 let Ok(permit)=capacity.clone().try_acquire_owned() else {continue};
-                let p=proxy.clone();let token=token.clone();
+                let p=proxy.clone();let token=token.clone();let wait_capacity=wait_capacity.clone();
                 tracker.spawn(async move {
                     let _permit=permit;
                     let work=async {
                         let req:Request=tokio::time::timeout(Duration::from_secs(10),read_frame(&mut io)).await??;
-                        let response=dispatch(p,req).await;
+                        let response=if matches!(&req.command,Command::WaitWorkers {..}) {
+                            tokio::select! {
+                                response=dispatch(p,req,wait_capacity)=>response,
+                                _=io.read_u8()=>anyhow::bail!("worker wait client disconnected or sent unexpected data"),
+                            }
+                        } else {dispatch(p,req,wait_capacity).await};
                         tokio::time::timeout(Duration::from_secs(10),write_frame(&mut io,&response)).await??;
                         Ok::<_,anyhow::Error>(())
                     };
@@ -259,11 +270,19 @@ impl ControlServer {
         let _ = std::fs::remove_file(self.path);
     }
 }
-async fn dispatch(proxy: Arc<RunningProxy>, request: Request) -> Response {
+async fn dispatch(
+    proxy: Arc<RunningProxy>,
+    request: Request,
+    wait_capacity: Arc<Semaphore>,
+) -> Response {
     let result = async {
         ensure!(request.version == 1, "unsupported_api_version");
         match request.command {
             Command::Status => Ok(proxy.status()),
+            Command::WaitWorkers {generation,timeout_ms} => {
+                let _permit=wait_capacity.try_acquire().context("too_many_worker_waiters")?;
+                proxy.wait_for_workers(generation,timeout_ms).await
+            },
             Command::Export => Ok(json!({"config":proxy.snapshot().config.encode()?})),
             Command::CacheStatus {upstream}=>proxy.cache_status(upstream).await,
             Command::CacheEntries {upstream,query}=>proxy.cache_entries(upstream,query).await,
@@ -347,6 +366,12 @@ async fn dispatch(proxy: Arc<RunningProxy>, request: Request) -> Response {
                 "generation_conflict"
             } else if message.contains("unsupported_api_version") {
                 "unsupported_api_version"
+            } else if message.contains("worker_drain_timeout") {
+                "worker_drain_timeout"
+            } else if message.contains("generation_not_committed") {
+                "generation_not_committed"
+            } else if message.contains("too_many_worker_waiters") {
+                "busy"
             } else {
                 "invalid_or_unavailable"
             };

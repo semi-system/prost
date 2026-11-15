@@ -1,0 +1,28 @@
+schema_version = 1
+
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+reload_mode = "rolling"
+io_workers = 2
+drain_seconds = 30
+
+[runtime.s3]
+region = "ap-southeast-1"
+# endpoint = "https://objects.example.com"
+# force_path_style = true
+# ca_certificate = "file:///etc/prost/objects-ca.pem"
+
+[[upstreams.mail.endpoints]]
+id = "imap"
+address = "127.0.0.1:1143"
+
+[[listeners]]
+id = "imaps"
+address = "0.0.0.0:993"
+protocol = "tcp"
+upstream = "mail"
+
+[listeners.tls]
+certificate = "s3://proxy-certs/mail/fullchain.pem"
+private_key = "s3://proxy-certs/mail/privkey.pem"

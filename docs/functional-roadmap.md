@@ -12,6 +12,9 @@ kết luận và giới hạn đã ghi, không dùng để xác nhận chức n�
 | DNS backend có TTL | Đã bổ sung | TTL cấu hình, negative cache, singleflight, nhiều IP, health và đổi pool khi tập IP đổi |
 | Quản trị/invalidation cache | Đã bổ sung | Status/entries/key, purge exact/all theo upstream, epoch chặn fill cũ và giữ memory lease |
 | HTTP cache nâng cao | Đã bổ sung revalidation/stale | ETag/Last-Modified/304, stale-if-error có giới hạn, giữ purge barrier; general Vary còn thiếu |
+| Rolling worker generation | Đã bổ sung | Prepare/readiness trước commit, clone socket, drain có deadline, tối đa hai thế hệ |
+| Chờ và quan sát rolling | Đã bổ sung | Runtime API `reload.wait`, CLI `reload --wait`/`workers wait`, connection/task/deadline và metrics |
+| TLS artifact URI/S3 | Đã bổ sung | File/HTTP(S)/SigV4 S3, versionId, staging và restart offline từ hash artifact |
 
 Routing hiện tại kết hợp host/path prefix/method/header với priority. Native
 header/map/rewrite tiếp tục là filter sau khi đã chọn route.

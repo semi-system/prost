@@ -156,11 +156,15 @@ upstream="tcp"
         # then recover using the committed hostname.
         candidate=seed.replace("moving.test:8080","unresolved.invalid:8080")
         (out/"candidate.toml").write_text(candidate); ctl("apply","--file","/cases/candidate.toml","--if-generation","0")
+        # Rolling reload drains the previous HTTP connection. Test the new
+        # generation on a fresh connection, as clients must after GOAWAY/close.
+        front.close(); front=connect(port(info,8080))
         front.request("GET","/label"); bad=front.getresponse(); assert bad.status==503; bad.read()
         map_host(ip_a)
         ctl("apply","--file","/cases/seed.toml","--if-generation","1")
+        front.close(); front=connect(port(info,8080))
         get(front,"/label",b"a")
-        checks.append("negative DNS/bad address fails boundedly; hot apply recovers without worker replacement")
+        checks.append("negative DNS/bad address fails boundedly; rolling apply recovers on a fresh client connection")
         for path in ["/cache/etag","/cache/lm","/cache/strict"]: get(front,path,b"body-1")
         count=len(calls(origin)); get(front,"/cache/etag",b"body-1"); assert len(calls(origin))==count
         time.sleep(2.1)

@@ -1,5 +1,13 @@
 # Prost
 
+Reload mặc định rolling worker, validate tuần tự và drain thế hệ cũ:
+[docs/rolling-updates.md](docs/rolling-updates.md).
+`prostctl reload --wait` và `prostctl workers wait` chờ drain qua Unix socket,
+không polling; status/Prometheus có số connection và thời hạn drain.
+TLS artifact từ đường dẫn, `file://`, HTTP(S), presigned URL hoặc `s3://` có SigV4:
+[docs/tls-sources.md](docs/tls-sources.md).
+Kiểm chứng local trên image release: [docs/rolling-validation.md](docs/rolling-validation.md).
+
 DNS backend có TTL/negative TTL và cache ETag/Last-Modified, stale-on-error:
 [docs/dns-cache.md](docs/dns-cache.md).
 
@@ -9,7 +17,7 @@ sau purge: [docs/cache-control.md](docs/cache-control.md).
 Routing HTTP theo method/header và ví dụ SNI default backend:
 [docs/http-routing.md](docs/http-routing.md).
 
-TLS passthrough chọn backend theo SNI, exact/wildcard và hot update:
+TLS passthrough chọn backend theo SNI, exact/wildcard và cập nhật qua Runtime API:
 [docs/passthrough-routing.md](docs/passthrough-routing.md).
 Các phần chức năng còn lại: [docs/functional-roadmap.md](docs/functional-roadmap.md).
 
@@ -41,7 +49,7 @@ Streaming body limits, granular HTTP timeouts và ví dụ cấu hình:
 Kết quả đo: [docs/http-limits-benchmark.md](docs/http-limits-benchmark.md).
 
 MVP reverse proxy L4/L7 bằng Rust cho Linux. Cập nhật config bằng **Unix socket +
-`prostctl`**, không polling, không watcher, không restart worker.
+`prostctl`**, không polling, không watcher; rolling worker mặc định.
 
 Đã triển khai TCP relay, TLS hai phía, HTTP/1.1–HTTP/2, HTTPS, WebSocket,
 gRPC streaming/trailers, weighted round-robin/least-conn/consistent hash, TCP/TLS/HTTP health check, cấu hình
@@ -50,7 +58,7 @@ ACL và rate limit toàn cục/theo IP/header. WASM là feature tùy chọn, m�
 Native rewrite path/query và redirect có điều kiện: [docs/rewrite.md](docs/rewrite.md).
 So sánh rewrite với nginx và kiểm tra regression:
 [docs/rewrite-benchmark.md](docs/rewrite-benchmark.md).
-TLS hỗ trợ nhiều certificate theo SNI, exact/wildcard và hot rotate:
+TLS hỗ trợ nhiều certificate theo SNI, exact/wildcard và rotate qua Runtime API:
 [docs/tls-sni.md](docs/tls-sni.md).
 Cấu hình, vòng đời active load và affinity: [docs/load-balancing.md](docs/load-balancing.md).
 Backend dự phòng và giới hạn request/stream/session trên từng endpoint:
@@ -75,6 +83,8 @@ push lên nhánh mặc định publish `ghcr.io/semi-system/prost:latest` và
 `packages: write`, không cần PAT riêng. Image là Linux amd64, WASM tắt mặc định.
 Semgrep/Trivy giữ gate strict, kể cả CVE chưa có bản vá; findings sẽ chặn publish.
 Report được lưu trong artifact `image-security-reports` của workflow.
+Chạy image đã publish trên VM Linux và giữ state qua restart:
+[docs/vm-soak.md](docs/vm-soak.md).
 
 Cần Docker Engine chạy trong WSL Ubuntu và Docker Compose v2 để chạy demo.
 Không cần cài Rust trên Windows.

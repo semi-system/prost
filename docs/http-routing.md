@@ -79,7 +79,10 @@ route index đều dùng cùng predicate; bật access log không làm đổi k�
 Apply compile matcher trước persistence/publish. Regex sai hoặc vượt budget,
 schema sai, header/method không hợp lệ giữ config và generation cũ. Request đang
 upload/download giữ snapshot/route/body limit đã chụp; request hoặc H2 stream mới
-trên connection hiện có nhận matcher mới sau commit. Config persist/restart giữ
+trên connection hiện có nhận matcher mới sau commit khi `reload_mode="hot"`.
+Mặc định rolling giữ snapshot theo connection và drain thế hệ cũ; client mở
+connection mới để nhận matcher mới: [rolling-updates.md](rolling-updates.md).
+Config persist/restart giữ
 method/header rules. Route plugin state giữ lại khi identity host/path/priority/
 method/header không đổi; đổi matcher được xem là thay identity route, tương tự
 đổi host/path trước đây.

@@ -57,6 +57,11 @@ impl ServerTls {
             !self.certificate.as_os_str().is_empty() && !self.private_key.as_os_str().is_empty(),
             "default TLS certificate and private_key are required"
         );
+        super::TlsSource::parse(&self.certificate)?;
+        super::TlsSource::parse(&self.private_key)?;
+        if let Some(ca) = &self.client_ca {
+            super::TlsSource::parse(ca)?;
+        }
         ensure!(
             self.certificates.len() <= 64,
             "at most 64 SNI certificate bundles per listener"
@@ -76,6 +81,8 @@ impl ServerTls {
                     && !cert.private_key.as_os_str().is_empty(),
                 "SNI certificate and private_key are required"
             );
+            super::TlsSource::parse(&cert.certificate)?;
+            super::TlsSource::parse(&cert.private_key)?;
             for name in &cert.server_names {
                 ensure!(
                     names.insert(Self::normalize_name(name)?),

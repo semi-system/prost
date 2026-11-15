@@ -6,6 +6,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub fn hash(bytes: &[u8]) -> String {
@@ -110,28 +111,48 @@ fn read_artifact(path: &Path, managed: bool) -> Result<Vec<u8>> {
     anyhow::ensure!(bytes.len() as u64 <= LIMIT, "artifact exceeds 16 MiB");
     Ok(bytes)
 }
-fn artifact(path: &mut PathBuf, dir: &Path) -> Result<()> {
-    let managed = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(artifacts::is_hash)
-        && fs::canonicalize(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new(".")),
-        )? == dir;
-    let bytes = read_artifact(path, managed)?;
+fn artifact(path: &mut PathBuf, dir: &Path, fetcher: Option<&mut fetch::Fetcher>) -> Result<()> {
+    let source = if fetcher.is_some() {
+        prost_config::TlsSource::parse(path)?
+    } else {
+        prost_config::TlsSource::File(path.clone())
+    };
+    let local = match &source {
+        prost_config::TlsSource::File(p) => Some(p.clone()),
+        _ => None,
+    };
+    let managed = local.as_ref().is_some_and(|path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(artifacts::is_hash)
+    }) && fs::canonicalize(
+        local
+            .as_ref()
+            .unwrap()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )? == dir;
+    let bytes = match source {
+        prost_config::TlsSource::File(path) => Arc::new(read_artifact(&path, managed)?),
+        prost_config::TlsSource::Remote(url) => fetcher
+            .context("remote source is only supported for TLS")?
+            .get(url.as_str())?,
+        prost_config::TlsSource::S3(_) => fetcher
+            .context("S3 source is only supported for TLS")?
+            .get(path.to_str().context("invalid S3 URI")?)?,
+    };
     let digest = hash(&bytes);
     if managed {
         anyhow::ensure!(
-            path.file_name().and_then(|n| n.to_str()) == Some(digest.as_str()),
+            local.as_ref().unwrap().file_name().and_then(|n| n.to_str()) == Some(digest.as_str()),
             "managed artifact hash mismatch"
         );
     }
     let destination = dir.join(digest);
     if fs::symlink_metadata(&destination).is_ok() {
         anyhow::ensure!(
-            read_artifact(&destination, true)? == bytes,
+            read_artifact(&destination, true)?.as_slice() == bytes.as_slice(),
             "artifact hash collision or corruption"
         );
     } else {
@@ -151,34 +172,49 @@ pub fn stage(mut c: Config, store: &ArtifactStore) -> Result<Config> {
     }
     store.verify()?;
     let dir = &store.path;
+    if let Some(ca) = c
+        .runtime
+        .s3
+        .as_mut()
+        .and_then(|s| s.ca_certificate.as_mut())
+    {
+        artifact(ca, dir, Some(&mut fetch::Fetcher::default()))?;
+        prost_transport::client_tls(Some(&prost_config::ClientTls {
+            policy: None,
+            server_name: "source".into(),
+            ca_certificate: Some(ca.clone()),
+            identity: None,
+        }))?;
+    }
+    let mut fetcher = fetch::Fetcher::new(c.runtime.s3.clone().unwrap_or_default());
     for u in c.upstreams.values_mut() {
         if let Some(tls) = &mut u.health_check.tls {
             if let Some(path) = &mut tls.ca_certificate {
-                artifact(path, dir)?;
+                artifact(path, dir, Some(&mut fetcher))?;
             }
             if let Some(id) = &mut tls.identity {
-                artifact(&mut id.certificate, dir)?;
-                artifact(&mut id.private_key, dir)?;
+                artifact(&mut id.certificate, dir, Some(&mut fetcher))?;
+                artifact(&mut id.private_key, dir, Some(&mut fetcher))?;
             }
         }
         if let Some(id) = u.tls.as_mut().and_then(|t| t.identity.as_mut()) {
-            artifact(&mut id.certificate, dir)?;
-            artifact(&mut id.private_key, dir)?;
+            artifact(&mut id.certificate, dir, Some(&mut fetcher))?;
+            artifact(&mut id.private_key, dir, Some(&mut fetcher))?;
         }
         if let Some(path) = u.tls.as_mut().and_then(|t| t.ca_certificate.as_mut()) {
-            artifact(path, dir)?;
+            artifact(path, dir, Some(&mut fetcher))?;
         }
     }
     for l in &mut c.listeners {
         if let Some(tls) = &mut l.tls {
             if let Some(path) = &mut tls.client_ca {
-                artifact(path, dir)?;
+                artifact(path, dir, Some(&mut fetcher))?;
             }
-            artifact(&mut tls.certificate, dir)?;
-            artifact(&mut tls.private_key, dir)?;
+            artifact(&mut tls.certificate, dir, Some(&mut fetcher))?;
+            artifact(&mut tls.private_key, dir, Some(&mut fetcher))?;
             for cert in &mut tls.certificates {
-                artifact(&mut cert.certificate, dir)?;
-                artifact(&mut cert.private_key, dir)?;
+                artifact(&mut cert.certificate, dir, Some(&mut fetcher))?;
+                artifact(&mut cert.private_key, dir, Some(&mut fetcher))?;
             }
         }
         for p in l
@@ -187,7 +223,7 @@ pub fn stage(mut c: Config, store: &ArtifactStore) -> Result<Config> {
             .chain(l.routes.iter_mut().flat_map(|r| r.plugins.iter_mut()))
         {
             if let Some(path) = &mut p.module {
-                artifact(path, dir)?;
+                artifact(path, dir, None)?;
             }
         }
     }
@@ -196,12 +232,40 @@ pub fn stage(mut c: Config, store: &ArtifactStore) -> Result<Config> {
 }
 
 mod artifacts;
+mod fetch;
 pub(crate) use artifacts::references;
 pub use artifacts::{ArtifactStore, GcOptions, GcReport};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn s3_ca_is_staged_protected_and_usable_without_the_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ca = dir.path().join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        fs::write(&ca, cert.cert.pem())?;
+        let store = ArtifactStore::open(&dir.path().join("store"))?;
+        let mut config = Config::parse("schema_version=1\nlisteners=[]\n[upstreams]\n")?;
+        config.runtime.s3 = Some(prost_config::S3Config {
+            ca_certificate: Some(format!("file://{}", ca.display()).into()),
+            ..Default::default()
+        });
+        let staged = stage(config, &store)?;
+        let held = staged
+            .runtime
+            .s3
+            .as_ref()
+            .unwrap()
+            .ca_certificate
+            .as_ref()
+            .unwrap();
+        assert!(held.starts_with(&store.path));
+        assert!(references(&staged).contains(held.file_name().unwrap()));
+        fs::remove_file(ca)?;
+        stage(staged, &store)?;
+        Ok(())
+    }
     #[test]
     fn bounded_artifact_reads_and_managed_symlinks() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -240,7 +304,7 @@ mod tests {
         let store = ArtifactStore::open(&dir.path().join("store"))?;
         let mut path = store.path.join(hash(b"original"));
         fs::write(&path, b"corrupted")?;
-        assert!(artifact(&mut path, &store.path)
+        assert!(artifact(&mut path, &store.path, None)
             .unwrap_err()
             .to_string()
             .contains("hash mismatch"));

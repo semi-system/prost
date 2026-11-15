@@ -44,8 +44,8 @@ impl Endpoint {
     }
     #[inline]
     fn increment(&self, counter: &AtomicU64) {
-        // A worker-local runtime has exactly one writer for its slot. Scrapes
-        // only load these atomics; shared-runtime callers retain atomic RMW.
+        // Hot worker-local runtimes have exactly one writer per slot. Rolling
+        // generations overlap and share endpoint stats, so they use atomic RMW.
         if self.single_writer {
             counter.store(
                 counter.load(Ordering::Relaxed).wrapping_add(1),
@@ -97,6 +97,7 @@ pub(crate) struct Runtime {
     pub h2_write_timeouts: Arc<AtomicU64>,
     pub tls: [AtomicU64; 5], // success, error, timeout, rejected, cancelled
     pub transactions: [[AtomicU64; 5]; 3], // apply, patch, validate
+    pub worker_retirements: [AtomicU64; 3], // retired, forced generations, forced connections
 }
 pub(crate) struct Handshake<'a> {
     runtime: &'a Runtime,
@@ -527,6 +528,42 @@ const DEFINITIONS: &[Definition] = &[
         "prost_config_generation",
         "Currently published generation",
         MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_worker_generations_live",
+        "Active and retiring worker/listener generations",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_worker_retiring_connections",
+        "Connections retained by the draining generation",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_worker_drain_remaining_seconds",
+        "Remaining drain deadline for the retiring generation",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_worker_generations_retired_total",
+        "Worker generations fully stopped and joined",
+        MetricType::COUNTER,
+        &[],
+    ),
+    (
+        "prost_worker_generations_forced_total",
+        "Worker generations that reached the drain deadline",
+        MetricType::COUNTER,
+        &[],
+    ),
+    (
+        "prost_worker_connections_forced_total",
+        "Connections present when a generation reached its drain deadline",
+        MetricType::COUNTER,
         &[],
     ),
     (
@@ -974,6 +1011,45 @@ impl Collector for Exporter {
             snapshot.config.generation as f64,
         );
         emit("prost_live_generations", &[], live.len() as f64);
+        let retiring = p
+            .retiring
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|g| !g.finished.is_cancelled());
+        emit(
+            "prost_worker_generations_live",
+            &[],
+            if retiring.is_some() { 2. } else { 1. },
+        );
+        emit(
+            "prost_worker_retiring_connections",
+            &[],
+            retiring
+                .as_ref()
+                .map_or(0, |g| g.connections.load(Ordering::Relaxed)) as f64,
+        );
+        emit(
+            "prost_worker_drain_remaining_seconds",
+            &[],
+            retiring
+                .as_ref()
+                .map_or(0., |g| g.remaining().as_secs_f64()),
+        );
+        for (index, name) in [
+            "prost_worker_generations_retired_total",
+            "prost_worker_generations_forced_total",
+            "prost_worker_connections_forced_total",
+        ]
+        .iter()
+        .enumerate()
+        {
+            emit(
+                name,
+                &[],
+                p.observed.worker_retirements[index].load(Ordering::Relaxed) as f64,
+            );
+        }
         emit("prost_snapshot_http_client_pools", &[], pools.len() as f64);
         emit("prost_snapshot_http_worker_clients", &[], clients as f64);
         emit(
@@ -1022,6 +1098,42 @@ impl Collector for Exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn rolling_generations_share_counters_without_losing_updates() -> anyhow::Result<()> {
+        let mut config = prost_config::Config::parse(
+            "schema_version=1\n[[upstreams.main.endpoints]]\nid='one'\naddress='127.0.0.1:19000'\n[[listeners]]\nid='web'\naddress='127.0.0.1:18000'\nprotocol='http'\nupstream='main'\n",
+        )?;
+        assert_eq!(
+            config.runtime.reload_mode,
+            prost_config::ReloadMode::Rolling
+        );
+        let registry = prost_plugin::PluginRegistry::new()?;
+        let first = crate::prepare(config.clone(), &registry, None, 1)?;
+        config.generation = 1;
+        let next = crate::prepare(config, &registry, Some(&first), 1)?;
+        let old = &first.upstreams["main"].observed[0];
+        let new = &next.upstreams["main"].observed[0];
+        assert!(Arc::ptr_eq(old, new));
+        assert!(!old.single_writer);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let endpoint = if index % 2 == 0 { old } else { new };
+                scope.spawn(move || {
+                    prost_http::set_worker_slot(0);
+                    for _ in 0..20000 {
+                        endpoint.selected();
+                        endpoint.response(200);
+                        endpoint.error();
+                    }
+                });
+            }
+        });
+        let slot = &new.slots[0];
+        assert_eq!(slot.selected.load(Ordering::Relaxed), 160000);
+        assert_eq!(slot.responses[1].load(Ordering::Relaxed), 160000);
+        assert_eq!(slot.errors.load(Ordering::Relaxed), 160000);
+        Ok(())
+    }
     #[test]
     fn worker_local_and_shared_counters_are_exact() {
         let local = Arc::new(Endpoint::new(2, true));

@@ -37,7 +37,9 @@ cũ. HTTP PROXY v2 vẫn có pool riêng theo frontend và cũng theo DNS revisi
 Đổi IP có thể làm mất các idle connection của endpoint khác cùng upstream;
 đây là lựa chọn bảo thủ cho vòng đời pool hiện tại.
 
-Hot apply thay DNS policy tạo resolver/pool mới; apply tương thích giữ state.
+Apply thay DNS policy tạo resolver/pool mới; apply tương thích giữ resolver state.
+Mặc định rolling luôn tạo transport pool mới cho worker generation mới;
+`reload_mode="hot"` có thể giữ pool tương thích. Xem [rolling-updates.md](rolling-updates.md).
 Policy được commit bền vững cùng config; answer/negative cache là RAM state,
 khởi tạo lại sau restart. TLS certificate/artifact và xác minh hostname không
 bị thay bằng địa chỉ IP vừa resolve.

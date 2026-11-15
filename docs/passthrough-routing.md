@@ -86,7 +86,9 @@ này: đây là TLS bắt đầu ngay khi mở kết nối.
 
 Snapshot được chụp khi accept TCP. Map/SNI policy/upstream đã chọn của phiên
 giữ nguyên tới khi relay kết thúc, kể cả đang chờ ClientHello khi config đổi.
-Hot apply thay map cho phiên accept sau commit, tái sử dụng listener như trước.
+Apply thay map cho phiên accept bởi generation mới, tái sử dụng socket lắng nghe.
+Mặc định rolling giữ phiên cũ đến khi kết thúc hoặc hết drain deadline;
+`reload_mode="hot"` giữ phiên đến khi tự kết thúc. Xem [rolling-updates.md](rolling-updates.md).
 Config sai không publish; map được persist cùng config và khôi phục sau restart.
 Metrics selection và TCP access log ghi upstream/endpoint thực được chọn.
 

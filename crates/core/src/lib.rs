@@ -11,6 +11,7 @@ mod proxy_clients;
 mod rate_tables;
 pub use prost_plugin::rate_table::{KeyEncoding, TableKey, TableQuery};
 pub use rate_tables::RateTableTarget;
+mod rolling;
 mod route_index;
 mod route_match;
 mod storage;
@@ -197,6 +198,7 @@ struct PreparedListener {
     route_uri_filters: Vec<bool>,
 }
 struct ConnectionInfo {
+    snapshot: Option<Arc<Snapshot>>,
     addresses: prost_transport::ProxyAddresses,
     proxy_clients: proxy_clients::Clients,
     transport_peer: SocketAddr,
@@ -248,6 +250,7 @@ impl HttpMode for LoggedHttp {
     }
 }
 struct ConnectionLease {
+    generation: Arc<rolling::Generation>,
     _ip: Option<ip_connections::Permit>,
     audit: Option<Arc<access_log::Ticket>>,
     _global: OwnedSemaphorePermit,
@@ -258,10 +261,12 @@ struct ConnectionLease {
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
         self.active.dec();
+        self.generation.connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 struct Binding {
     cancel: CancellationToken,
+    masters: Vec<std::net::TcpListener>,
 }
 pub struct RunningProxy {
     proxy_connections: Arc<Semaphore>,
@@ -284,7 +289,8 @@ pub struct RunningProxy {
     generations: Mutex<Vec<Weak<Snapshot>>>,
     probes: Mutex<BTreeMap<usize, Weak<PreparedUpstream>>>,
     pub metrics: Metrics,
-    workers: Option<Arc<workers::Workers>>,
+    workers: Mutex<Arc<rolling::Generation>>,
+    retiring: Mutex<Option<Arc<rolling::Generation>>>,
     worker_count: usize,
     observed: observability::Runtime,
 }
@@ -364,6 +370,11 @@ impl ProxyBuilder {
         );
         let runtime = snapshot.config.runtime.clone();
         let snapshot = Arc::new(snapshot);
+        let generation = rolling::Generation::new(
+            snapshot.config.generation,
+            runtime.reload_mode == prost_config::ReloadMode::Rolling,
+            workers,
+        );
         let p = Arc::new(RunningProxy {
             proxy_connections: Arc::new(Semaphore::new(runtime.max_proxy_connections)),
             access_log,
@@ -385,7 +396,8 @@ impl ProxyBuilder {
             generations: Mutex::new(vec![Arc::downgrade(&snapshot)]),
             probes: Mutex::new(BTreeMap::new()),
             metrics,
-            workers,
+            workers: Mutex::new(generation.clone()),
+            retiring: Mutex::new(None),
             worker_count,
             observed: observability::Runtime::default(),
         });
@@ -393,7 +405,7 @@ impl ProxyBuilder {
             .registry
             .register(Box::new(observability::Exporter::new(Arc::downgrade(&p))?))?;
         for (id, socket) in sockets {
-            p.start_listener(id, socket);
+            p.start_listener(id, socket, generation.clone(), snapshot.clone());
         }
         p.start_health(&snapshot);
         if let Some(socket) = metrics_socket {
@@ -409,10 +421,12 @@ fn prepare(
     worker_count: usize,
 ) -> Result<Snapshot> {
     config.validate()?;
+    let fresh_clients =
+        previous.is_some() && config.runtime.reload_mode == prost_config::ReloadMode::Rolling;
     let mut upstreams = BTreeMap::new();
     for (name, u) in &config.upstreams {
         if let Some(old) = previous.and_then(|s| s.upstreams.get(name)) {
-            if serde_json::to_value(&old.config)? == serde_json::to_value(u)? {
+            if !fresh_clients && serde_json::to_value(&old.config)? == serde_json::to_value(u)? {
                 upstreams.insert(name.clone(), old.clone());
                 continue;
             }
@@ -447,7 +461,9 @@ fn prepare(
                     .unwrap_or_else(|| prost_transport::DnsResolver::new(policy.clone()))
             })
             .transpose()?;
-        let client = if let Some(old) = old.filter(|old| pool_compatible(&old.config, u)) {
+        let client = if let Some(old) =
+            old.filter(|old| !fresh_clients && pool_compatible(&old.config, u))
+        {
             old.client.clone()
         } else {
             Arc::new(ClientPool::new_with_dns(
@@ -473,7 +489,8 @@ fn prepare(
                 .unwrap_or_else(|| {
                     Arc::new(observability::Endpoint::new(
                         worker_count,
-                        config.runtime.worker_local,
+                        config.runtime.worker_local
+                            && config.runtime.reload_mode == prost_config::ReloadMode::Hot,
                     ))
                 })
             })
@@ -757,7 +774,15 @@ impl RunningProxy {
             (name, endpoints)
         }).collect();
         let balancers:BTreeMap<_,_>=snapshot.upstreams.iter().map(|(name,u)|(name,serde_json::json!({"algorithm":u.config.balance,"hash_key":if u.config.balance=="consistent_hash" {Some(u.config.hash_key.as_deref().unwrap_or("$remote_addr"))} else {None},"hash_points":u.balancer.points()}))).collect();
-        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": self.workers.is_some(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers, "artifact_gc":self.last_gc.lock().unwrap().clone(), "access_log": self.access_log.as_ref().map(|log|log.status())})
+        let worker = self.workers.lock().unwrap().clone();
+        let retiring = self
+            .retiring
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|g| !g.finished.is_cancelled())
+            .map(|g| g.id);
+        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": worker.workers.is_some(), "reload_mode":snapshot.config.runtime.reload_mode, "worker_generation":worker.id, "retiring_worker_generation":retiring, "worker_generations":self.worker_status(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers, "artifact_gc":self.last_gc.lock().unwrap().clone(), "access_log": self.access_log.as_ref().map(|log|log.status())})
     }
     pub async fn validate(self: &Arc<Self>, text: String) -> Result<()> {
         let p = self.clone();
@@ -904,8 +929,10 @@ impl RunningProxy {
     }
     fn compatible(&self, config: &Config, old: &Snapshot) -> Result<()> {
         ensure!(!self.shutdown.is_cancelled(), "proxy shutting down");
+        let mut runtime = config.runtime.clone();
+        runtime.s3 = old.config.runtime.s3.clone();
         ensure!(
-            config.runtime == old.config.runtime,
+            runtime == old.config.runtime,
             "runtime settings require restart"
         );
         for l in &config.listeners {
@@ -1014,16 +1041,53 @@ impl RunningProxy {
             })
             .await??,
         );
-        let mut sockets = Vec::new();
-        for l in &new.config.listeners {
-            if !old.listeners.contains_key(&l.id) {
-                sockets.push((
-                    l.id.clone(),
-                    workers::bind(l.address, self.workers.as_deref())
-                        .await
-                        .with_context(|| format!("bind {}", l.address))?,
-                ));
+        let previous_generation = self.workers.lock().unwrap().clone();
+        let rolling = new.config.runtime.reload_mode == prost_config::ReloadMode::Rolling;
+        let next_generation = if rolling {
+            let retiring = self.retiring.lock().unwrap().clone();
+            if let Some(retiring) = retiring {
+                retiring.finished.cancelled().await;
+                self.retiring.lock().unwrap().take();
             }
+            let workers = if previous_generation.workers.is_some() {
+                let count = self.worker_count;
+                let latency = self.metrics.latency.clone();
+                Some(Arc::new(
+                    tokio::task::spawn_blocking(move || workers::Workers::new(count, latency))
+                        .await??,
+                ))
+            } else {
+                None
+            };
+            rolling::Generation::new(new.config.generation, true, workers)
+        } else {
+            previous_generation.clone()
+        };
+        let mut sockets = Vec::new();
+        for listener in &new.config.listeners {
+            if rolling || !old.listeners.contains_key(&listener.id) {
+                let attached = if rolling {
+                    let bindings = self.bindings.lock().unwrap();
+                    bindings
+                        .get(&listener.id)
+                        .map(|binding| {
+                            workers::attach(&binding.masters, next_generation.workers.as_deref())
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                let socket = match attached {
+                    Some(socket) => socket,
+                    None => workers::bind(listener.address, next_generation.workers.as_deref())
+                        .await
+                        .with_context(|| format!("bind {}", listener.address))?,
+                };
+                sockets.push((listener.id.clone(), socket));
+            }
+        }
+        if let Some(workers) = &next_generation.workers {
+            workers.ready().await?;
         }
         let path = self.path.clone();
         let encoded = new.config.encode()?;
@@ -1037,16 +1101,29 @@ impl RunningProxy {
             generations.retain(|generation| generation.strong_count() > 0);
             generations.push(Arc::downgrade(&new));
         }
-        self.bindings.lock().unwrap().retain(|id, b| {
-            if !new.listeners.contains_key(id) {
-                b.cancel.cancel();
-                false
-            } else {
-                true
+        if rolling {
+            *self.workers.lock().unwrap() = next_generation.clone();
+            let old_bindings = std::mem::take(&mut *self.bindings.lock().unwrap());
+            for (id, socket) in sockets {
+                self.start_listener(id, socket, next_generation.clone(), new.clone());
             }
-        });
-        for (id, socket) in sockets {
-            self.start_listener(id, socket);
+            for binding in old_bindings.values() {
+                binding.cancel.cancel();
+            }
+            self.retire_generation(previous_generation, new.config.runtime.drain_seconds)
+                .await;
+        } else {
+            self.bindings.lock().unwrap().retain(|id, binding| {
+                if !new.listeners.contains_key(id) {
+                    binding.cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+            for (id, socket) in sockets {
+                self.start_listener(id, socket, next_generation.clone(), new.clone());
+            }
         }
         self.start_health(&new);
         self.metrics.commits.inc();
@@ -1059,46 +1136,87 @@ impl RunningProxy {
             serde_json::json!({"generation":new.config.generation,"hash":new.hash,"durable":durable}),
         )
     }
-    fn start_listener(self: &Arc<Self>, id: String, sockets: workers::BoundListener) {
+    async fn retire_generation(
+        self: &Arc<Self>,
+        generation: Arc<rolling::Generation>,
+        seconds: u64,
+    ) {
+        generation.accepting.cancel();
+        generation.begin_drain(seconds);
+        generation.accepts.close();
+        generation.accepts.wait().await;
+        generation.tasks.close();
+        *self.retiring.lock().unwrap() = Some(generation.clone());
+        let weak = Arc::downgrade(self);
+        self.tasks.spawn(async move {
+            if tokio::time::timeout(generation.remaining(), generation.tasks.wait())
+                .await
+                .is_err()
+            {
+                if let Some(p) = weak.upgrade() {
+                    p.observed.worker_retirements[1].fetch_add(1, Ordering::Relaxed);
+                    p.observed.worker_retirements[2].fetch_add(
+                        generation.connections.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                }
+                generation.force.cancel();
+                generation.tasks.wait().await;
+            }
+            if let Some(workers) = generation.workers.clone() {
+                let _ = tokio::task::spawn_blocking(move || workers.join()).await;
+            }
+            if let Some(p) = weak.upgrade() {
+                p.observed.worker_retirements[0].fetch_add(1, Ordering::Relaxed);
+            }
+            generation.finished.cancel();
+        });
+    }
+    fn start_listener(
+        self: &Arc<Self>,
+        id: String,
+        sockets: workers::BoundListener,
+        generation: Arc<rolling::Generation>,
+        pinned: Arc<Snapshot>,
+    ) {
         let cancel = self.shutdown.child_token();
         self.bindings.lock().unwrap().insert(
             id.clone(),
             Binding {
                 cancel: cancel.clone(),
+                masters: sockets.masters,
             },
         );
-        for (handle, socket) in sockets.0 {
+        let pinned = generation.rolling.then_some(pinned);
+        for (handle, socket) in sockets.sockets {
             let weak = Arc::downgrade(self);
             let id = id.clone();
             let cancel = cancel.clone();
-            self.tasks.spawn_on(async move {
-            loop {
-                let accepted = tokio::select! { biased; _ = cancel.cancelled() => break, a = socket.accept() => a };
-                let (stream,peer) = match accepted { Ok(v) => v, Err(e) => { tracing::warn!(error=%e,"accept failed"); tokio::time::sleep(Duration::from_millis(100)).await; continue; } };
-                let Some(p) = weak.upgrade() else { break; };
-                let snapshot = p.snapshot();
-                let Some(listener) = snapshot.listeners.get(&id).cloned() else { continue; };
-                let global = match p.connections.clone().try_acquire_owned() { Ok(v)=>v,Err(_)=>continue };
-                let local = match listener.capacity.clone().try_acquire_owned() { Ok(v)=>v,Err(_)=>continue };
-                let plugin_permits = match connection_permits(&listener.plugins) { Ok(v)=>v,Err(_)=>continue };
-                p.metrics.connections.inc();
-                let audit = if listener.config.protocol == Protocol::Tcp && listener.config.access_log {
-                    p.access_log.as_ref().filter(|log| log.sample()).map(|log| access_log::Ticket::tcp(log.clone(), &peer.to_string(), &id, snapshot.config.generation))
-                } else { None };
-                let lease = ConnectionLease { _ip:None, audit, _global:global, _local:local, _plugins:plugin_permits, active:p.metrics.connections.clone() };
-                let p2 = p.clone();
-                let id = id.clone();
-                let audit = lease.audit.clone();
-                p.tasks.spawn(async move {
-                    let result = tokio::select! {
-                        _ = p2.force.cancelled() => Ok(()),
-                        r = p2.connection(id,stream,peer,snapshot,listener,lease) => r,
-                    };
-                    if let Some(audit) = &audit { audit.finish(None,if result.is_err() { "error" } else { "aborted" }); }
-                    if let Err(e) = result { p2.metrics.errors.inc(); tracing::debug!(error=%e,%peer,"connection ended with error"); }
-                });
-            }
-        },&handle);
+            let generation = generation.clone();
+            let pinned = pinned.clone();
+            let accepts = generation.accepts.clone();
+            self.tasks.spawn_on(accepts.track_future(async move {
+                loop {
+                    let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,_=generation.accepting.cancelled()=>break,a=socket.accept()=>a};
+                    let (stream,peer)=match accepted {Ok(value)=>value,Err(error)=>{tracing::warn!(%error,"accept failed");tokio::time::sleep(Duration::from_millis(100)).await;continue;}};
+                    let Some(p)=weak.upgrade() else{break;};
+                    let snapshot=pinned.clone().unwrap_or_else(||p.snapshot());
+                    let Some(listener)=snapshot.listeners.get(&id).cloned() else{continue;};
+                    let global=match p.connections.clone().try_acquire_owned(){Ok(permit)=>permit,Err(_)=>continue};
+                    let local=match listener.capacity.clone().try_acquire_owned(){Ok(permit)=>permit,Err(_)=>continue};
+                    let plugin_permits=match connection_permits(&listener.plugins){Ok(permits)=>permits,Err(_)=>continue};
+                    p.metrics.connections.inc();
+                    generation.connections.fetch_add(1, Ordering::Relaxed);
+                    let audit=if listener.config.protocol==Protocol::Tcp && listener.config.access_log {p.access_log.as_ref().filter(|log|log.sample()).map(|log|access_log::Ticket::tcp(log.clone(),&peer.to_string(),&id,snapshot.config.generation))}else{None};
+                    let lease=ConnectionLease{generation:generation.clone(),_ip:None,audit,_global:global,_local:local,_plugins:plugin_permits,active:p.metrics.connections.clone()};
+                    let p2=p.clone();let id=id.clone();let audit=lease.audit.clone();let force=generation.force.clone();
+                    p.tasks.spawn(generation.tasks.track_future(async move {
+                        let result=tokio::select!{_=p2.force.cancelled()=>Ok(()),_=force.cancelled()=>Ok(()),r=p2.connection(id,stream,peer,snapshot,listener,lease)=>r};
+                        if let Some(audit)=&audit {audit.finish(None,if result.is_err(){"error"}else{"aborted"});}
+                        if let Err(error)=result {p2.metrics.errors.inc();tracing::debug!(%error,%peer,"connection ended with error");}
+                    }));
+                }
+            }),&handle);
         }
     }
     async fn connection(
@@ -1288,6 +1406,7 @@ impl RunningProxy {
             return result.map(|_| ());
         }
         let info = Arc::new(ConnectionInfo {
+            snapshot: lease.generation.rolling.then(|| snapshot.clone()),
             addresses,
             proxy_clients: proxy_clients::Clients::new(self.proxy_connections.clone()),
             transport_peer,
@@ -1350,6 +1469,7 @@ impl RunningProxy {
             (io, None)
         };
         let p = self.clone();
+        let drain = info._lease.generation.drain.clone();
         let first_info = info.clone();
         let service = service_fn(move |request| {
             if !info.headers_seen.load(Ordering::Relaxed) {
@@ -1390,12 +1510,16 @@ impl RunningProxy {
             .max_send_buf_size(32768);
         let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
         tokio::pin!(connection);
-        if header_timeout > 0 {
-            // Covers auto protocol detection and the first H2 request as well.
+        if header_timeout > 0 || first_info._lease.generation.rolling {
+            // A socket accepted just before a rolling switch may not have its
+            // first headers yet. Calling graceful_shutdown during auto protocol
+            // detection drops that legitimate request without a response. Let
+            // the first request start, bounded by header/drain deadlines, then
+            // drain below once Hyper knows which request/stream to finish.
             tokio::select! {
                 result = &mut connection => { result.map_err(|e| anyhow::anyhow!(e))?; return Ok(()); },
                 _ = first_info.first_headers.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(header_timeout)) => anyhow::bail!("initial request headers timeout"),
+                _ = async {if header_timeout > 0 {tokio::time::sleep(Duration::from_millis(header_timeout)).await;} else {std::future::pending::<()>().await;}} => anyhow::bail!("initial request headers timeout"),
                 _ = self.shutdown.cancelled() => {
                     connection.as_mut().graceful_shutdown();
                     connection.await.map_err(|e| anyhow::anyhow!(e))?;
@@ -1407,7 +1531,7 @@ impl RunningProxy {
         tokio::select! {
             result = &mut connection => { result.map_err(|e| anyhow::anyhow!(e))?; },
             _ = async {if let Some(clock)=&clock {clock.expired().await;}else{std::future::pending::<()>().await;}} => {connection.as_mut().graceful_shutdown();connection.await.map_err(|e|anyhow::anyhow!(e))?;},
-            _ = self.shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); connection.await.map_err(|e| anyhow::anyhow!(e))?; },
+            _ = async {tokio::select!{_=self.shutdown.cancelled()=>{},_=drain.cancelled()=>{}}} => { connection.as_mut().graceful_shutdown(); connection.await.map_err(|e| anyhow::anyhow!(e))?; },
         }
         Ok(())
     }
@@ -1419,7 +1543,7 @@ impl RunningProxy {
         h2_write_guard: bool,
     ) -> Response<Body> {
         use hyper::body::Body as _;
-        let snapshot = self.snapshot();
+        let snapshot = info.snapshot.clone().unwrap_or_else(|| self.snapshot());
         let route = snapshot
             .listeners
             .get(id.as_ref())
@@ -1485,10 +1609,15 @@ impl RunningProxy {
         context: Option<access_log::RequestContext>,
     ) -> Response<Body> {
         self.metrics.requests.inc();
+        let worker_generation = info._lease.generation.clone();
         let _timer = local_metrics::Timer::new(&self.metrics.latency);
         let (snapshot, route_override, audit) = match context {
             Some(context) => (context.snapshot, Some(context.route), context.audit),
-            None => (self.snapshot(), None, None),
+            None => (
+                info.snapshot.clone().unwrap_or_else(|| self.snapshot()),
+                None,
+                None,
+            ),
         };
         let peer = info.peer.ip();
         let downstream_version = request.version();
@@ -1599,13 +1728,14 @@ impl RunningProxy {
                 let audit = audit.clone();
                 if let Some(audit) = &audit { audit.arm_tunnel(); }
                 let force = self.force.clone();
-                self.tasks.spawn(async move {
+                let worker_force=worker_generation.force.clone();
+                self.tasks.spawn(worker_generation.tasks.track_future(async move {
                     let mut tunnel = tunnel;
                     tokio::select! {
-                        _ = force.cancelled() => { tunnel.abort(); let _ = tunnel.await; if let Some(audit) = &audit { audit.finish(None,"aborted"); } },
+                        _ = async {tokio::select!{_=force.cancelled()=>{},_=worker_force.cancelled()=>{}}} => { tunnel.abort(); let _ = tunnel.await; if let Some(audit) = &audit { audit.finish(None,"aborted"); } },
                         result = &mut tunnel => { if let Some(audit) = &audit { match result { Ok(report) => audit.finish(report.bytes,if report.error { "error" } else { "complete" }),Err(_) => audit.finish(None,"aborted") } } }
                     }
-                });
+                }));
             }
             if needs & prost_plugin::NEEDS_UPSTREAM_HEADERS != 0 {if let Some(ctx)=&mut header_context {for p in l.plugins.iter().chain(route_plugins.unwrap_or_default()){p.copy_header_inputs(true,outcome.response.headers(),&mut ctx.upstream_headers);}}}
             if let Some(ctx)=&mut header_context {if let Some(info)=outcome.response.extensions().get::<hyper_util::client::legacy::connect::HttpInfo>(){ctx.upstream_addr=Some(HeaderValue::from_str(&info.remote_addr().to_string())?);}}
@@ -1623,9 +1753,10 @@ impl RunningProxy {
                 let listener=l.clone();
                 let generation=snapshot.clone();
                 let p=self.clone();
-                self.tasks.spawn(async move {
+                let worker_force=worker_generation.force.clone();
+                self.tasks.spawn(worker_generation.tasks.track_future(async move {
                     let _generation=generation;
-                    tokio::select!{_=p.force.cancelled()=>return,_=completion=>{}}
+                    tokio::select!{_=p.force.cancelled()=>return,_=worker_force.cancelled()=>return,_=completion=>{}}
                     event.hook="end".into();
                     let result=async {
                         invoke(&listener.plugins,&mut event,None).await?;
@@ -1633,7 +1764,7 @@ impl RunningProxy {
                         Ok::<_,anyhow::Error>(())
                     }.await;
                     if let Err(e)=result {p.metrics.errors.inc();tracing::warn!(error=%e,"end hook failed");}
-                });
+                }));
                 }
             }
             Ok::<_,anyhow::Error>(outcome.response)
@@ -1791,6 +1922,7 @@ impl RunningProxy {
     pub async fn shutdown(self: &Arc<Self>) {
         let _guard = self.coordinator.lock().await;
         self.shutdown.cancel();
+        self.bindings.lock().unwrap().clear();
         self.tasks.close();
         let drain = self.snapshot().config.runtime.drain_seconds;
         if tokio::time::timeout(Duration::from_secs(drain), self.tasks.wait())
@@ -1800,8 +1932,8 @@ impl RunningProxy {
             self.force.cancel();
             self.tasks.wait().await;
         }
-        if let Some(workers) = &self.workers {
-            let workers = workers.clone();
+        let workers = self.workers.lock().unwrap().workers.clone();
+        if let Some(workers) = workers {
             let _ = tokio::task::spawn_blocking(move || workers.join()).await;
         }
         if let Some(log) = &self.access_log {

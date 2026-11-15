@@ -15,15 +15,25 @@ struct Args {
 #[derive(Subcommand)]
 enum Ctl {
     Status,
+    Workers {
+        #[command(subcommand)]
+        command: Workers,
+    },
     Validate {
         #[arg(long)]
         file: PathBuf,
     },
+    #[command(alias = "reload")]
     Apply {
         #[arg(long)]
         file: PathBuf,
         #[arg(long)]
         if_generation: Option<u64>,
+        /// Wait for older workers to drain after committing the configuration.
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_timeout: Option<u64>,
     },
     Upstream {
         #[command(subcommand)]
@@ -48,6 +58,16 @@ enum Ctl {
     Cache {
         #[command(subcommand)]
         command: Cache,
+    },
+}
+#[derive(Subcommand)]
+enum Workers {
+    /// Wait for workers older than a committed generation without changing config.
+    Wait {
+        #[arg(long)]
+        generation: u64,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=300))]
+        timeout: u64,
     },
 }
 #[derive(Subcommand)]
@@ -199,14 +219,33 @@ async fn main() -> Result<()> {
         }
     }
     let export = matches!(args.command, Ctl::Config { .. });
+    let wait = match &args.command {
+        Ctl::Apply {
+            wait: true,
+            wait_timeout,
+            ..
+        } => Some(wait_timeout.unwrap_or(60) * 1000),
+        _ => None,
+    };
     let command = match args.command {
         Ctl::Status => Command::Status,
+        Ctl::Workers {
+            command:
+                Workers::Wait {
+                    generation,
+                    timeout,
+                },
+        } => Command::WaitWorkers {
+            generation,
+            timeout_ms: timeout * 1000,
+        },
         Ctl::Validate { file } => Command::Validate {
             config: std::fs::read_to_string(file)?,
         },
         Ctl::Apply {
             file,
             if_generation,
+            ..
         } => Command::Apply {
             config: std::fs::read_to_string(file)?,
             expected_generation: generation(&args.socket, if_generation).await?,
@@ -321,7 +360,29 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let response = request(&args.socket, command).await?;
+    let mut response = request(&args.socket, command).await?;
+    if let Some(timeout_ms) = wait {
+        let committed = response.generation;
+        match request(
+            &args.socket,
+            Command::WaitWorkers {
+                generation: committed,
+                timeout_ms,
+            },
+        )
+        .await
+        {
+            Ok(drained) => {
+                if let Some(result) = response.result.as_mut() {
+                    result["worker_drain"] = drained.result.context("missing drain result")?;
+                }
+            }
+            Err(error) => {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Err(error.context(format!("configuration generation {committed} committed; worker wait failed; inspect status before retrying")));
+            }
+        }
+    }
     if export {
         print!(
             "{}",
@@ -352,6 +413,47 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    #[test]
+    fn rolling_reload_wait_cli_validates_timeout_and_alias() -> Result<()> {
+        Args::try_parse_from(["prostctl", "workers", "wait", "--generation", "12"])?;
+        assert!(Args::try_parse_from([
+            "prostctl",
+            "workers",
+            "wait",
+            "--generation",
+            "12",
+            "--timeout",
+            "0"
+        ])
+        .is_err());
+        let args = Args::try_parse_from([
+            "prostctl",
+            "reload",
+            "--file",
+            "candidate.toml",
+            "--wait",
+            "--wait-timeout",
+            "90",
+        ])?;
+        assert!(matches!(
+            args.command,
+            Ctl::Apply {
+                wait: true,
+                wait_timeout: Some(90),
+                ..
+            }
+        ));
+        for extra in [
+            vec!["--wait-timeout", "10"],
+            vec!["--wait", "--wait-timeout", "0"],
+            vec!["--wait", "--wait-timeout", "301"],
+        ] {
+            let mut command = vec!["prostctl", "apply", "--file", "candidate.toml"];
+            command.extend(extra);
+            assert!(Args::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
     #[test]
     fn cache_cli_requires_scope_bounds_and_preserves_header_occurrences() -> Result<()> {
         Args::command().debug_assert();

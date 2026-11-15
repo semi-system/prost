@@ -285,6 +285,14 @@ fn is_temp(name: &str) -> bool {
 }
 pub(crate) fn references(config: &Config) -> HashSet<OsString> {
     let mut paths = Vec::new();
+    if let Some(ca) = config
+        .runtime
+        .s3
+        .as_ref()
+        .and_then(|s| s.ca_certificate.as_ref())
+    {
+        paths.push(ca);
+    }
     for u in config.upstreams.values() {
         if let Some(tls) = &u.health_check.tls {
             if let Some(path) = &tls.ca_certificate {

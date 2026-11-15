@@ -143,7 +143,7 @@ async fn http_completion_trailers_bodyless_rotation_and_hot_flags() -> Result<()
     assert_eq!(p.access_log_control(true, 1).await?["epoch"], 1);
     assert!(p.access_log_control(true, 0).await.is_err());
     let io = TcpStream::connect(f.address()).await?;
-    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut h1, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     h1.send_request(request("/enabled/h1"))
         .await?

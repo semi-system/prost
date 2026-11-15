@@ -60,10 +60,8 @@ async fn method_header_routing_h1_h2_linear_indexed_hot_apply_and_restart() -> R
         }
         std::fs::write(&f.path, f.config.encode()?)?;
         let p = f.start().await;
-        let (mut h1, c1) = hyper::client::conn::http1::handshake(TokioIo::new(
-            TcpStream::connect(f.address()).await?,
-        ))
-        .await?;
+        let (mut h1, c1) =
+            crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
         let d1 = tokio::spawn(c1);
         let (mut h2, c2) = hyper::client::conn::http2::handshake(
             TokioExecutor::new(),
@@ -243,10 +241,8 @@ async fn method_header_routing_h1_h2_linear_indexed_hot_apply_and_restart() -> R
         p.shutdown().await;
         drop(p);
         let restarted = f.start().await;
-        let (mut h1, connection) = hyper::client::conn::http1::handshake(TokioIo::new(
-            TcpStream::connect(f.address()).await?,
-        ))
-        .await?;
+        let (mut h1, connection) =
+            crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
         let driver = tokio::spawn(connection);
         h1.ready().await?;
         checked(

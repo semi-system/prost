@@ -202,8 +202,7 @@ async fn plugin_metrics_and_compact_log_filters() -> Result<()> {
     std::fs::write(&f.path, f.config.encode()?)?;
     let p = f.start().await;
     let (mut client, conn) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(conn);
     for path in ["/", "/status/200", "/status/404", "/status/503"] {
         let response = client

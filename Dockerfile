@@ -14,7 +14,9 @@ RUN cargo build --workspace --locked --profile "$CARGO_PROFILE" --features "$CAR
        fi
 
 FROM debian:bookworm-slim AS runtime
-RUN groupadd --gid 10001 prost && useradd --uid 10001 --gid prost --no-create-home prost \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 prost && useradd --uid 10001 --gid prost --no-create-home prost \
     && mkdir -p /run/prost /var/lib/prost /etc/prost \
     && chown -R prost:prost /run/prost /var/lib/prost /etc/prost
 COPY --from=build /out/prost /out/prostctl /usr/local/bin/

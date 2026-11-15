@@ -8,6 +8,8 @@ use std::{
 };
 
 mod dns;
+mod tls_source;
+pub use tls_source::{S3Config, S3Object, TlsSource};
 #[cfg(test)]
 mod encoding_tests;
 mod http_policy;
@@ -74,6 +76,9 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
+    pub reload_mode: ReloadMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<S3Config>,
     pub max_proxy_connections: usize,
     pub observe_plugins: bool,
     pub access_log: Option<AccessLog>,
@@ -89,6 +94,8 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            reload_mode: ReloadMode::Rolling,
+            s3: None,
             max_proxy_connections: 4096,
             observe_plugins: false,
             access_log: None,
@@ -102,6 +109,13 @@ impl Default for Runtime {
             io_workers: 0,
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReloadMode {
+    #[default]
+    Rolling,
+    Hot,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -427,6 +441,9 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(s3) = &self.runtime.s3 {
+            s3.validate()?;
+        }
         if let Some(log) = &self.runtime.access_log {
             log.validate()?;
         }
@@ -473,12 +490,17 @@ impl Config {
                     policy.validate()?;
                 }
                 ensure!(!tls.server_name.is_empty(), "TLS server_name is required");
+                if let Some(ca) = &tls.ca_certificate {
+                    TlsSource::parse(ca)?;
+                }
                 if let Some(id) = &tls.identity {
                     ensure!(
                         !id.certificate.as_os_str().is_empty()
                             && !id.private_key.as_os_str().is_empty(),
                         "client identity requires certificate and key"
                     );
+                    TlsSource::parse(&id.certificate)?;
+                    TlsSource::parse(&id.private_key)?;
                 }
             }
             if let Some(policy) = &u.http {

@@ -65,7 +65,9 @@ TLS config không thay đổi được tái sử dụng qua cập nhật route/h
 giữ session cache hiện tại. Thay certificate hoặc policy SNI tạo ServerConfig
 mới; phiên TLS đã mở tiếp tục với TLS state cũ. Kết nối được nhận và lấy snapshot
 sau publish dùng cấu hình mới; handshake đã bắt đầu có thể giữ snapshot cũ.
-Request/HTTP2 stream mới trên kết nối đang mở vẫn lấy route/plugin mới.
+Trong `reload_mode="hot"`, request/HTTP2 stream mới trên kết nối đang mở vẫn lấy
+route/plugin mới. Mặc định rolling pin snapshot theo connection, drain HTTP và
+giới hạn thời gian giữ phiên TLS cũ: [rolling-updates.md](rolling-updates.md).
 
 Sau restart daemon dùng artifact đã commit, không phụ thuộc file nguồn còn tồn
 tại. Private key nằm trong artifact hạn chế quyền; export chỉ chứa đường dẫn.

@@ -125,8 +125,7 @@ async fn exact_and_all_purge_keep_variants_compatible_apply_and_restart_semantic
     std::fs::write(&f.path, f.config.encode()?)?;
     let p = f.start().await;
     let (mut client, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(connection);
     count(client.send_request(request("/a", None)).await?, 1).await?;
     count(client.send_request(request("/a", None)).await?, 1).await?;
@@ -226,8 +225,7 @@ async fn exact_and_all_purge_keep_variants_compatible_apply_and_restart_semantic
     assert_eq!(status["caches"]["main"]["status"]["entries"], 0);
     assert_eq!(status["caches"]["main"]["status"]["epoch"], 0);
     let (mut client, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?))
-            .await?;
+        crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;
     let driver = tokio::spawn(connection);
     count(client.send_request(request("/a", None)).await?, 5).await?;
     drop(client);

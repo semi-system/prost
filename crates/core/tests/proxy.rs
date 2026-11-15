@@ -34,6 +34,8 @@ mod cache_control;
 mod cache_freshness;
 #[path = "support/edge.rs"]
 mod edge;
+#[path = "support/http1.rs"]
+mod http1;
 #[path = "support/http_routing.rs"]
 mod http_routing;
 #[path = "support/limits.rs"]
@@ -46,10 +48,14 @@ mod passthrough_routes;
 mod pool_metrics;
 #[path = "support/rate_tables.rs"]
 mod rate_tables;
+#[path = "support/rolling.rs"]
+mod rolling;
 #[path = "support/rusty.rs"]
 mod rusty;
 #[path = "support/timeouts.rs"]
 mod timeouts;
+#[path = "support/tls_uri.rs"]
+mod tls_uri;
 
 struct Server {
     address: SocketAddr,
@@ -177,7 +183,7 @@ async fn metrics_scrape_counters_survive_apply_and_release_old_resources() -> Re
     }
     // Exercise the HTTP exposition, not just registry.gather().
     let io = TcpStream::connect(fixture.config.runtime.metrics_address.unwrap()).await?;
-    let (mut scrape, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut scrape, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let scrape_driver = tokio::spawn(connection);
     let response = scrape
         .send_request(
@@ -270,7 +276,7 @@ async fn idle_pool_connections_close_without_another_request() -> Result<()> {
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     let response = client
         .send_request(
@@ -329,7 +335,7 @@ async fn native_header_variables_h1_h2_trailers_and_bodyless_responses() -> Resu
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut h1, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     for (method, path, status) in [
         (http::Method::GET, "/", 200),
@@ -422,7 +428,7 @@ async fn native_header_inheritance_and_always_on_local_rejections() -> Result<()
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     for path in ["/child", "/merge"] {
         let response = client
@@ -484,7 +490,7 @@ async fn native_headers_hot_update_and_plugin_ordering() -> Result<()> {
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     for expected in ["before", "after"] {
         let response = client
@@ -569,7 +575,7 @@ async fn native_acl_http_ignores_spoofed_forwarded_address_and_tcp_closes() -> R
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     let response = client
         .send_request(
@@ -647,7 +653,7 @@ async fn mapped_headers_apply_on_live_h1_h2_and_invalid_update_rolls_back() -> R
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     for (origin, policy, expiry) in [
         ("https://app.example", "trusted", true),
@@ -746,7 +752,7 @@ async fn keyed_rate_limit_shares_workers_and_survives_neighbor_update() -> Resul
     let p = fixture.start().await;
     async fn request(address: SocketAddr, key: &str) -> Result<(u16, String)> {
         let io = TcpStream::connect(address).await?;
-        let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
         let driver = tokio::spawn(conn);
         let response = client
             .send_request(
@@ -828,7 +834,7 @@ async fn native_rewrite_h1_h2_keeps_route_and_stream_snapshot() -> Result<()> {
             .unwrap()
     };
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut h1, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let h1driver = tokio::spawn(conn);
     // Body/trailer completion can precede the connection dispatcher becoming
     // ready again. Synchronize with Hyper rather than executor scheduling.
@@ -1016,7 +1022,7 @@ async fn native_redirect_without_upstream_acl_rate_order_and_rollback() -> Resul
             .unwrap()
     };
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut h1, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let h1driver = tokio::spawn(conn);
     for method in ["GET", "HEAD", "POST"] {
         h1.ready().await?;
@@ -1108,8 +1114,7 @@ async fn native_rate_limit_returns_429_and_survives_pool_update() -> Result<()> 
     let p = fixture.start().await;
     async fn request(address: SocketAddr, status: u16) -> Result<String> {
         let io = TcpStream::connect(address).await?;
-        let (mut client, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
         let driver = tokio::spawn(connection);
         let response = client
             .send_request(
@@ -1230,8 +1235,7 @@ async fn http_health_detects_application_failure_timeout_and_recovers() -> Resul
         p.apply(next.encode()?, 0).await?;
         assert_eq!(p.status()["upstreams"]["main"][0]["healthy"], false);
         let io = TcpStream::connect(fixture.address()).await?;
-        let (mut client, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
         let driver = tokio::spawn(connection);
         let response = client
             .send_request(
@@ -1279,7 +1283,7 @@ async fn shared_runtime_fallback_serves_http_with_exact_metrics() -> Result<()> 
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     let response = client
         .send_request(
@@ -1310,8 +1314,7 @@ async fn concurrent_small_and_split_bodies_are_complete() -> Result<()> {
         let address = fixture.address();
         tasks.push(tokio::spawn(async move {
             let io = TcpStream::connect(address).await?;
-            let (mut client, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+            let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
             let driver = tokio::spawn(connection);
             for n in 0..10 {
                 let split = (n + index) % 2 == 0;
@@ -1420,7 +1423,7 @@ async fn compiled_routes_preserve_precedence_and_refresh_upstream_bindings() -> 
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     for (path, host, expected) in [
         ("/api/long/x", "EXAMPLE.COM:8080", "b"),
@@ -1471,8 +1474,7 @@ async fn streamed_response_timeout_releases_request_capacity() -> Result<()> {
     let p = fixture.start().await;
     async fn get(address: SocketAddr, path: &str) -> Result<hyper::Response<Incoming>> {
         let io = TcpStream::connect(address).await?;
-        let (mut client, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
         tokio::spawn(connection);
         Ok(client
             .send_request(
@@ -1540,7 +1542,7 @@ async fn plugin_end_hook_waits_for_body_and_survives_fast_path_changes() -> Resu
         .start()
         .await?;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     let response = client
         .send_request(
@@ -1784,7 +1786,8 @@ upstream="main"
                 "http"
             }
         );
-        let config = Config::parse(&text).unwrap();
+        let mut config = Config::parse(&text).unwrap();
+        config.runtime.reload_mode = prost_config::ReloadMode::Hot;
         std::fs::write(&path, config.encode().unwrap()).unwrap();
         Self { dir, path, config }
     }
@@ -1897,7 +1900,7 @@ async fn keepalive_requests_use_new_generation_and_release_old() -> Result<()> {
     let fixture = Fixture::new(Protocol::Http, a.address);
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     let send = |label: &str| {
         Request::builder()
@@ -2193,7 +2196,7 @@ async fn sni_http1_http2_and_live_streams_use_new_routes() -> Result<()> {
     )
     .await?;
     assert_eq!(io.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
-    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut h1, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let h1driver = tokio::spawn(conn);
     let request = || {
         Request::builder()
@@ -2438,7 +2441,7 @@ async fn https_upstream_protocol_and_alpn_follow_config_after_apply() -> Result<
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, conn) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(conn);
     for (generation, h2) in [false, true, false].into_iter().enumerate() {
         if generation > 0 {
@@ -2494,7 +2497,9 @@ async fn websocket_tunnel_survives_config_update() -> Result<()> {
         }
     });
     let server = Server { address, task };
-    let fixture = Fixture::new(Protocol::Http, server.address);
+    let mut fixture = Fixture::new(Protocol::Http, server.address);
+    fixture.config.runtime.reload_mode = prost_config::ReloadMode::Rolling;
+    std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let (mut ws, _) =
         tokio_tungstenite::connect_async(format!("ws://{}/", fixture.address())).await?;
@@ -2578,8 +2583,7 @@ async fn wasm_header_plugin_updates_and_rejects_invalid_module() -> Result<()> {
     let p = fixture.start().await;
     async fn check(address: SocketAddr, expected: &str) -> Result<()> {
         let io = TcpStream::connect(address).await?;
-        let (mut client, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+        let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
         let driver = tokio::spawn(connection);
         let response = client
             .send_request(
@@ -3364,7 +3368,7 @@ async fn weighted_round_robin_and_endpoint_disable() -> Result<()> {
     std::fs::write(&fixture.path, fixture.config.encode()?)?;
     let p = fixture.start().await;
     let io = TcpStream::connect(fixture.address()).await?;
-    let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    let (mut client, connection) = crate::http1::handshake(TokioIo::new(io)).await?;
     let driver = tokio::spawn(connection);
     let mut results = Vec::new();
     for _ in 0..6 {
