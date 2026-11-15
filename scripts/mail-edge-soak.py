@@ -291,7 +291,10 @@ async def workload(args, out, cases, names, port, ctl, report, started):
             report["counts"]["smtp"] += 1
         finally:
             w.close()
-            await w.wait_closed()
+            try:
+                await asyncio.wait_for(w.wait_closed(), 3)
+            except (TimeoutError, OSError):
+                w.transport.abort()
 
     # Linux bridge records the actual host-side peer address, not 127.0.0.1.
     network = json.loads(run("docker", "network", "inspect", names["edge"].removesuffix("-edge"), capture_output=True, text=True).stdout)[0]
@@ -376,7 +379,10 @@ async def workload(args, out, cases, names, port, ctl, report, started):
             if stress is not None and stress.done():
                 await stress
             async with asyncio.timeout(30):
-                await asyncio.gather(*(smtp(p, p == 10465) for _ in range(args.clients) for p in (10025, 10587, 10465)))
+                async with asyncio.TaskGroup() as jobs:
+                    for _ in range(args.clients):
+                        for p in (10025, 10587, 10465):
+                            jobs.create_task(smtp(p, p == 10465))
                 await command(smtp_reader, smtp_writer, b"NOOP\r\n", b"250")
                 # The second IMAPS session remains application-silent across
                 # renewals. TCP keepalive does not count as relay activity.
@@ -444,8 +450,8 @@ async def workload(args, out, cases, names, port, ctl, report, started):
             rounds += 1
             await asyncio.sleep(args.interval)
         assert len(report["certificates"]) >= 2, "no verified renewal observed"
-        if stress is not None and stress.done():
-            await stress
+        if stress is not None:
+            await asyncio.wait_for(asyncio.shield(stress), 45)
         if args.duration>=args.idle_silence_seconds:
             report["checks"].append(f"silent IMAPS IDLE held for at least {args.idle_silence_seconds}s")
         report["checks"] += ["CA renewal verified by fresh TLS connections", "held SMTP and STARTTLS/IMAPS IDLE survived renewal", "strict PROXY v2 traffic and zero-payload LOCAL health", "no forced worker drain", "SMTP source IP preserved", "HTTP/2 ALPN traffic"]
