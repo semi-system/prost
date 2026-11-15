@@ -32,6 +32,15 @@ Raw local artifacts:
 - `test-results/mail-edge-local-final/{summary.json,samples.jsonl,*.log}`
 - `test-results/mail-runtime-final/summary.json`
 - `test-results/mail-edge-{semgrep-final,trivy}.json`
+- `test-results/mail-interop-final-verified/summary.json`: 10,000 requests,
+  ten explicit hot-mode updates, zero errors; independent Go PROXY-v2/mTLS
+  backend, real OpenSSL rejection of TLS1.0/1.1/CBC/DHE and unknown/missing SNI.
+
+The compatibility fixture initially inherited the newer rolling default and
+incorrectly required H1 sockets to survive a normal config drain. Its config now
+explicitly selects hot mode to match the fixture's purpose; production defaults
+and rolling drain behavior are unchanged. That failed fixture run is retained
+separately and is not counted as a passing result.
 
 Reports are ignored by Git. Disposable private keys are never committed.
 The harness creates runtime state on a Linux filesystem, not a Windows-backed

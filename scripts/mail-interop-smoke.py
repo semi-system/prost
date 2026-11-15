@@ -170,6 +170,7 @@ def main():
 [runtime]
 admin_socket="/run/prost/admin.sock"
 artifact_dir="/var/lib/prost/artifacts"
+reload_mode="hot"
 max_connections=256
 max_requests=256
 max_proxy_connections=64
