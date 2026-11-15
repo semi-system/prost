@@ -334,16 +334,37 @@ async fn rolling_accept_before_first_headers_preserves_first_h1_h2_request() -> 
         let d1 = tokio::spawn(c1);
         let response = h1.send_request(request("/")).await?;
         assert_eq!(response.into_body().collect().await?.to_bytes(), "a");
-        let (mut h2, c2) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(first_h2))
-                .await?;
+        // Exercise the accepted stream and graceful GOAWAY directly. Hyper's
+        // client dispatcher polls readiness again after opening a stream; a
+        // concurrent GOAWAY can close that dispatch slot despite the server
+        // having accepted the stream. The wire-level client retains its
+        // response future independently of readiness for subsequent requests.
+        let (mut h2, c2) = h2::client::handshake(first_h2)
+            .await
+            .context("H2 handshake on socket accepted before rolling")?;
         let d2 = tokio::spawn(c2);
-        let response = h2.send_request(request("/")).await?;
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "a");
+        h2 = h2.ready().await?;
+        let (response, _) =
+            h2.send_request(Request::builder().uri("http://localhost/").body(())?, true)?;
+        let response = response
+            .await
+            .context("first H2 request on retired worker")?;
+        assert_eq!(response.status(), 200);
+        let mut stream = response.into_body();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.data().await {
+            let chunk = chunk.context("first H2 body on retired worker")?;
+            stream.flow_control().release_capacity(chunk.len())?;
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"a");
+        drop(stream);
         drop(h1);
         drop(h2);
         timeout(Duration::from_secs(2), d1).await???;
-        timeout(Duration::from_secs(2), d2).await???;
+        timeout(Duration::from_secs(2), d2)
+            .await??
+            .context("H2 driver after retired worker completed first response")?;
         p.wait_for_workers(1, 3000).await?;
         let (mut fresh, conn) =
             crate::http1::handshake(TokioIo::new(TcpStream::connect(f.address()).await?)).await?;

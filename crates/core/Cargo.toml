@@ -40,6 +40,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 [dev-dependencies]
+h2 = "0.4.20"
 async-compression.workspace = true
 tempfile.workspace = true
 rcgen = "0.13"
