@@ -182,12 +182,19 @@ private_key = "/certs/api.key"
             ctl("validate", "--file", "/certs/rotate.toml")
             assert ctl("status")["generation"] == generation
             ctl("apply", "--file", "/certs/rotate.toml", "--if-generation", str(generation))
-            http(old_http, "api.example.test", "green")
+            # A completed HTTP keepalive drains when its worker is retired.
+            # Existing TCP streams remain usable until closed/deadline.
+            assert old_http.recv(1) == b"", "old HTTP keepalive did not drain"
+            old_http.close(); old_http = None
             echo(old_tcp)
             with connect("api.example.test", certificate="api-next") as stream:
                 http(stream, "api.example.test", "green")
             with connect("mail.example.test", args.tcp_port, "api-next") as stream:
                 echo(stream)
+            old_tcp.close(); old_tcp = None
+            assert ctl("workers", "wait", "--generation", str(generation+1), "--timeout", "10")["drained"] is True
+            old_tcp = connect("mail.example.test", args.tcp_port, "api-next")
+            echo(old_tcp)
             state = ctl("status")
             ctl("apply", "--file", "/certs/bad.toml", "--if-generation", str(state["generation"]), succeeds=False)
             unchanged = ctl("status")
@@ -195,18 +202,26 @@ private_key = "/certs/api.key"
             ctl("apply", "--file", "/certs/strict.toml", "--if-generation", str(state["generation"]))
             rejected("unknown.other.test")
             rejected(None)
-            http(old_http, "api.example.test", "green")
+            with connect("api.example.test", certificate="api-next") as stream:
+                http(stream, "api.example.test", "green")
             echo(old_tcp)
             final = ctl("status")
-            old_http.close(); old_http = None
             old_tcp.close(); old_tcp = None
+            assert ctl("workers", "wait", "--generation", str(final["generation"]), "--timeout", "10")["drained"] is True
             # Restart can only use the committed artifacts after all source keys/certs disappear.
             for label in subjects:
                 (directory / f"{label}.pem").unlink()
                 (directory / f"{label}.key").unlink()
             run(*compose, "restart", "prost")
-            with connect("api.example.test", certificate="api-next") as stream:
-                http(stream, "api.example.test", "green")
+            deadline = time.monotonic()+20
+            while True:
+                try:
+                    with connect("api.example.test", certificate="api-next") as stream:
+                        http(stream, "api.example.test", "green")
+                    break
+                except (OSError, HTTPException):
+                    if time.monotonic() >= deadline: raise
+                    time.sleep(.1)
             with connect("mail.example.test", args.tcp_port, "api-next") as stream:
                 echo(stream)
             rejected("unknown.other.test")
@@ -217,7 +232,7 @@ private_key = "/certs/api.key"
                                 capture_output=True, text=True).stdout.strip(),
                 "generation": final["generation"], "duration_seconds": time.monotonic() - started,
                 "checks": ["exact/wildcard precedence", "default/no SNI", "HTTP host routing", "TCP TLS",
-                    "CLI validate/apply", "certificate rotation", "live HTTP/TCP sessions", "key mismatch rollback",
+                    "CLI validate/apply", "certificate rotation", "HTTP keepalive drain/TCP stream survival", "key mismatch rollback",
                     "unknown/no SNI rejection", "artifact restart without source files"]}, indent=2) + "\n")
             print(f"PASS: SNI Docker/CLI smoke; report {args.output}", flush=True)
         except BaseException:
