@@ -109,6 +109,7 @@ upstream="echo"
         # fixture's network namespace; no metrics port is exposed on the host.
         containers.append(monitor)
         run("docker", "run", "-d", "--name", monitor, "--network", "container:"+name,
+            "--pid", "container:"+name,
             "--memory", "64m", "--cpus", "0.25", "python:3.13-alpine", "python", "-c", "import time; time.sleep(3600)", stdout=subprocess.DEVNULL)
 
         def get():
@@ -131,7 +132,7 @@ upstream="echo"
             return values
 
         def process():
-            raw = run("docker", "exec", name, "cat", "/proc/1/stat", capture_output=True, text=True).stdout
+            raw = run("docker", "exec", monitor, "python", "-c", "from pathlib import Path; print(Path('/proc/1/stat').read_text())", capture_output=True, text=True).stdout
             fields = raw[raw.rfind(")")+2:].split()
             return {"cpu_ticks":int(fields[11])+int(fields[12]), "threads":int(fields[17])}
 

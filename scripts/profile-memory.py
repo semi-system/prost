@@ -111,6 +111,10 @@ def main():
     p.add_argument("--streams", type=int, default=32)
     p.add_argument("--output-dir", type=Path, required=True)
     args = p.parse_args()
+    if args.heap:
+        image_info = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image], text=True))[0]
+        if (image_info["Config"].get("Labels") or {}).get("io.prost.runtime") == "baseless-static":
+            p.error("heaptrack needs a dynamically linked GNU profiling image; Baseless static supports RSS/FD/thread measurements without --heap")
     if min(args.requests, args.clients, args.streams) < 1: p.error("counts must be positive")
     output = args.output_dir.resolve(); output.mkdir(parents=True, exist_ok=True)
     certs = ROOT / "test-results/advanced-fixtures/certs"

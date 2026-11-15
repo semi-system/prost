@@ -672,6 +672,8 @@ impl Collector for Exporter {
         let mut emit = |name: &str, values: &[&str], value: f64| {
             let index = DEFINITIONS.iter().position(|d| d.0 == name).unwrap();
             let mut metric = Metric::default();
+            // Infer Vec or RepeatedField when an embedding application enables
+            // Prometheus protobuf through Cargo feature unification.
             metric.set_label(
                 DEFINITIONS[index]
                     .3
@@ -683,8 +685,7 @@ impl Collector for Exporter {
                         pair.set_value((*val).into());
                         pair
                     })
-                    .collect::<Vec<_>>()
-                    .into(),
+                    .collect(),
             );
             if DEFINITIONS[index].2 == MetricType::COUNTER {
                 let mut c = Counter::default();

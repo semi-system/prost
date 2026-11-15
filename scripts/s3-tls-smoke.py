@@ -102,6 +102,8 @@ private_key="file:///cases/certs/1/key.pem"
         s3_info = inspect(s3)
         for _ in range(120):
             try:
+                # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+                # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                 with urllib.request.urlopen(f"http://127.0.0.1:{port(s3_info)}/health/ready", timeout=1) as response:
                     if response.status == 200: break
             except OSError: pass
@@ -114,6 +116,8 @@ private_key="file:///cases/certs/1/key.pem"
         # Prove the fixture enforces authentication; a successful signed load
         # must not be explainable by an accidentally public object.
         try:
+            # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             with urllib.request.urlopen(f"http://127.0.0.1:{port(s3_info)}/prost-certs/tls/fullchain.pem", timeout=3):
                 raise AssertionError("S3 fixture allowed unsigned object GET")
         except HTTPError as error:

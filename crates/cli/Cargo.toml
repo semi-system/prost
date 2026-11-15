@@ -12,6 +12,9 @@ path = "src/prost.rs"
 [[bin]]
 name = "prostctl"
 path = "src/prostctl.rs"
+[[bin]]
+name = "prost-entrypoint"
+path = "src/entrypoint.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

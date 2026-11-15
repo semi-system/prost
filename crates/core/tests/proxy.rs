@@ -78,7 +78,7 @@ fn metric(p: &RunningProxy, name: &str, labels: &[(&str, &str)]) -> Option<f64> 
                     })
                 })
                 .map(|m| {
-                    if m.has_counter() {
+                    if f.get_field_type() == prometheus::proto::MetricType::COUNTER {
                         m.get_counter().get_value()
                     } else {
                         m.get_gauge().get_value()

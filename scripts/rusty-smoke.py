@@ -60,6 +60,8 @@ async def workload(port, context, ctl, container, out, requests):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             ctx.minimum_version = ctx.maximum_version = version
+        # Negative TLS fixture intentionally offers forbidden protocols/ciphers and asserts rejection; set_ciphers follows immediately.
+        # nosemgrep: python.lang.security.audit.insecure-transport.ssl.no-set-ciphers.no-set-ciphers
         ctx.set_ciphers(ciphers)
         try:
             _, writer = await connect(100, ctx)

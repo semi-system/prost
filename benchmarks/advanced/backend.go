@@ -27,6 +27,8 @@ func serve(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("x-upstream-http-version", r.Proto)
     if value := r.Header.Get("x-test-plugin"); value != "" { w.Header().Set("x-seen-plugin", value) }
     if r.URL.Path == "/ready" { w.Write([]byte("ready")); return }
+    // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+    // nosemgrep: go.lang.security.audit.xss.no-fprintf-to-responsewriter.no-fprintf-to-responsewriter
     if r.URL.Path == "/stats" { w.Header().Set("content-type", "application/json"); fmt.Fprintf(w, "{\"label\":%q,\"requests\":%d}", backendLabel, backendRequests.Load()); return }
     if strings.HasPrefix(r.URL.Path, "/cached/") { w.Header().Set("cache-control", "public,max-age=10") }
     if backendLabel != "" { w.Header().Set("x-backend", backendLabel); backendRequests.Add(1) }
@@ -36,6 +38,8 @@ func serve(w http.ResponseWriter, r *http.Request) {
         n, err := io.Copy(hash, io.LimitReader(r.Body, 16*1024*1024+1))
         if err != nil || n != 1048576 || !bytes.Equal(hash.Sum(nil), uploadHash[:]) { http.Error(w, "invalid upload", 400); return }
         w.Header().Set("Content-Type", "text/plain")
+        // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+        // nosemgrep: go.lang.security.audit.xss.no-fprintf-to-responsewriter.no-fprintf-to-responsewriter
         fmt.Fprintf(w, "%d:%s", n, hex.EncodeToString(hash.Sum(nil)))
         return
     }
@@ -48,7 +52,11 @@ func serve(w http.ResponseWriter, r *http.Request) {
         for i := 0; i < 16; i++ {
             prefix := make([]byte, 5)
             binary.BigEndian.PutUint32(prefix[1:], uint32(len(block)))
+            // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+            // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
             if _, err := w.Write(prefix); err != nil { return }
+            // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+            // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
             if _, err := w.Write(block); err != nil { return }
             w.(http.Flusher).Flush()
             time.Sleep(time.Millisecond)
@@ -69,6 +77,8 @@ func serve(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Length", strconv.Itoa(size))
     for size > 0 {
         n := min(size, len(block))
+        // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+        // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
         if _, err := w.Write(block[:n]); err != nil { return }
         size -= n
         if stream { w.(http.Flusher).Flush(); time.Sleep(2*time.Millisecond) }

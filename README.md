@@ -83,6 +83,9 @@ push lên nhánh mặc định publish `ghcr.io/semi-system/prost:latest` và
 `packages: write`, không cần PAT riêng. Image là Linux amd64, WASM tắt mặc định.
 Semgrep/Trivy giữ gate strict, kể cả CVE chưa có bản vá; findings sẽ chặn publish.
 Report được lưu trong artifact `image-security-reports` của workflow.
+Runtime dùng Baseless static, binary musl có dependency metadata để Trivy quét;
+gate inventory/advisory Baseless cũng phải đạt trước publish:
+[docs/image-security.md](docs/image-security.md).
 Chạy image đã publish trên VM Linux và giữ state qua restart:
 [docs/vm-soak.md](docs/vm-soak.md).
 

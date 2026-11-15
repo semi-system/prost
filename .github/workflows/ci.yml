@@ -15,7 +15,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build developer image
         run: docker build -f Dockerfile.dev -t prost-dev .
       - name: Format
@@ -52,7 +52,7 @@ jobs:
           docker compose -f benchmarks/balance/compose.yaml logs
       - name: Protocol reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: advanced-protocol-reports
           path: test-results/advanced-ci
@@ -72,17 +72,19 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Build, scan and publish image
-        uses: abxst/actions/strict@v5
+      - name: Build and scan image
+        id: image
+        uses: abxst/actions/strict@670736025c229e0c308fc9a488cd5f008a96ca74 # v5
         with:
           registry: ghcr.io
           image-name: ${{ github.repository }}
           context: .
           dockerfile: ./Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          # Publish the exact scanned image only after the Baseless gate below.
+          push: 'false'
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           build-args: |
@@ -92,3 +94,69 @@ jobs:
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
           report-artifact-name: image-security-reports
+      - name: Verify Rust binary audit coverage
+        env:
+          REPORT: ${{ runner.temp }}/trivy-report.json
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path(os.environ["REPORT"]).read_text())
+          expected = {"usr/local/bin/prost", "usr/local/bin/prostctl", "usr/local/bin/prost-entrypoint"}
+          found = {r.get("Target", "").lstrip("/") for r in report.get("Results", []) if r.get("Type") == "rustbinary"}
+          missing = expected - found
+          if missing:
+              raise SystemExit("Missing Rust dependency audit coverage: " + ", ".join(sorted(missing)))
+          print("Verified Rust binary dependency coverage for all three executables")
+          PY
+      - name: Verify Baseless inventory and advisories
+        uses: semi-system/baseless/scan@c9f6e9663c636e69dfa295058b896465a2dff962
+        with:
+          image: ghcr.io/${{ steps.image.outputs.image-name-lc }}:scan
+          report: ${{ runner.temp }}/baseless-report.json
+      - name: Baseless report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: baseless-security-report
+          path: ${{ runner.temp }}/baseless-report.json
+          if-no-files-found: ignore
+      - name: Login for publication
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish exact scanned image
+        id: publish
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          SOURCE_IMAGE: ghcr.io/${{ steps.image.outputs.image-name-lc }}:scan
+          IMAGE_TAGS: ${{ steps.image.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          source_id=$(docker image inspect "$SOURCE_IMAGE" --format '{{.Id}}')
+          first_digest=''
+          pushed=0
+          # Promote the floating tag only after the immutable commit tag exists.
+          ordered_tags=$(printf '%s\n' "$IMAGE_TAGS" | awk 'NF && !/:latest$/ {print} /:latest$/ {latest=$0} END {if (latest != "") print latest}')
+          while IFS= read -r target; do
+            [[ -z "$target" ]] && continue
+            docker tag "$SOURCE_IMAGE" "$target"
+            [[ "$(docker image inspect "$target" --format '{{.Id}}')" == "$source_id" ]]
+            log_file=$(mktemp)
+            docker push "$target" 2>&1 | tee "$log_file"
+            digest=$(sed -n 's/.*digest: \(sha256:[a-f0-9]*\).*/\1/p' "$log_file" | tail -n 1)
+            rm -f "$log_file"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            if [[ -z "$first_digest" ]]; then
+              first_digest="$digest"
+            else
+              [[ "$digest" == "$first_digest" ]]
+            fi
+            printf 'Published image: %s@%s\n' "${target%:*}" "$digest" >> "$GITHUB_STEP_SUMMARY"
+            pushed=$((pushed + 1))
+          done <<< "$ordered_tags"
+          [[ "$pushed" -gt 0 ]]
+          echo "digest=$first_digest" >> "$GITHUB_OUTPUT"

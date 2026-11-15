@@ -30,6 +30,8 @@ with tempfile.TemporaryDirectory(prefix="prost-image-smoke-") as directory:
         deadline=time.monotonic()+20
         while True:
             try:
+                # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+                # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected,python.lang.security.audit.insecure-transport.urllib.insecure-urlopen.insecure-urlopen
                 with urllib.request.urlopen("http://127.0.0.1:18088/",timeout=2) as response:
                     if response.status==200:
                         break

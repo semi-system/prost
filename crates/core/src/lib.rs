@@ -296,12 +296,14 @@ pub struct RunningProxy {
 }
 pub struct ProxyBuilder {
     path: PathBuf,
+    seed: Option<PathBuf>,
     registry: PluginRegistry,
 }
 impl ProxyBuilder {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         Ok(Self {
             path: path.into(),
+            seed: None,
             registry: PluginRegistry::new()?,
         })
     }
@@ -309,10 +311,45 @@ impl ProxyBuilder {
         self.registry = registry;
         self
     }
+    /// Bootstrap a missing managed config from this source. An existing config
+    /// always remains authoritative, including when it fails validation.
+    pub fn seed(mut self, path: impl Into<PathBuf>) -> Self {
+        self.seed = Some(path.into());
+        self
+    }
     pub async fn start(self) -> Result<Arc<RunningProxy>> {
-        let path = std::fs::canonicalize(&self.path).context("config path must exist")?;
+        let path = match std::fs::canonicalize(&self.path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.seed.is_some() => {
+                // Do not replace a dangling symlink or create a partial config.
+                ensure!(
+                    std::fs::symlink_metadata(&self.path).is_err(),
+                    "managed config path already exists"
+                );
+                let parent = self
+                    .path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                std::fs::canonicalize(parent)
+                    .context("managed config directory must exist")?
+                    .join(
+                        self.path
+                            .file_name()
+                            .context("managed config filename required")?,
+                    )
+            }
+            Err(error) => return Err(error).context("config path must exist"),
+        };
         let lock = storage::lock(&path)?;
-        let raw = Config::parse(&std::fs::read_to_string(&path)?)?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.seed.is_some() => {
+                std::fs::read_to_string(self.seed.as_ref().unwrap()).context("read startup seed")?
+            }
+            Err(error) => return Err(error).context("read managed config"),
+        };
+        let raw = Config::parse(&text)?;
         let artifacts = Arc::new(storage::ArtifactStore::open(&raw.runtime.artifact_dir)?);
         let access_log = raw
             .runtime

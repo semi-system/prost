@@ -36,6 +36,8 @@ def ready(port):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         try:
+            # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                 if r.status == 200 and json.load(r) == {"backend": "green", "path": "/"}:
                     return

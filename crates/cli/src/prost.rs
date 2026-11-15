@@ -12,6 +12,9 @@ enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
+        /// Bootstrap only when the managed config is missing.
+        #[arg(long)]
+        seed: Option<PathBuf>,
     },
     Check {
         #[arg(long)]
@@ -40,8 +43,12 @@ async fn run() -> Result<()> {
                 "configuration valid (schema only; use prostctl validate for TLS/WASM checks)"
             );
         }
-        Command::Run { config } => {
-            let proxy = prost_core::ProxyBuilder::new(config)?.start().await?;
+        Command::Run { config, seed } => {
+            let mut builder = prost_core::ProxyBuilder::new(config)?;
+            if let Some(seed) = seed {
+                builder = builder.seed(seed);
+            }
+            let proxy = builder.start().await?;
             let control = match prost_control::ControlServer::bind(proxy.clone()).await {
                 Ok(v) => v,
                 Err(e) => {

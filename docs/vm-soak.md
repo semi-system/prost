@@ -3,6 +3,9 @@
 Dùng tag theo commit hoặc digest được workflow publish. Giữ nguyên image trong
 suốt đợt test để đối chiếu lỗi/tài nguyên; không tự cập nhật `latest` giữa chừng.
 Workflow build Linux amd64, native, WASM tắt.
+Runtime là Baseless static và chạy UID/GID 10001; không có shell/package manager.
+Gọi quản trị bằng `docker exec prost prostctl ...`. Chi tiết các gate publish:
+[image-security.md](image-security.md).
 
 Nếu package GHCR private, đăng nhập bằng tài khoản có quyền đọc package và token
 `read:packages`. Truyền token qua stdin, không ghi token vào command history hoặc
@@ -44,7 +47,8 @@ trên VM; kiểm tra chúng chưa bị service khác chiếm. Metrics nếu cấ
 `127.0.0.1:9090` có thể được collector trên chính VM đọc. Admin API vẫn là Unix
 socket trong container, gọi bằng `docker exec`.
 
-Seed chỉ được copy khi volume chưa có config. Sau đó daemon quản lý config trong
+Seed chỉ được Core nạp khi volume chưa có config; commit ban đầu cũng được
+validate và lưu atomic dưới config lock. Sau đó daemon quản lý config trong
 volume; sửa seed không tự kích hoạt cập nhật. Apply có validate và rolling drain:
 
 ```sh
@@ -61,6 +65,7 @@ Trong đợt test, lưu image digest/ID, config generation, log lỗi, CPU/RSS/F
 health backend, latency và số request thất bại. Giới hạn CPU/RAM và workload nên
 được giữ nhất quán giữa các lần đối chiếu. Thử restart container và reload config
 trong lúc có stream dài; kiểm tra forced drain và generation cũ được thu hồi.
+Nếu đổi `drain_seconds`, chỉnh `--stop-timeout` lớn hơn deadline drain tương ứng.
 `restart unless-stopped` tự phục hồi container khi process thoát, không thay thế
 việc theo dõi lỗi và ghi nhận downtime.
 

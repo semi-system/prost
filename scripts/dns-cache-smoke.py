@@ -116,7 +116,11 @@ upstream="tcp"
         return dict(response.getheaders())
     def map_host(ip):
         # Explicit arguments, no shell interpolation of user paths or config.
-        run("docker", "exec", "-u", "0", name, "sh", "-c", 'printf "%s\\n" "$1" > /etc/hosts', "sh", f"127.0.0.1 localhost\n{ip} moving.test")
+        hosts = inspect(name)["HostsPath"]
+        run("docker", "run", "--rm", "--network", "none", "--memory", "64m",
+            "-v", f"{hosts}:/fixture-hosts", "python:3.13-alpine", "python", "-c",
+            "import sys; from pathlib import Path; Path('/fixture-hosts').write_text(sys.argv[1])",
+            f"127.0.0.1 localhost\n{ip} moving.test\n")
         time.sleep(.35)
     def calls(origin):
         origin.request("GET", "/stats"); response=origin.getresponse(); assert response.status == 200

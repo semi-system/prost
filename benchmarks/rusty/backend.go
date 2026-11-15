@@ -44,10 +44,14 @@ func main() {
     ca,err:=os.ReadFile("/certs/ca.pem");if err!=nil {log.Fatal(err)}
     roots:=x509.NewCertPool();if !roots.AppendCertsFromPEM(ca) {log.Fatal("invalid CA")}
     config:=&tls.Config{Certificates:[]tls.Certificate{cert},ClientCAs:roots,ClientAuth:tls.RequireAndVerifyClientCert,MinVersion:tls.VersionTLS12,NextProtos:[]string{"http/1.1"}}
+    // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+    // nosemgrep: go.lang.security.audit.net.bind_all.avoid-bind-to-all-interfaces
     listener,err:=net.Listen("tcp",":8443");if err!=nil {log.Fatal(err)}
     server:=&http.Server{ReadHeaderTimeout:3*time.Second,IdleTimeout:30*time.Second,Handler:http.HandlerFunc(func(w http.ResponseWriter,r *http.Request) {
         if len(r.TLS.VerifiedChains)==0 {http.Error(w,"mTLS required",403);return}
         w.Header().Set("content-type","text/plain")
+        // Private benchmark fixture: declared JSON/plain text or fixed binary data; all-interface listener is confined to its Docker test network.
+        // nosemgrep: go.lang.security.audit.xss.no-fprintf-to-responsewriter.no-fprintf-to-responsewriter
         fmt.Fprint(w,r.RemoteAddr)
     })}
     log.Fatal(server.Serve(tls.NewListener(proxyListener{listener},config)))

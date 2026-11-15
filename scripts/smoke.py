@@ -28,6 +28,8 @@ def ctl(*args):
 
 
 def http_status():
+    # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
     with urllib.request.urlopen(options.http_url, timeout=3) as response:
         return json.load(response)["backend"]
 
@@ -63,6 +65,8 @@ ctl("apply", "--file", "/examples/prost.toml")
 wait_backend("blue")
 ctl("validate", "--file", "/examples/native-headers.toml")
 ctl("apply", "--file", "/examples/native-headers.toml")
+# CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+# nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
 with urllib.request.urlopen(options.http_url, timeout=3) as response:
     assert response.headers["x-proxy"] == "prost"
     assert response.headers["x-status"] == "200"
@@ -74,6 +78,8 @@ ctl("apply", "--file", "/examples/native-policies.toml")
 def policy_request(key, origin, expected):
     request = urllib.request.Request(options.http_url, headers={"x-api-key":key,"origin":origin})
     try:
+        # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         response = urllib.request.urlopen(request, timeout=3)
     except urllib.error.HTTPError as error:
         response = error
@@ -97,6 +103,8 @@ ctl("apply", "--file", "/examples/rewrite.toml")
 root = options.http_url.rstrip("/")
 for path, expected, current in [("/api/v1/item?q=1", "/api/v2/item?q=1", "/api/v2/item"),
                                  ("/users/42?q=1", "/profiles/42?source=legacy&q=1", "/profiles/42")]:
+    # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
     with urllib.request.urlopen(root + path, timeout=3) as response:
         assert json.load(response)["path"] == expected
         assert response.headers["x-original-uri"] == path
@@ -116,6 +124,8 @@ ctl("validate", "--file", "/examples/balancing.toml")
 ctl("apply", "--file", "/examples/balancing.toml")
 def sticky(key):
     request = urllib.request.Request(root + "/sticky/item", headers={"x-session":key})
+    # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
     with urllib.request.urlopen(request, timeout=3) as response:
         return json.load(response)["backend"]
 owners = [sticky(f"session-{i}") for i in range(32)]
@@ -145,6 +155,8 @@ ctl("validate", "--file", "/examples/passive-health.toml")
 ctl("apply", "--file", "/examples/passive-health.toml")
 for _ in range(3):
     try:
+        # CLI-only test fixture URL, controlled by the test/operator; no remote user input or production TLS artifact fetching.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         urllib.request.urlopen(root + "/status/503", timeout=3)
         raise AssertionError("expected original upstream 503")
     except urllib.error.HTTPError as error:

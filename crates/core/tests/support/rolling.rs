@@ -364,3 +364,59 @@ async fn rolling_accept_before_first_headers_preserves_first_h1_h2_request() -> 
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_seed_commits_atomically_and_never_overrides_managed_config() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let backend = tagged(b'A').await?;
+    let f = Fixture::new(Protocol::Tcp, backend.address);
+    let seed = f.dir.path().join("seed.toml");
+    std::fs::copy(&f.path, &seed)?;
+    std::fs::remove_file(&f.path)?;
+    let occupied = TcpListener::bind(f.address()).await?;
+    assert!(ProxyBuilder::new(&f.path)?
+        .seed(&seed)
+        .start()
+        .await
+        .is_err());
+    assert!(
+        !f.path.exists(),
+        "failed startup published a partial config"
+    );
+    drop(occupied);
+    let proxy = ProxyBuilder::new(&f.path)?.seed(&seed).start().await?;
+    assert_eq!(
+        std::fs::metadata(&f.path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    let mut io = TcpStream::connect(f.address()).await?;
+    assert_eq!(io.read_u8().await?, b'A');
+    drop(io);
+    proxy.set_enabled("main/one".into(), false, 0).await?;
+    proxy.shutdown().await;
+    drop(proxy);
+    std::fs::remove_file(&seed)?;
+    let proxy = ProxyBuilder::new(&f.path)?.seed(&seed).start().await?;
+    assert_eq!(proxy.snapshot().config.generation, 1);
+    assert!(!proxy.snapshot().config.upstreams["main"].endpoints[0].enabled);
+    proxy.shutdown().await;
+    drop(proxy);
+    let valid = f.config.encode()?;
+    std::fs::write(&seed, valid)?;
+    std::fs::write(&f.path, "invalid managed config")?;
+    assert!(ProxyBuilder::new(&f.path)?
+        .seed(&seed)
+        .start()
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&f.path)?, "invalid managed config");
+    std::fs::remove_file(&f.path)?;
+    symlink(f.dir.path().join("missing"), &f.path)?;
+    assert!(ProxyBuilder::new(&f.path)?
+        .seed(&seed)
+        .start()
+        .await
+        .is_err());
+    assert!(!f.dir.path().join("missing").exists());
+    Ok(())
+}

@@ -1,29 +1,37 @@
-FROM rust:1.93-bookworm AS build
+FROM rust:1.93-bookworm AS toolchain
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl \
+    && cargo install cargo-auditable --version 0.7.7 --locked
+ENV CARGO_BUILD_JOBS=2
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+
+FROM toolchain AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-ENV CARGO_BUILD_JOBS=2
 ARG CARGO_PROFILE=release
 ARG CARGO_FEATURES=""
-RUN cargo build --workspace --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" \
+RUN cargo auditable build --workspace --locked --target x86_64-unknown-linux-musl --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" \
     && mkdir /out \
     && if [ "$CARGO_PROFILE" = dev ]; then \
-         cp target/debug/prost target/debug/prostctl /out/; \
+         cp target/x86_64-unknown-linux-musl/debug/prost target/x86_64-unknown-linux-musl/debug/prostctl target/x86_64-unknown-linux-musl/debug/prost-entrypoint /out/; \
        else \
-         cp "target/$CARGO_PROFILE/prost" "target/$CARGO_PROFILE/prostctl" /out/; \
-       fi
+         cp "target/x86_64-unknown-linux-musl/$CARGO_PROFILE/prost" "target/x86_64-unknown-linux-musl/$CARGO_PROFILE/prostctl" "target/x86_64-unknown-linux-musl/$CARGO_PROFILE/prost-entrypoint" /out/; \
+       fi \
+    && mkdir -p /runtime/run/prost /runtime/var/lib/prost /runtime/etc/prost
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 prost && useradd --uid 10001 --gid prost --no-create-home prost \
-    && mkdir -p /run/prost /var/lib/prost /etc/prost \
-    && chown -R prost:prost /run/prost /var/lib/prost /etc/prost
+FROM ghcr.io/semi-system/baseless-static@sha256:0818dee927a7fdd28e358e3337c891b878ebc58e9e20094d236ae3fe03a09f1b AS runtime
+LABEL io.prost.runtime="baseless-static"
+COPY --from=build --chown=10001:10001 /runtime/run/prost/ /run/prost/
+COPY --from=build --chown=10001:10001 /runtime/var/lib/prost/ /var/lib/prost/
+COPY --from=build --chown=10001:10001 /runtime/etc/prost/ /etc/prost/
 COPY --from=build /out/prost /out/prostctl /usr/local/bin/
+COPY --from=build /out/prost-entrypoint /usr/local/bin/prost-entrypoint
 COPY examples/prost.toml /etc/prost/seed.toml
-COPY scripts/entrypoint.sh /usr/local/bin/prost-entrypoint
-RUN chmod 755 /usr/local/bin/prost-entrypoint
-USER prost
+USER 10001:10001
+ENV HOME=/var/lib/prost
+WORKDIR /
 VOLUME ["/var/lib/prost"]
 EXPOSE 8080 9000
 ENTRYPOINT ["/usr/local/bin/prost-entrypoint"]

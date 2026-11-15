@@ -7,4 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends heaptrack procp
 COPY --from=binaries /usr/local/bin/prost /usr/local/bin/prostctl /usr/local/bin/
 COPY benchmarks/profiling/entrypoint.sh /usr/local/bin/prost-entrypoint
 RUN chmod 755 /usr/local/bin/prost-entrypoint
+# Opt-in heaptrack fixture requires root for host-owned trace mounts; the published runtime Dockerfile uses UID 10001.
+# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["/usr/local/bin/prost-entrypoint"]
