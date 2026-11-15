@@ -32,7 +32,10 @@ async def header(reader):
 def tls_context():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(ROOT / "fullchain.pem", ROOT / "privkey.pem")
+    # Pin one immutable version before opening either file. Resolving `current`
+    # separately for cert and key can mix generations during a renewal.
+    version = ROOT.resolve(strict=True)
+    context.load_cert_chain(version / "fullchain.pem", version / "privkey.pem")
     return context
 
 
