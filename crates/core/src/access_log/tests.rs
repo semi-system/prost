@@ -1,5 +1,56 @@
 use super::*;
 
+#[tokio::test]
+async fn stdout_sink_flush_reopen_and_shutdown_without_files() -> Result<()> {
+    if std::env::var_os("PROST_STDOUT_LOG_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "access_log::tests::stdout_sink_flush_reopen_and_shutdown_without_files",
+                "--nocapture",
+            ])
+            .env("PROST_STDOUT_LOG_CHILD", "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record.get("path").is_some())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["path"], "/stdout-before");
+        assert_eq!(records[1]["path"], "/stdout-after");
+        return Ok(());
+    }
+    let c = AccessLog {
+        sink: prost_config::LogSink::Stdout,
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir()?;
+    let managed = dir.path().join("missing/config.toml");
+    let artifacts = dir.path().join("missing/artifacts");
+    let log = Logger::start(&c, &managed, &artifacts)?;
+    for (path, reopen) in [("/stdout-before", false), ("/stdout-after", true)] {
+        if reopen {
+            assert_eq!(log.control(true).await?, 1);
+        }
+        let record = ticket(&log, path);
+        record.headers(200);
+        record.finish(Some(3), "complete");
+        drop(record);
+        log.control(false).await?;
+    }
+    log.shutdown().await?;
+    assert_eq!(log.counters.io_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(log.counters.processed.load(Ordering::Relaxed), 2);
+    assert!(!managed.parent().unwrap().exists());
+    Ok(())
+}
+
 fn config(dir: &Path) -> AccessLog {
     AccessLog {
         path: dir.join("access.jsonl"),

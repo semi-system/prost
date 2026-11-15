@@ -11,6 +11,7 @@ pub(crate) struct Generation {
     pub id: u64,
     pub rolling: bool,
     pub workers: Option<Arc<crate::workers::Workers>>,
+    pub snapshot: arc_swap::ArcSwapOption<crate::Snapshot>,
     pub accepting: CancellationToken,
     pub drain: CancellationToken,
     pub force: CancellationToken,
@@ -21,11 +22,17 @@ pub(crate) struct Generation {
     draining: Mutex<Option<(Instant, Duration)>>,
 }
 impl Generation {
-    pub fn new(id: u64, rolling: bool, workers: Option<Arc<crate::workers::Workers>>) -> Arc<Self> {
+    pub fn new(
+        id: u64,
+        rolling: bool,
+        workers: Option<Arc<crate::workers::Workers>>,
+        snapshot: Arc<crate::Snapshot>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             rolling,
             workers,
+            snapshot: arc_swap::ArcSwapOption::from(rolling.then_some(snapshot)),
             accepting: CancellationToken::new(),
             drain: CancellationToken::new(),
             force: CancellationToken::new(),

@@ -1,0 +1,36 @@
+[package]
+name = "prost-certd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "rcgen"] }
+libc.workspace = true
+prost-config = { path = "../config" }
+prost-control = { path = "../control" }
+prost-transport = { path = "../transport" }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "crypto"] }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

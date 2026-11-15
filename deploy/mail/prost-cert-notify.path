@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch committed edge certificate publications
+
+[Path]
+# Rootful Docker default data-root; adjust for your host or a bind mount.
+PathChanged=/var/lib/docker/volumes/prost-mail-certificates/_data/publication.json
+Unit=prost-cert-notify.service
+
+[Install]
+WantedBy=multi-user.target

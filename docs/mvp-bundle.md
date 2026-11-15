@@ -133,7 +133,7 @@ khai báo khi nguồn chưa được cho phép. V1 tối đa 108 byte, v2 payloa
 timeout mặc định 2 giây. TCP4/TCP6 và LOCAL/UNKNOWN được hỗ trợ; không dùng TLV
 để thay chứng thực TLS. Địa chỉ client được dùng cho ACL/rate/X-Forwarded-For/log;
 quyết định tin forwarded headers dùng peer transport thật. PROXY v2 egress, pool HTTP giữ đúng IP, chính sách TLS,
-health check mail và giới hạn IP đã có trong [rusty.md](rusty.md).
+health check mail và giới hạn IP đã có trong [mail-edge.md](mail-edge.md).
 
 ## Metrics tùy chọn
 

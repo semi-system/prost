@@ -94,6 +94,7 @@ pub struct FilterCall<'a> {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AccessConfig {
+    require_allowlist: bool,
     allow: Vec<IpNet>,
     deny: Vec<IpNet>,
 }
@@ -104,10 +105,35 @@ impl IpAccess {
     pub fn new(value: serde_json::Value) -> Result<Self> {
         let config: AccessConfig = serde_json::from_value(value)?;
         ensure!(
+            !config.require_allowlist
+                || (!config.allow.is_empty() && config.allow.iter().all(|n| n.prefix_len() > 0)),
+            "required allow-list must be nonempty and must not contain an IPv4/IPv6 /0"
+        );
+        ensure!(
             config.allow.len() + config.deny.len() <= 256,
             "too many ACL rules"
         );
         Ok(Self { config })
+    }
+}
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+    #[test]
+    fn required_allowlist_rejects_empty_and_both_default_routes() {
+        for allow in [
+            serde_json::json!([]),
+            serde_json::json!(["0.0.0.0/0"]),
+            serde_json::json!(["::/0"]),
+        ] {
+            assert!(
+                IpAccess::new(serde_json::json!({"require_allowlist":true,"allow":allow})).is_err()
+            );
+        }
+        assert!(IpAccess::new(
+            serde_json::json!({"require_allowlist":true,"allow":["192.0.2.0/24","2001:db8::/32"]})
+        )
+        .is_ok());
     }
 }
 impl NativeFilter for IpAccess {

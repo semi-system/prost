@@ -13,3 +13,4 @@ tokio-util.workspace = true
 tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
+rcgen = "0.13"

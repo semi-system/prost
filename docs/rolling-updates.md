@@ -1,5 +1,9 @@
 # Rolling worker khi reload cấu hình
 
+Riêng frontend certificate/SNI/TLS policy có thể dùng `prostctl tls reload`
+để giữ worker và phiên đang mở: [tls-refresh.md](tls-refresh.md).
+Các ngữ nghĩa drain bên dưới áp dụng full config apply/reload.
+
 Mặc định `reload_mode="rolling"`: parse/validate và chuẩn bị tài nguyên, khởi tạo
 thế hệ worker mới, clone socket lắng nghe hiện có, kiểm tra worker readiness,
 persist config/artifact, rồi chuyển accept và drain thế hệ cũ.

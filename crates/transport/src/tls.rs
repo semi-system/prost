@@ -7,6 +7,38 @@ use rustls::{
 };
 use std::{borrow::Cow, collections::HashMap, io::BufReader, path::Path, sync::Arc};
 
+#[derive(Clone, Debug)]
+pub struct CertificateInfo {
+    pub not_before: i64,
+    pub not_after: i64,
+    pub dns_names: Vec<String>,
+}
+pub fn certificate_info(pem: &[u8]) -> Result<CertificateInfo> {
+    let der = rustls_pemfile::certs(&mut BufReader::new(pem))
+        .next()
+        .context("missing leaf certificate")??;
+    ensure!(der.len() <= 1024 * 1024, "leaf certificate exceeds 1 MiB");
+    let (remaining, cert) = x509_parser::parse_x509_certificate(der.as_ref())
+        .map_err(|_| anyhow::anyhow!("invalid leaf certificate"))?;
+    ensure!(remaining.is_empty(), "trailing certificate DER");
+    let mut dns_names = Vec::new();
+    if let Some(san) = cert
+        .subject_alternative_name()
+        .map_err(|_| anyhow::anyhow!("invalid certificate SAN"))?
+    {
+        for name in &san.value.general_names {
+            if let x509_parser::extensions::GeneralName::DNSName(name) = name {
+                dns_names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    Ok(CertificateInfo {
+        not_before: cert.validity().not_before.timestamp(),
+        not_after: cert.validity().not_after.timestamp(),
+        dns_names,
+    })
+}
+
 #[derive(Debug)]
 struct SniResolver {
     default: Arc<CertifiedKey>,

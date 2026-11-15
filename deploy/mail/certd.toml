@@ -1,0 +1,18 @@
+# Replace example domains/contact, open public port 80 and accept CA terms.
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+contact = "mailto:ops@example.test"
+terms_agreed = true
+state_dir = "/var/lib/prost-certd"
+certificates_dir = "/certificates"
+admin_socket = "/run/prost/admin.sock"
+challenge_address = "0.0.0.0:8088"
+renew_before_seconds = 2592000
+retry_seconds = 300
+order_timeout_seconds = 180
+
+[[certificates]]
+id = "edge"
+domains = ["mail.example.test", "admin.example.test"]
+listeners = ["smtps", "imaps", "admin"]
+# Preserve each listener's existing strict SNI allow-list during renewal.
+add_sni_names = false

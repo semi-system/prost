@@ -43,6 +43,10 @@ enum Ctl {
         #[command(subcommand)]
         command: Config,
     },
+    Tls {
+        #[command(subcommand)]
+        command: Tls,
+    },
     Artifacts {
         #[command(subcommand)]
         command: Artifacts,
@@ -58,6 +62,18 @@ enum Ctl {
     Cache {
         #[command(subcommand)]
         command: Cache,
+    },
+}
+#[derive(Subcommand)]
+enum Tls {
+    /// Replace frontend TLS configuration without draining existing connections.
+    Reload {
+        listener: String,
+        /// TOML containing certificate/private_key and optional SNI/policy fields.
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        if_generation: Option<u64>,
     },
 }
 #[derive(Subcommand)]
@@ -251,6 +267,20 @@ async fn main() -> Result<()> {
             expected_generation: generation(&args.socket, if_generation).await?,
         },
         Ctl::Config { .. } => Command::Export,
+        Ctl::Tls {
+            command:
+                Tls::Reload {
+                    listener,
+                    file,
+                    if_generation,
+                },
+        } => Command::ReloadTls {
+            listener,
+            tls: Box::new(prost_config::ServerTls::parse(&std::fs::read_to_string(
+                file,
+            )?)?),
+            expected_generation: generation(&args.socket, if_generation).await?,
+        },
         Ctl::Cache { command } => match command {
             Cache::Status { upstream } => Command::CacheStatus { upstream },
             Cache::Entries {

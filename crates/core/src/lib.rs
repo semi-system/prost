@@ -17,6 +17,7 @@ mod route_match;
 mod storage;
 #[cfg(test)]
 mod storage_tests;
+mod tls_reload;
 mod workers;
 
 use anyhow::{ensure, Context, Result};
@@ -64,7 +65,7 @@ pub struct Metrics {
     pub commits: prometheus::IntCounter,
     pub latency: prometheus::Histogram,
     tls_latency: prometheus::Histogram,
-    transaction_latency: [prometheus::Histogram; 3],
+    transaction_latency: [prometheus::Histogram; 4],
     gc_runs: prometheus::IntCounterVec,
     gc_files: prometheus::IntCounter,
     gc_bytes: prometheus::IntCounter,
@@ -106,7 +107,7 @@ impl Metrics {
                 "prost_tls_handshake_seconds",
                 "Downstream TLS handshake duration excluding rejected admission",
             ))?,
-            transaction_latency: ["apply", "endpoint_patch", "validate"]
+            transaction_latency: ["apply", "endpoint_patch", "validate", "tls_reload"]
                 .map(|operation| transaction_latency.with_label_values(&[operation])),
             connections: prometheus::IntGauge::new(
                 "prost_connections",
@@ -180,6 +181,7 @@ impl PreparedUpstream {
     }
 }
 struct PreparedListener {
+    certificate_expirations: Vec<(String, i64)>,
     connection_admission: Vec<usize>,
     ip_capacity: Arc<ip_connections::IpConnections>,
     passthrough: Option<Arc<prost_transport::ClientHelloGuard>>,
@@ -411,6 +413,7 @@ impl ProxyBuilder {
             snapshot.config.generation,
             runtime.reload_mode == prost_config::ReloadMode::Rolling,
             workers,
+            snapshot.clone(),
         );
         let p = Arc::new(RunningProxy {
             proxy_connections: Arc::new(Semaphore::new(runtime.max_proxy_connections)),
@@ -457,9 +460,19 @@ fn prepare(
     previous: Option<&Snapshot>,
     worker_count: usize,
 ) -> Result<Snapshot> {
+    prepare_with_clients(config, registry, previous, worker_count, false)
+}
+fn prepare_with_clients(
+    config: Config,
+    registry: &PluginRegistry,
+    previous: Option<&Snapshot>,
+    worker_count: usize,
+    reuse_clients: bool,
+) -> Result<Snapshot> {
     config.validate()?;
-    let fresh_clients =
-        previous.is_some() && config.runtime.reload_mode == prost_config::ReloadMode::Rolling;
+    let fresh_clients = !reuse_clients
+        && previous.is_some()
+        && config.runtime.reload_mode == prost_config::ReloadMode::Rolling;
     let mut upstreams = BTreeMap::new();
     for (name, u) in &config.upstreams {
         if let Some(old) = previous.and_then(|s| s.upstreams.get(name)) {
@@ -638,6 +651,25 @@ fn prepare(
             previous_l.map(|old| old.config.plugins.as_slice()),
             previous_l.map(|old| &old.plugins),
         )?;
+        let certificate_expirations =
+            if let Some(old) = previous_l.filter(|old| old.config.tls == l.tls) {
+                old.certificate_expirations.clone()
+            } else if let Some(tls) = &l.tls {
+                let mut values = vec![(
+                    "default".into(),
+                    prost_transport::certificate_info(&std::fs::read(&tls.certificate)?)?.not_after,
+                )];
+                for cert in &tls.certificates {
+                    values.push((
+                        cert.server_names[0].clone(),
+                        prost_transport::certificate_info(&std::fs::read(&cert.certificate)?)?
+                            .not_after,
+                    ));
+                }
+                values
+            } else {
+                Vec::new()
+            };
         let has_hooks = plugins.iter().any(PreparedPlugin::has_event_hooks);
         let routes: Vec<Arc<Vec<PreparedPlugin>>> = l
             .routes
@@ -692,6 +724,7 @@ fn prepare(
         listeners.insert(
             l.id.clone(),
             Arc::new(PreparedListener {
+                certificate_expirations,
                 connection_admission: l
                     .plugins
                     .iter()
@@ -1096,7 +1129,7 @@ impl RunningProxy {
             } else {
                 None
             };
-            rolling::Generation::new(new.config.generation, true, workers)
+            rolling::Generation::new(new.config.generation, true, workers, new.clone())
         } else {
             previous_generation.clone()
         };
@@ -1182,6 +1215,7 @@ impl RunningProxy {
         generation.begin_drain(seconds);
         generation.accepts.close();
         generation.accepts.wait().await;
+        generation.snapshot.store(None);
         generation.tasks.close();
         *self.retiring.lock().unwrap() = Some(generation.clone());
         let weak = Arc::downgrade(self);
@@ -1214,7 +1248,7 @@ impl RunningProxy {
         id: String,
         sockets: workers::BoundListener,
         generation: Arc<rolling::Generation>,
-        pinned: Arc<Snapshot>,
+        _pinned: Arc<Snapshot>,
     ) {
         let cancel = self.shutdown.child_token();
         self.bindings.lock().unwrap().insert(
@@ -1224,20 +1258,18 @@ impl RunningProxy {
                 masters: sockets.masters,
             },
         );
-        let pinned = generation.rolling.then_some(pinned);
         for (handle, socket) in sockets.sockets {
             let weak = Arc::downgrade(self);
             let id = id.clone();
             let cancel = cancel.clone();
             let generation = generation.clone();
-            let pinned = pinned.clone();
             let accepts = generation.accepts.clone();
             self.tasks.spawn_on(accepts.track_future(async move {
                 loop {
                     let accepted=tokio::select!{biased;_=cancel.cancelled()=>break,_=generation.accepting.cancelled()=>break,a=socket.accept()=>a};
                     let (stream,peer)=match accepted {Ok(value)=>value,Err(error)=>{tracing::warn!(%error,"accept failed");tokio::time::sleep(Duration::from_millis(100)).await;continue;}};
                     let Some(p)=weak.upgrade() else{break;};
-                    let snapshot=pinned.clone().unwrap_or_else(||p.snapshot());
+                    let snapshot=if generation.rolling { generation.snapshot.load_full().expect("accept snapshot retained until accepts stop") } else { p.snapshot() };
                     let Some(listener)=snapshot.listeners.get(&id).cloned() else{continue;};
                     let global=match p.connections.clone().try_acquire_owned(){Ok(permit)=>permit,Err(_)=>continue};
                     let local=match listener.capacity.clone().try_acquire_owned(){Ok(permit)=>permit,Err(_)=>continue};

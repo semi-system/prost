@@ -1,0 +1,63 @@
+name: prost-mail
+services:
+  certd:
+    image: ${PROST_IMAGE:?Set PROST_IMAGE to a published immutable digest}
+    entrypoint: ["/usr/local/bin/prost-certd"]
+    command: ["run", "--config", "/etc/prost/certd.toml"]
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - ./certd.toml:/etc/prost/certd.toml:ro
+      - certd-state:/var/lib/prost-certd
+      - certificates:/certificates
+      - admin-socket:/run/prost
+    healthcheck:
+      test: ["CMD", "prost-certd", "check"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+    logging: &logging
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+  edge:
+    image: ${PROST_IMAGE:?Set PROST_IMAGE to a published immutable digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    depends_on:
+      certd: {condition: service_healthy}
+    ports:
+      - "25:10025"
+      - "587:10587"
+      - "143:10143"
+      - "465:10465"
+      - "993:10993"
+      - "443:10443"
+      - "80:10080"
+    volumes:
+      - ./edge.toml:/etc/prost/seed.toml:ro
+      - edge-state:/var/lib/prost
+      - certificates:/certificates:ro
+      - admin-socket:/run/prost
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "prostctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+volumes:
+  edge-state:
+  certd-state:
+  certificates:
+    name: prost-mail-certificates
+  admin-socket:
+# Attach your backend containers to this network. Their PROXY-v2 ports must
+# remain private; the public network is terminated by the edge only.
+networks:
+  default:
+    name: prost-mail

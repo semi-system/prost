@@ -45,6 +45,11 @@ pub struct NamedCertificate {
 }
 
 impl ServerTls {
+    pub fn parse(text: &str) -> Result<Self> {
+        let config: Self = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
     pub fn validate(&self) -> Result<()> {
         if let Some(policy) = &self.policy {
             policy.validate()?;

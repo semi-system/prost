@@ -34,6 +34,8 @@ mod cache_control;
 mod cache_freshness;
 #[path = "support/edge.rs"]
 mod edge;
+#[path = "support/health_local.rs"]
+mod health_local;
 #[path = "support/http1.rs"]
 mod http1;
 #[path = "support/http_routing.rs"]
@@ -42,6 +44,8 @@ mod http_routing;
 mod limits;
 #[path = "support/logging.rs"]
 mod logging;
+#[path = "support/mail.rs"]
+mod mail;
 #[path = "support/passthrough_routes.rs"]
 mod passthrough_routes;
 #[path = "support/pool_metrics.rs"]
@@ -50,10 +54,12 @@ mod pool_metrics;
 mod rate_tables;
 #[path = "support/rolling.rs"]
 mod rolling;
-#[path = "support/rusty.rs"]
-mod rusty;
 #[path = "support/timeouts.rs"]
 mod timeouts;
+#[path = "support/tls_batch.rs"]
+mod tls_batch;
+#[path = "support/tls_reload.rs"]
+mod tls_reload;
 #[path = "support/tls_uri.rs"]
 mod tls_uri;
 

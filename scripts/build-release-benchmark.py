@@ -44,12 +44,12 @@ try:
         "-e", "CARGO_BUILD_JOBS=2", builder, *command)
     with tempfile.TemporaryDirectory(prefix="prost-release-image-") as directory:
         context = Path(directory)
-        for binary in ("prost", "prostctl", "prost-entrypoint"):
+        for binary in ("prost", "prostctl", "prost-entrypoint", "prost-certd"):
             profile_dir = "debug" if args.profile == "dev" else "release"
             build_dir = f"{target}/{profile_dir}" if target else profile_dir
             run("docker", "cp", f"{name}:/work/target/{build_dir}/{binary}", str(context / binary))
         (context / "Dockerfile").write_text(
-            f"FROM {args.base_image}\nCOPY prost prostctl prost-entrypoint /usr/local/bin/\n"
+            f"FROM {args.base_image}\nCOPY prost prostctl prost-entrypoint prost-certd /usr/local/bin/\n"
             + ('LABEL io.prost.runtime="baseless-static"\n' if auditable else ''))
         run("docker", "build", "-t", tag, str(context))
 finally:

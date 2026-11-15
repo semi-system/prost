@@ -271,7 +271,7 @@ async fn smtp_starttls_health_rejects_silent_bad_capability_and_post_tls_stalls_
                         io.write_all(if mode == 2 {
                             b"554 unavailable\r\n"
                         } else {
-                            b"220 rusty ESMTP\r\n"
+                            b"220 mail ESMTP\r\n"
                         })
                         .await?;
                         let mut io = BufReader::new(io);
@@ -279,9 +279,9 @@ async fn smtp_starttls_health_rejects_silent_bad_capability_and_post_tls_stalls_
                         io.read_line(&mut line).await?;
                         anyhow::ensure!(line.starts_with("EHLO "), "expected EHLO");
                         io.write_all(if mode == 3 {
-                            b"250 rusty\r\n"
+                            b"250 mail\r\n"
                         } else {
-                            b"250-rusty\r\n250 STARTTLS\r\n"
+                            b"250-mail\r\n250 STARTTLS\r\n"
                         })
                         .await?;
                         line.clear();
@@ -296,7 +296,7 @@ async fn smtp_starttls_health_rejects_silent_bad_capability_and_post_tls_stalls_
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             return Ok(());
                         }
-                        io.write_all(b"250 rusty secured\r\n").await?;
+                        io.write_all(b"250 mail secured\r\n").await?;
                         line.clear();
                         io.read_line(&mut line).await?;
                         anyhow::ensure!(line == "QUIT\r\n", "QUIT after TLS");
@@ -732,9 +732,9 @@ async fn imap_pop3_banner_and_starttls_health_use_proxy_and_verified_mtls() -> R
                             io.write_all(if mode != 0 {
                                 b"-ERR broken\r\n"
                             } else if imap {
-                                b"* OK Rusty IMAP ready\r\n"
+                                b"* OK mail service IMAP ready\r\n"
                             } else {
-                                b"+OK Rusty POP3 ready\r\n"
+                                b"+OK mail service POP3 ready\r\n"
                             })
                             .await?;
                             if mode != 0 {

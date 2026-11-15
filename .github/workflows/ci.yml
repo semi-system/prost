@@ -36,6 +36,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y nghttp2-client
+          sudo python3 scripts/mail-edge-soak.py --image prost:mvp --duration 180 --clients 2 --output-dir test-results/advanced-ci/mail-edge
           python3 scripts/sni-smoke.py --image prost:mvp --output test-results/advanced-ci/sni-smoke.json
           docker tag prost:mvp prost:advanced-release
           python3 scripts/prepare-advanced-bench.py
@@ -102,12 +103,12 @@ jobs:
           import json, os
           from pathlib import Path
           report = json.loads(Path(os.environ["REPORT"]).read_text())
-          expected = {"usr/local/bin/prost", "usr/local/bin/prostctl", "usr/local/bin/prost-entrypoint"}
+          expected = {"usr/local/bin/prost", "usr/local/bin/prostctl", "usr/local/bin/prost-entrypoint", "usr/local/bin/prost-certd"}
           found = {r.get("Target", "").lstrip("/") for r in report.get("Results", []) if r.get("Type") == "rustbinary"}
           missing = expected - found
           if missing:
               raise SystemExit("Missing Rust dependency audit coverage: " + ", ".join(sorted(missing)))
-          print("Verified Rust binary dependency coverage for all three executables")
+          print("Verified Rust binary dependency coverage for all four executables")
           PY
       - name: Verify Baseless inventory and advisories
         uses: semi-system/baseless/scan@c9f6e9663c636e69dfa295058b896465a2dff962

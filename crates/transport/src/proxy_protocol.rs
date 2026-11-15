@@ -8,6 +8,14 @@ pub struct ProxyAddresses {
     pub destination: SocketAddr,
 }
 
+/// Health probes do not represent a proxied client. LOCAL carries no address or TLVs.
+pub async fn write_proxy_v2_local(io: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    io.write_all(b"\r\n\r\n\0\r\nQUIT\n\x20\x00\x00\x00")
+        .await?;
+    Ok(())
+}
+
 /// Fixed-size binary TCP address header. No caller-supplied bytes or TLVs.
 pub async fn write_proxy_v2(
     io: &mut (impl tokio::io::AsyncWrite + Unpin),

@@ -243,12 +243,13 @@ pub(crate) async fn probe(upstream: &PreparedUpstream, index: usize) -> bool {
         } else {
             endpoint.address.clone()
         };
-        let stream = prost_transport::connect_plain_resolved(
+        let stream = prost_transport::connect_plain_with_proxy_command(
             &address,
             upstream.config.connect_timeout_ms,
             policy
                 .send_proxy_v2
-                .unwrap_or(upstream.config.send_proxy_v2),
+                .unwrap_or(upstream.config.send_proxy_v2)
+                .then_some(policy.proxy_v2_command),
             None,
             upstream.dns.as_deref(),
         )

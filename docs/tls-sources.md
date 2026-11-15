@@ -82,6 +82,9 @@ artifact đã commit, không cần nguồn online. GC giữ cả CA riêng của
 Thay nội dung file/object/URL không tự rotate cert. Gửi lại candidate có URI qua
 `prostctl apply`/`reload` để lấy phiên bản mới. URL presign hết hạn sau commit
 không ảnh hưởng bản đã tải; thời hạn certificate vẫn phải được quản lý riêng.
+Riêng frontend TLS có thể dùng `prostctl tls reload` để lấy lại URI mà không
+drain phiên mail: [tls-refresh.md](tls-refresh.md). Cần certificate agent bên ngoài
+để tự gửi transaction khi gia hạn hoặc khi S3 thông báo thay đổi.
 Với cặp cert/key trên S3, nên dùng prefix release bất biến hoặc versionId cho
 từng object để tránh đọc lẫn hai lần phát hành. Validate và apply là hai lượt
 độc lập; apply luôn kiểm tra lại.

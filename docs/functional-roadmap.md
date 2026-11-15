@@ -15,6 +15,10 @@ kết luận và giới hạn đã ghi, không dùng để xác nhận chức n�
 | Rolling worker generation | Đã bổ sung | Prepare/readiness trước commit, clone socket, drain có deadline, tối đa hai thế hệ |
 | Chờ và quan sát rolling | Đã bổ sung | Runtime API `reload.wait`, CLI `reload --wait`/`workers wait`, connection/task/deadline và metrics |
 | TLS artifact URI/S3 | Đã bổ sung | File/HTTP(S)/SigV4 S3, versionId, staging và restart offline từ hash artifact |
+| Frontend TLS refresh giữ phiên | Đã bổ sung | `tls.reload`, generation CAS, persist/GC, không thay worker hoặc bắt đầu drain |
+| Health PROXY v2 LOCAL | Đã bổ sung | Command configurable, 16 byte/length 0; traffic giữ PROXY/IP thật; decoder độc lập đã kiểm tra |
+| Access/session log stdout | Đã bổ sung | Sink stdout, bounded queue, flush/reopen/shutdown; rootfs không cần writable cho log |
+| ACME/cert-sync và expiry metrics | Đã bổ sung | Agent HTTP-01, batch TLS API, shared volume/notification và expiry; cần soak đủ 24 giờ và kiểm chứng ứng dụng triển khai |
 
 Routing hiện tại kết hợp host/path prefix/method/header với priority. Native
 header/map/rewrite tiếp tục là filter sau khi đã chọn route.

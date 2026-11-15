@@ -78,7 +78,7 @@ type Reply = oneshot::Sender<std::result::Result<u64, String>>;
 enum Event {
     Record(Queued),
     Flush(Reply),
-    Reopen(File, Reply),
+    Reopen(Output, Reply),
     Stop(Reply),
 }
 pub(crate) struct Logger {
@@ -90,6 +90,24 @@ pub(crate) struct Logger {
     pub counters: Arc<Counters>,
     closed: AtomicBool,
     sequence: AtomicU64,
+}
+enum Output {
+    File(File),
+    Stdout(std::io::Stdout),
+}
+impl Write for Output {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(f) => f.write(data),
+            Self::Stdout(s) => s.write(data),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(f) => f.flush(),
+            Self::Stdout(s) => s.flush(),
+        }
+    }
 }
 fn open_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
@@ -128,22 +146,27 @@ impl Logger {
         serde_json::json!({"enabled":true,"writer_alive":c.alive.load(Ordering::Acquire),"accepted":c.accepted.load(Ordering::Relaxed),"processed":c.processed.load(Ordering::Relaxed),"pending":c.pending.load(Ordering::Relaxed),"active":c.active.load(Ordering::Relaxed),"sampled_out":c.sampled_out.load(Ordering::Relaxed),"dropped_queue_full":c.dropped[0].load(Ordering::Relaxed),"dropped_io_uncertain":c.dropped[1].load(Ordering::Relaxed),"dropped_closed":c.dropped[2].load(Ordering::Relaxed),"io_errors":c.io_errors.load(Ordering::Relaxed),"reopens":c.reopens.load(Ordering::Relaxed),"flushes":c.flushes.load(Ordering::Relaxed)})
     }
     pub fn start(config: &AccessLog, managed_config: &Path, artifacts: &Path) -> Result<Arc<Self>> {
-        let parent = std::fs::canonicalize(
-            config
-                .path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new(".")),
-        )?;
-        let path = parent.join(config.path.file_name().context("access log filename")?);
-        ensure!(
-            !parent.starts_with(artifacts)
-                && path != managed_config
-                && path != managed_config.with_extension("toml.lock"),
-            "access log cannot overwrite config, locks or managed artifacts"
-        );
-        let file =
-            open_file(&path).with_context(|| format!("open access log {}", path.display()))?;
+        let (path, file) = if config.sink == prost_config::LogSink::Stdout {
+            (PathBuf::new(), Output::Stdout(std::io::stdout()))
+        } else {
+            let parent = std::fs::canonicalize(
+                config
+                    .path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )?;
+            let path = parent.join(config.path.file_name().context("access log filename")?);
+            ensure!(
+                !parent.starts_with(artifacts)
+                    && path != managed_config
+                    && path != managed_config.with_extension("toml.lock"),
+                "access log cannot overwrite config, locks or managed artifacts"
+            );
+            let file =
+                open_file(&path).with_context(|| format!("open access log {}", path.display()))?;
+            (path, Output::File(file))
+        };
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let counters = Arc::new(Counters::default());
         counters.alive.store(1, Ordering::Relaxed);
@@ -209,7 +232,9 @@ impl Logger {
             "access log is shutting down"
         );
         let (tx, rx) = oneshot::channel();
-        let event = if reopen {
+        let event = if reopen && self.config.sink == prost_config::LogSink::Stdout {
+            Event::Reopen(Output::Stdout(std::io::stdout()), tx)
+        } else if reopen {
             let path = self.path.clone();
             let config = self.managed_config.clone();
             let artifacts = self.artifacts.clone();
@@ -224,7 +249,7 @@ impl Logger {
                             && resolved != config.with_extension("toml.lock"),
                         "access log cannot overwrite managed files"
                     );
-                    open_file(&resolved)
+                    open_file(&resolved).map(Output::File)
                 })
                 .await??,
                 tx,
@@ -269,7 +294,7 @@ impl Logger {
     }
 }
 struct Writer {
-    file: Option<BufWriter<File>>,
+    file: Option<BufWriter<Output>>,
     buffered: u64,
     counters: Arc<Counters>,
 }
@@ -302,7 +327,7 @@ impl Writer {
 #[cfg(test)]
 fn writer_loop(file: File, receiver: Receiver<Event>, counters: Arc<Counters>, interval: Duration) {
     writer_loop_format(
-        file,
+        Output::File(file),
         receiver,
         counters,
         interval,
@@ -310,7 +335,7 @@ fn writer_loop(file: File, receiver: Receiver<Event>, counters: Arc<Counters>, i
     );
 }
 fn writer_loop_format(
-    file: File,
+    file: Output,
     receiver: Receiver<Event>,
     counters: Arc<Counters>,
     interval: Duration,

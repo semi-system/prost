@@ -1,5 +1,23 @@
 # Native access log và metrics transport upstream
 
+Container có thể gửi access/session log trực tiếp tới stdout:
+
+```toml
+[runtime.access_log]
+sink = "stdout"
+format = "json"
+queue_capacity = 2048
+```
+
+Không khai báo `path` khi dùng stdout; sink file vẫn là mặc định và yêu cầu path.
+Stdout dùng writer thread, bounded queue, sampling và cùng bộ đếm drop/IO; không
+đọc `/dev/stdout` hoặc yêu cầu filesystem writable cho log. Flush/shutdown giữ
+ngữ nghĩa hiện tại; reopen flush rồi thay handle stdout. Collector cần tiêu thụ
+stdout; nếu bị nghẽn writer có thể chờ I/O và queue đầy sẽ drop record theo counter,
+không tăng queue vô hạn. Log vận hành JSON và access log có thể cùng stdout.
+Đổi sink thuộc runtime config, cần restart. Quyền file/rotate bên dưới dành cho
+sink file.
+
 Bản mở rộng có format compact, status/path filter và service logging riêng:
 [mvp-bundle.md](mvp-bundle.md). Các ngữ nghĩa JSON đầy đủ bên dưới vẫn giữ nguyên.
 

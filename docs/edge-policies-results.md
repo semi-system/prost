@@ -2,7 +2,7 @@
 
 Mục tiêu là hoàn thiện Prost độc lập với ứng dụng/backend cụ thể. Hướng dẫn:
 [edge-policies.md](edge-policies.md); ví dụ chung [edge.toml](../examples/edge.toml).
-Không thực hiện chuyển đổi toàn bộ cấu hình Rusty.
+Không thực hiện chuyển đổi toàn bộ cấu hình mail service.
 
 ## Build và test
 

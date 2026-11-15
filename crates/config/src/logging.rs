@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessLog {
+    pub sink: LogSink,
     pub format: LogFormat,
     pub statuses: Vec<u16>,
     pub include_paths: Vec<String>,
@@ -17,6 +18,7 @@ pub struct AccessLog {
 impl Default for AccessLog {
     fn default() -> Self {
         Self {
+            sink: LogSink::File,
             format: LogFormat::Json,
             statuses: Vec::new(),
             include_paths: Vec::new(),
@@ -47,8 +49,11 @@ impl AccessLog {
             "invalid access log path filters"
         );
         ensure!(
-            !self.path.as_os_str().is_empty(),
-            "access log path is required"
+            match self.sink {
+                LogSink::File => !self.path.as_os_str().is_empty(),
+                LogSink::Stdout => self.path.as_os_str().is_empty(),
+            },
+            "file access log requires path; stdout access log must omit path"
         );
         ensure!(
             (1..=65536).contains(&self.queue_capacity),
@@ -68,6 +73,13 @@ impl AccessLog {
         );
         Ok(())
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSink {
+    #[default]
+    File,
+    Stdout,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +118,12 @@ mod tests {
             );
         }
         assert!(toml::from_str::<AccessLog>("path='x'\nunknown=true").is_err());
+        toml::from_str::<AccessLog>("sink='stdout'")?.validate()?;
+        assert!(
+            toml::from_str::<AccessLog>("sink='stdout'\npath='/dev/stdout'")?
+                .validate()
+                .is_err()
+        );
         Ok(())
     }
 }

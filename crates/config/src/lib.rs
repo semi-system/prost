@@ -19,7 +19,7 @@ mod route_match;
 pub use http_policy::{Cache, Compression, HttpPolicy, Retry};
 pub use route_match::RouteHeader;
 mod tls;
-pub use logging::{AccessLog, LogFormat};
+pub use logging::{AccessLog, LogFormat, LogSink};
 pub use tls::{
     NamedCertificate, PassthroughRoute, PassthroughSettings, ServerTls, TlsMinimum, TlsPolicy,
 };
@@ -196,6 +196,7 @@ pub struct HealthCheck {
     pub port: Option<u16>,
     pub tls: Option<ClientTls>,
     pub send_proxy_v2: Option<bool>,
+    pub proxy_v2_command: ProxyV2Command,
     /// None checks TCP/TLS connectivity; Some performs GET and checks response status.
     pub path: Option<String>,
     pub host: Option<String>,
@@ -203,6 +204,13 @@ pub struct HealthCheck {
     pub timeout_ms: u64,
     pub fall: u32,
     pub rise: u32,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyV2Command {
+    #[default]
+    Proxy,
+    Local,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +248,7 @@ impl Default for HealthCheck {
             port: None,
             tls: None,
             send_proxy_v2: None,
+            proxy_v2_command: ProxyV2Command::Proxy,
             path: None,
             host: None,
             expected_status: 200,
@@ -532,7 +541,7 @@ impl Config {
                 "upstream {name} requires 1..256 endpoints"
             );
             ensure!(
-                u.connect_timeout_ms > 0 && u.idle_timeout_ms > 0 && u.health_interval_ms >= 100,
+                u.connect_timeout_ms > 0 && u.health_interval_ms >= 100,
                 "invalid timeouts"
             );
             validate_timeout(u.response_header_timeout_ms)?;
@@ -566,6 +575,11 @@ impl Config {
                 );
             }
             let h = &u.health_check;
+            ensure!(
+                h.proxy_v2_command != ProxyV2Command::Local
+                    || h.send_proxy_v2.unwrap_or(u.send_proxy_v2),
+                "health LOCAL command requires send_proxy_v2"
+            );
             ensure!(h.port != Some(0), "health port must be positive");
             let starttls = matches!(
                 h.protocol,

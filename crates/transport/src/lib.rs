@@ -28,9 +28,11 @@ pub use dns::{DnsLookup, DnsResolver, LookupFuture};
 pub use retry::{connect_tcp, connect_tcp_resolved, DialFailure};
 mod tls;
 pub use h2_headers::H2HeaderDeadline;
-pub use proxy_protocol::{read_proxy, read_proxy_addresses, write_proxy_v2, ProxyAddresses};
+pub use proxy_protocol::{
+    read_proxy, read_proxy_addresses, write_proxy_v2, write_proxy_v2_local, ProxyAddresses,
+};
 mod write_timeout;
-pub use tls::server_tls;
+pub use tls::{certificate_info, server_tls, CertificateInfo};
 pub use write_timeout::TimedWrite;
 
 /// Detect dead peers without waiting for the kernel's long retransmission defaults.
@@ -47,6 +49,9 @@ pub fn configure_socket(tcp: &TcpStream) -> Result<()> {
     socket.set_tcp_user_timeout(Some(Duration::from_secs(60)))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod idle_tests;
 
 pub fn client_tls(tls: Option<&ClientTls>) -> Result<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
@@ -145,6 +150,22 @@ pub async fn connect_plain_resolved(
     addresses: Option<ProxyAddresses>,
     resolver: Option<&DnsResolver>,
 ) -> Result<BoxStream> {
+    connect_plain_with_proxy_command(
+        address,
+        timeout_ms,
+        send_proxy_v2.then_some(prost_config::ProxyV2Command::Proxy),
+        addresses,
+        resolver,
+    )
+    .await
+}
+pub async fn connect_plain_with_proxy_command(
+    address: &str,
+    timeout_ms: u64,
+    command: Option<prost_config::ProxyV2Command>,
+    addresses: Option<ProxyAddresses>,
+    resolver: Option<&DnsResolver>,
+) -> Result<BoxStream> {
     let budget = Duration::from_millis(timeout_ms);
     let started = tokio::time::Instant::now();
     let mut tcp = timeout(budget, async {
@@ -162,15 +183,17 @@ pub async fn connect_plain_resolved(
     })?
     .map_err(DialFailure)?;
     configure_socket(&tcp)?;
-    if send_proxy_v2 {
+    if let Some(command) = command {
         let addresses = addresses.unwrap_or(ProxyAddresses {
             source: tcp.local_addr()?,
             destination: tcp.peer_addr()?,
         });
-        timeout(
-            budget.saturating_sub(started.elapsed()),
-            write_proxy_v2(&mut tcp, addresses),
-        )
+        timeout(budget.saturating_sub(started.elapsed()), async {
+            match command {
+                prost_config::ProxyV2Command::Proxy => write_proxy_v2(&mut tcp, addresses).await,
+                prost_config::ProxyV2Command::Local => write_proxy_v2_local(&mut tcp).await,
+            }
+        })
         .await
         .context("PROXY header write timeout")??;
     }
@@ -222,6 +245,10 @@ pub async fn relay_with_timeouts(
                 if first_eof.set(Instant::now()).is_ok() {
                     fin_changed.notify_one();
                 }
+                if idle.is_zero() {
+                    w.shutdown().await?;
+                    return Ok(total);
+                }
                 timeout(idle, w.shutdown()).await.map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "peer shutdown stalled")
                 })??;
@@ -231,9 +258,13 @@ pub async fn relay_with_timeouts(
                 started.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            timeout(idle, w.write_all(&buf[..n])).await.map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "peer stopped reading")
-            })??;
+            if idle.is_zero() {
+                w.write_all(&buf[..n]).await?;
+            } else {
+                timeout(idle, w.write_all(&buf[..n])).await.map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "peer stopped reading")
+                })??;
+            }
             activity.store(
                 started.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -242,6 +273,9 @@ pub async fn relay_with_timeouts(
         }
     }
     let guard = async {
+        if idle.is_zero() {
+            return std::future::pending::<Result<u64>>().await;
+        }
         loop {
             tokio::time::sleep(idle).await;
             let elapsed = started.elapsed().as_millis() as u64;

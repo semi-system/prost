@@ -1,5 +1,11 @@
 # Prost
 
+Mail edge 7 cổng, ACME HTTP-01 tự cấp/gia hạn và cấu hình Docker trung lập:
+[docs/mail-edge.md](docs/mail-edge.md), [docs/acme.md](docs/acme.md).
+
+Xoay frontend certificate/SNI không drain phiên mail, health check PROXY v2 LOCAL
+và kiểm thử decoder PROXY v2 độc lập: [docs/tls-refresh.md](docs/tls-refresh.md).
+
 Reload mặc định rolling worker, validate tuần tự và drain thế hệ cũ:
 [docs/rolling-updates.md](docs/rolling-updates.md).
 `prostctl reload --wait` và `prostctl workers wait` chờ drain qua Unix socket,

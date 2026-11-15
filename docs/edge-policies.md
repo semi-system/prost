@@ -1,6 +1,6 @@
 # HTTP policy và TCP connection policy
 
-Đây là các tính năng chung của Prost, không phụ thuộc Rusty hay cấu hình dịch vụ
+Đây là các tính năng chung của Prost, không phụ thuộc mail service hay cấu hình dịch vụ
 cụ thể. Ví dụ: [edge.toml](../examples/edge.toml). Các tùy chọn mới tắt mặc định,
 không thêm scanner/header clock hoặc retry vào đường xử lý không sử dụng chúng.
 

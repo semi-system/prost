@@ -1,7 +1,7 @@
 # Mức sẵn sàng và kiểm chứng bản native mở rộng
 
 Báo cáo này ghi image `25a01bb041ec` trước phần PROXY v2 egress/mail health/TLS
-policy. Bản Rusty mới hơn và bằng chứng tương ứng: [rusty-results.md](rusty-results.md).
+policy. Bản mail service mới hơn và bằng chứng tương ứng: [mail-interop-results.md](mail-interop-results.md).
 
 Đánh giá hiện tại: **dùng cho MVP/pilot có giám sát**. Chưa xác nhận đủ điều kiện
 cho production quan trọng. Các số đo dưới đây thuộc fixture local Docker/WSL,
@@ -77,7 +77,7 @@ Lượt log benchmark đầu bị dừng do trùng thời gian compile; không d
 đó để kết luận regression. Tag `prost:native` có thể đổi, phải đối chiếu image ID
 trong từng báo cáo JSON.
 
-## Đối chứng trước phần Rusty
+## Đối chứng trước phần mail service
 
 CPU pin client/proxy/backend `0,2` / `4,6` / `8,10`; hai proxy worker,
 control `41e2…` và candidate `25a0…`, cùng workload không cache. Không compile,

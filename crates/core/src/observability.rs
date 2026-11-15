@@ -96,7 +96,7 @@ impl Default for Upstream {
 pub(crate) struct Runtime {
     pub h2_write_timeouts: Arc<AtomicU64>,
     pub tls: [AtomicU64; 5], // success, error, timeout, rejected, cancelled
-    pub transactions: [[AtomicU64; 5]; 3], // apply, patch, validate
+    pub transactions: [[AtomicU64; 5]; 4], // apply, patch, validate, TLS reload
     pub worker_retirements: [AtomicU64; 3], // retired, forced generations, forced connections
 }
 pub(crate) struct Handshake<'a> {
@@ -517,6 +517,18 @@ const DEFINITIONS: &[Definition] = &[
         "Downstream TLS handshake outcomes including admission rejections",
         MetricType::COUNTER,
         &["result"],
+    ),
+    (
+        "prost_tls_certificate_not_after_seconds",
+        "Active frontend certificate expiry as Unix seconds",
+        MetricType::GAUGE,
+        &["listener", "certificate"],
+    ),
+    (
+        "prost_tls_certificate_seconds_remaining",
+        "Seconds until active frontend certificate expiry",
+        MetricType::GAUGE,
+        &["listener", "certificate"],
     ),
     (
         "prost_config_transactions_total",
@@ -980,7 +992,10 @@ impl Collector for Exporter {
                 );
             }
         }
-        for (i, operation) in ["apply", "endpoint_patch", "validate"].iter().enumerate() {
+        for (i, operation) in ["apply", "endpoint_patch", "validate", "tls_reload"]
+            .iter()
+            .enumerate()
+        {
             for (j, result) in ["success", "not_durable", "conflict", "error", "cancelled"]
                 .iter()
                 .enumerate()
@@ -1012,6 +1027,24 @@ impl Collector for Exporter {
             snapshot.config.generation as f64,
         );
         emit("prost_live_generations", &[], live.len() as f64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as f64;
+        for (id, listener) in &snapshot.listeners {
+            for (certificate, expires) in &listener.certificate_expirations {
+                emit(
+                    "prost_tls_certificate_not_after_seconds",
+                    &[id, certificate],
+                    *expires as f64,
+                );
+                emit(
+                    "prost_tls_certificate_seconds_remaining",
+                    &[id, certificate],
+                    *expires as f64 - now,
+                );
+            }
+        }
         let retiring = p
             .retiring
             .lock()

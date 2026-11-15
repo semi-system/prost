@@ -1,7 +1,7 @@
 # Image Baseless và gate publish
 
 Runtime dùng `ghcr.io/semi-system/baseless-static`, pin digest trong Dockerfile.
-Ba executable `prost`, `prostctl`, `prost-entrypoint` được build cho
+Bốn executable `prost`, `prostctl`, `prost-entrypoint`, `prost-certd` được build cho
 `x86_64-unknown-linux-musl`. Image không thêm shell, package manager hay thư viện
 Debian. UID/GID vẫn là 10001 để giữ tương thích volume đã tạo từ bản trước.
 Chỉ các thư mục ứng dụng được đổi owner; `/etc`, `/usr` và inventory APK của base
@@ -28,7 +28,7 @@ Luồng publish:
 3. `semi-system/baseless/scan` kiểm tra identity, APK inventory, version mapping
    và advisory feed Baseless trên chính image đã scan. Gate này bắt buộc vì
    generic Trivy chưa nhận diện Baseless như một distro OS được hỗ trợ.
-   Workflow cũng yêu cầu report Trivy nhận diện dependency metadata của cả ba
+   Workflow cũng yêu cầu report Trivy nhận diện dependency metadata của cả bốn
    Rust executable; report trống do thiếu audit metadata không được coi là đạt.
 4. Chỉ sau khi cả hai gate đạt mới login/push các tag trỏ đến image đó; không
    build lại. Workflow kiểm tra image ID và digest giữa các tag.

@@ -149,9 +149,9 @@ async def workload(port, context, ctl, container, out, requests):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="prost:native")
-    parser.add_argument("--backend-image", default="prost:rusty-backend")
+    parser.add_argument("--backend-image", default="prost:mail-backend")
     parser.add_argument("--requests", type=int, default=10000)
-    parser.add_argument("--output-dir", type=Path, default=ROOT/"test-results/rusty-smoke")
+    parser.add_argument("--output-dir", type=Path, default=ROOT/"test-results/mail-smoke")
     args = parser.parse_args()
     if args.requests < 1000:
         parser.error("use at least 1000 requests")
@@ -220,7 +220,7 @@ min_version="tls12"
 session_resumption=false
 '''
     (out / "seed.toml").write_text(seed)
-    name = "prost-rusty-" + uuid.uuid4().hex[:10]
+    name = "prost-mail-" + uuid.uuid4().hex[:10]
     backend = name + "-backend"
     created = []
 

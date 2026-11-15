@@ -10,6 +10,11 @@ max_requests = 4096
 max_proxy_connections = 4096
 drain_seconds = 30
 
+[runtime.access_log]
+sink = "stdout"
+format = "json"
+queue_capacity = 2048
+
 [upstreams.smtp]
 send_proxy_v2 = true
 connect_timeout_ms = 3000
@@ -18,6 +23,7 @@ write_timeout_ms = 30000
 half_close_timeout_ms = 5000
 health_interval_ms = 2000
 [upstreams.smtp.health_check]
+proxy_v2_command = "local"
 protocol = "smtp" # Banner 220, matching the supplied HAProxy check.
 timeout_ms = 3000
 fall = 3
@@ -36,16 +42,17 @@ write_timeout_ms = 30000
 half_close_timeout_ms = 5000
 health_interval_ms = 2000
 [upstreams.imap.health_check]
+proxy_v2_command = "local"
 protocol = "imap" # * OK after the verified backend mTLS handshake.
 timeout_ms = 3000
 fall = 3
 rise = 2
 [upstreams.imap.tls]
 server_name = "be-imap"
-ca_certificate = "/run/rusty-certs/internal-ca.crt"
+ca_certificate = "/run/mail-certs/internal-ca.crt"
 [upstreams.imap.tls.identity]
-certificate = "/run/rusty-certs/edge-client.pem"
-private_key = "/run/rusty-certs/edge-client.pem" # Combined PEM is supported.
+certificate = "/run/mail-certs/edge-client.pem"
+private_key = "/run/mail-certs/edge-client.pem" # Combined PEM is supported.
 [upstreams.imap.tls.policy]
 min_version = "tls12"
 session_resumption = false
@@ -64,6 +71,7 @@ write_timeout_ms = 30000
 pool_idle_timeout_ms = 5000
 health_interval_ms = 2000
 [upstreams.web.health_check]
+proxy_v2_command = "local"
 protocol = "http"
 path = "/health"
 host = "be-http"
@@ -73,10 +81,10 @@ fall = 3
 rise = 2
 [upstreams.web.tls]
 server_name = "be-http"
-ca_certificate = "/run/rusty-certs/internal-ca.crt"
+ca_certificate = "/run/mail-certs/internal-ca.crt"
 [upstreams.web.tls.identity]
-certificate = "/run/rusty-certs/edge-client.pem"
-private_key = "/run/rusty-certs/edge-client.pem"
+certificate = "/run/mail-certs/edge-client.pem"
+private_key = "/run/mail-certs/edge-client.pem"
 [upstreams.web.tls.policy]
 min_version = "tls12"
 session_resumption = false
@@ -109,13 +117,13 @@ client_write_timeout_ms = 30000
 name = "connection_rate"
 config = { connections_per_second = 10, burst = 100, key = "$remote_addr", max_keys = 100000, idle_timeout_ms = 30000 }
 [listeners.tls]
-certificate = "/run/rusty-certs/edge-public.pem"
-private_key = "/run/rusty-certs/edge-public.pem"
+certificate = "/run/mail-certs/edge-public.pem"
+private_key = "/run/mail-certs/edge-public.pem"
 reject_unknown_sni = true
 [[listeners.tls.certificates]]
 server_names = ["mail.test"] # Replace with the real allowed public SNI names.
-certificate = "/run/rusty-certs/edge-public.pem"
-private_key = "/run/rusty-certs/edge-public.pem"
+certificate = "/run/mail-certs/edge-public.pem"
+private_key = "/run/mail-certs/edge-public.pem"
 [listeners.tls.policy]
 min_version = "tls12"
 session_resumption = false
@@ -139,13 +147,13 @@ upstream = "web"
 name = "connection_rate"
 config = { connections_per_second = 20, burst = 200, key = "$remote_addr", max_keys = 100000, idle_timeout_ms = 30000 }
 [listeners.tls]
-certificate = "/run/rusty-certs/edge-public.pem"
-private_key = "/run/rusty-certs/edge-public.pem"
+certificate = "/run/mail-certs/edge-public.pem"
+private_key = "/run/mail-certs/edge-public.pem"
 reject_unknown_sni = true
 [[listeners.tls.certificates]]
 server_names = ["web.test"]
-certificate = "/run/rusty-certs/edge-public.pem"
-private_key = "/run/rusty-certs/edge-public.pem"
+certificate = "/run/mail-certs/edge-public.pem"
+private_key = "/run/mail-certs/edge-public.pem"
 [listeners.tls.policy]
 min_version = "tls12"
 session_resumption = false

@@ -1,0 +1,14 @@
+# Full ServerTls object for: prostctl tls reload imaps_in --file tls-refresh.toml
+# The daemon uses runtime.s3 from its committed config.
+certificate = "s3://proxy-certs/mail/fullchain.pem"
+private_key = "s3://proxy-certs/mail/privkey.pem"
+reject_unknown_sni = true
+
+[[certificates]]
+server_names = ["mail.example.test"]
+certificate = "s3://proxy-certs/mail/fullchain.pem"
+private_key = "s3://proxy-certs/mail/privkey.pem"
+
+[policy]
+min_version = "tls12"
+session_resumption = false

@@ -36,6 +36,17 @@ pub enum Command {
         config: String,
         expected_generation: u64,
     },
+    #[serde(rename = "tls.reload")]
+    ReloadTls {
+        listener: String,
+        tls: Box<prost_core::prost_config::ServerTls>,
+        expected_generation: u64,
+    },
+    #[serde(rename = "tls.reload_many")]
+    ReloadTlsMany {
+        updates: std::collections::BTreeMap<String, prost_core::prost_config::ServerTls>,
+        expected_generation: u64,
+    },
     #[serde(rename = "upstream.set_enabled")]
     SetEnabled {
         endpoint: String,
@@ -336,6 +347,12 @@ async fn dispatch(
                 config,
                 expected_generation,
             } => proxy.apply(config, expected_generation).await,
+            Command::ReloadTls { listener, tls, expected_generation } => {
+                proxy.reload_tls(listener, *tls, expected_generation).await
+            }
+            Command::ReloadTlsMany { updates, expected_generation } => {
+                proxy.reload_tls_many(updates, expected_generation).await
+            }
             Command::SetEnabled {
                 endpoint,
                 enabled,

@@ -1,0 +1,176 @@
+# Generic seven-port mail edge. Replace names, endpoints and admin CIDRs.
+schema_version = 1
+[runtime]
+admin_socket = "/run/prost/admin.sock"
+artifact_dir = "/var/lib/prost/artifacts"
+reload_mode = "rolling"
+max_connections = 4096
+drain_seconds = 30
+[runtime.access_log]
+sink = "stdout"
+format = "json"
+queue_capacity = 2048
+
+[upstreams.smtp]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+idle_timeout_ms = 300000
+health_interval_ms = 5000
+[upstreams.smtp.health_check]
+protocol = "connect"
+proxy_v2_command = "local"
+[[upstreams.smtp.endpoints]]
+id = "smtp"
+address = "mail-backend:1025"
+
+[upstreams.submission]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+idle_timeout_ms = 300000
+health_interval_ms = 5000
+[upstreams.submission.health_check]
+protocol = "connect"
+proxy_v2_command = "local"
+[[upstreams.submission.endpoints]]
+id = "submission"
+address = "mail-backend:1587"
+
+[upstreams.imap]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+# IMAP IDLE may remain silent for longer than the SMTP idle budget.
+idle_timeout_ms = 0
+health_interval_ms = 5000
+[upstreams.imap.health_check]
+protocol = "connect"
+proxy_v2_command = "local"
+[[upstreams.imap.endpoints]]
+id = "imap"
+address = "mail-backend:1143"
+
+[upstreams.web]
+send_proxy_v2 = true
+connect_timeout_ms = 3000
+health_interval_ms = 5000
+[upstreams.web.health_check]
+protocol = "http"
+proxy_v2_command = "local"
+path = "/healthz"
+host = "admin.example.test"
+[[upstreams.web.endpoints]]
+id = "admin"
+address = "admin-backend:8080"
+
+[[upstreams.acme.endpoints]]
+id = "certd"
+address = "certd:8088"
+
+[[listeners]]
+id = "smtp"
+address = "0.0.0.0:10025"
+protocol = "tcp"
+upstream = "smtp"
+max_connections_per_ip = 50
+[[listeners.plugins]]
+name = "connection_rate"
+config = {connections_per_second=10, burst=100, max_keys=100000, idle_timeout_ms=30000}
+
+[[listeners]]
+id = "submission"
+address = "0.0.0.0:10587"
+protocol = "tcp"
+upstream = "submission"
+max_connections_per_ip = 50
+
+[[listeners]]
+id = "imap"
+address = "0.0.0.0:10143"
+protocol = "tcp"
+upstream = "imap"
+max_connections_per_ip = 50
+
+[[listeners]]
+id = "smtps"
+address = "0.0.0.0:10465"
+protocol = "tcp"
+upstream = "smtp"
+max_connections_per_ip = 50
+tls_handshake_timeout_ms = 5000
+[listeners.tls]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["mail.example.test"]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+session_resumption = false
+
+[[listeners]]
+id = "imaps"
+address = "0.0.0.0:10993"
+protocol = "tcp"
+upstream = "imap"
+max_connections_per_ip = 50
+tls_handshake_timeout_ms = 5000
+[listeners.tls]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["mail.example.test"]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+session_resumption = false
+
+[[listeners]]
+id = "admin"
+address = "0.0.0.0:10443"
+protocol = "http"
+upstream = "web"
+max_connections_per_ip = 100
+header_read_timeout_ms = 10000
+[[listeners.plugins]]
+name = "host_acl"
+config = {hosts=["admin.example.test"], status=421}
+[[listeners.plugins]]
+name = "ip_acl"
+hooks = ["request_headers"]
+# Documentation ranges deliberately deny real public clients. Replace them.
+config = {require_allowlist=true, allow=["192.0.2.0/24", "2001:db8::/32"]}
+[listeners.http2_settings]
+header_read_timeout_ms = 10000
+[listeners.tls]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+reject_unknown_sni = true
+[[listeners.tls.certificates]]
+server_names = ["admin.example.test"]
+certificate = "/certificates/edge/current/fullchain.pem"
+private_key = "/certificates/edge/current/privkey.pem"
+[listeners.tls.policy]
+min_version = "tls12"
+session_resumption = false
+
+[[listeners]]
+id = "http"
+address = "0.0.0.0:10080"
+protocol = "http"
+header_read_timeout_ms = 10000
+[[listeners.plugins]]
+name = "host_acl"
+config = {hosts=["mail.example.test", "admin.example.test"], status=421}
+[[listeners.routes]]
+path_prefix = "/.well-known/acme-challenge/"
+priority = 100
+upstream = "acme"
+[[listeners.routes]]
+path_prefix = "/"
+upstream = "web"
+[[listeners.routes.plugins]]
+name = "rewrite"
+config = {rules=[{action="redirect", to="https://$host$request_uri", status=308, query="drop"}]}
