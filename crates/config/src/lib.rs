@@ -14,10 +14,16 @@ pub use tls_source::{S3Config, S3Object, TlsSource};
 mod encoding_tests;
 mod http_policy;
 pub use dns::DnsPolicy;
+mod http3;
 mod logging;
 mod route_match;
+mod static_files;
+mod udp;
+pub use http3::Http3Settings;
 pub use http_policy::{Cache, Compression, HttpPolicy, Retry};
 pub use route_match::RouteHeader;
+pub use static_files::StaticFiles;
+pub use udp::UdpSettings;
 mod tls;
 pub use logging::{AccessLog, LogFormat, LogSink};
 pub use tls::{
@@ -76,6 +82,9 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Runtime {
+    pub max_quic_receive_bytes: usize,
+    pub max_udp_buffer_bytes: usize,
+    pub max_static_ram_bytes: u64,
     pub reload_mode: ReloadMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<S3Config>,
@@ -94,6 +103,9 @@ pub struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            max_quic_receive_bytes: 64 * 1024 * 1024,
+            max_udp_buffer_bytes: 64 * 1024 * 1024,
+            max_static_ram_bytes: 256 * 1024 * 1024,
             reload_mode: ReloadMode::Rolling,
             s3: None,
             max_proxy_connections: 4096,
@@ -192,6 +204,7 @@ impl Default for TcpRetry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HealthCheck {
+    pub enabled: bool,
     pub protocol: HealthProtocol,
     pub port: Option<u16>,
     pub tls: Option<ClientTls>,
@@ -244,6 +257,7 @@ impl Default for PassiveHealth {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            enabled: true,
             protocol: HealthProtocol::Connect,
             port: None,
             tls: None,
@@ -336,10 +350,24 @@ pub struct ClientIdentity {
 pub enum Protocol {
     Tcp,
     Http,
+    Udp,
+    Http3,
+}
+impl Protocol {
+    pub fn is_http(self) -> bool {
+        matches!(self, Self::Http | Self::Http3)
+    }
+    pub fn is_udp(self) -> bool {
+        matches!(self, Self::Udp | Self::Http3)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http3: Option<Http3Settings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp: Option<UdpSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive_idle_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +426,8 @@ impl Default for ProxyProtocol {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_files: Option<StaticFiles>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -414,6 +444,7 @@ pub struct Route {
     pub path_prefix: String,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub upstream: String,
     #[serde(default)]
     pub plugins: Vec<Plugin>,
@@ -469,6 +500,18 @@ impl Config {
         );
         ensure!(self.runtime.drain_seconds <= 3600, "invalid drain_seconds");
         ensure!(self.runtime.io_workers <= 32, "io_workers must be 0..32");
+        ensure!(
+            (65536..=1024 * 1024 * 1024).contains(&self.runtime.max_quic_receive_bytes),
+            "max_quic_receive_bytes must be 64KiB..1GiB"
+        );
+        ensure!(
+            (65536..=1024 * 1024 * 1024).contains(&self.runtime.max_udp_buffer_bytes),
+            "max_udp_buffer_bytes must be 64KiB..1GiB"
+        );
+        ensure!(
+            (1..=(1_u64 << 40)).contains(&self.runtime.max_static_ram_bytes),
+            "runtime max_static_ram_bytes must be 1..1TiB"
+        );
         ensure!(
             self.runtime.admin_socket.is_absolute() && self.runtime.artifact_dir.is_absolute(),
             "runtime paths must be absolute"
@@ -686,6 +729,61 @@ impl Config {
             }
         }
         for l in &self.listeners {
+            if let Some(settings) = &l.http3 {
+                ensure!(
+                    l.protocol == Protocol::Http3,
+                    "HTTP/3 settings require HTTP/3 listener"
+                );
+                settings.validate()?;
+            }
+            if l.protocol == Protocol::Http3 {
+                let settings = l.http3.clone().unwrap_or_default();
+                ensure!(
+                    l.tls.is_some() && !l.tls_passthrough && l.proxy_protocol.is_none(),
+                    "HTTP/3 requires TLS and does not accept PROXY/passthrough"
+                );
+                ensure!(
+                    settings.connection_receive_window as usize
+                        <= self.runtime.max_quic_receive_bytes,
+                    "QUIC receive budget cannot hold one connection window"
+                );
+            }
+            if let Some(settings) = &l.udp {
+                ensure!(
+                    l.protocol == Protocol::Udp,
+                    "UDP settings require a UDP listener"
+                );
+                settings.validate()?;
+            }
+            if l.protocol == Protocol::Udp {
+                ensure!(
+                    l.tls.is_none()
+                        && !l.tls_passthrough
+                        && l.proxy_protocol.is_none()
+                        && l.plugins.is_empty()
+                        && l.routes.is_empty(),
+                    "UDP does not accept TLS, PROXY protocol or TCP/HTTP plugins/routes"
+                );
+                let upstream = l
+                    .upstream
+                    .as_ref()
+                    .and_then(|name| self.upstreams.get(name))
+                    .context("UDP requires an upstream")?;
+                ensure!(upstream.tls.is_none() && !upstream.send_proxy_v2 && !upstream.health_check.enabled && upstream.http.is_none() && !upstream.http2 && upstream.tcp_retry.is_none(),"UDP upstream must be plain datagrams with health_check.enabled=false and no TCP/HTTP policy");
+                let maximum = l
+                    .udp
+                    .as_ref()
+                    .map_or(65507, |settings| settings.max_datagram_bytes);
+                ensure!(
+                    self.runtime.max_udp_buffer_bytes >= maximum * 2 + 128,
+                    "UDP buffer budget cannot hold a maximum packet and response buffer"
+                );
+                ensure!(
+                    upstream.balance != "consistent_hash"
+                        || upstream.hash_key.as_deref().unwrap_or("$remote_addr") == "$remote_addr",
+                    "UDP consistent hash requires $remote_addr"
+                );
+            }
             validate_timeout(l.keepalive_idle_timeout_ms)?;
             ensure!(
                 l.protocol == Protocol::Http || l.keepalive_idle_timeout_ms.unwrap_or(0) == 0,
@@ -743,7 +841,7 @@ impl Config {
             valid_id(&l.id)?;
             ensure!(ids.insert(&l.id), "duplicate listener id");
             ensure!(
-                l.address.port() > 0 && addresses.insert(l.address),
+                l.address.port() > 0 && addresses.insert((l.address, l.protocol.is_udp())),
                 "duplicate or zero listener address"
             );
             ensure!(l.max_connections > 0, "listener limit must be positive");
@@ -751,7 +849,7 @@ impl Config {
                 l.max_connections <= 1_000_000 && l.routes.len() <= 4096,
                 "listener limits exceeded"
             );
-            if l.protocol == Protocol::Tcp {
+            if !l.protocol.is_http() {
                 ensure!(
                     l.max_request_body_bytes.is_none()
                         && l.request_body_timeout_ms.is_none()
@@ -788,13 +886,20 @@ impl Config {
             }
             for r in &l.routes {
                 r.validate_match()?;
+                if let Some(files) = &r.static_files {
+                    files.validate()?;
+                    ensure!(
+                        l.protocol.is_http() && r.upstream.is_empty(),
+                        "static route requires HTTP and no upstream"
+                    );
+                }
                 validate_timeout(r.request_body_timeout_ms)?;
                 ensure!(
                     r.path_prefix.starts_with('/'),
                     "path_prefix must start with /"
                 );
                 ensure!(
-                    self.upstreams.contains_key(&r.upstream),
+                    r.static_files.is_some() || self.upstreams.contains_key(&r.upstream),
                     "unknown upstream {}",
                     r.upstream
                 );

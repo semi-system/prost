@@ -1,0 +1,27 @@
+schema_version = 1
+upstreams = {}
+
+[runtime]
+max_static_ram_bytes = 16777216
+
+[[listeners]]
+id = "static-web"
+address = "0.0.0.0:8080"
+protocol = "http"
+
+# Disk-backed, with bounded demand cache.
+[[listeners.routes]]
+path_prefix = "/"
+[listeners.routes.static_files]
+root = "/examples/static"
+max_ram_bytes = 8388608
+cache_max_file_bytes = 1048576
+
+# The same files, fully preloaded during validate/apply/startup.
+[[listeners.routes]]
+path_prefix = "/ram/"
+[listeners.routes.static_files]
+root = "/examples/static"
+strip_prefix = true
+load_to_ram = true
+max_ram_bytes = 8388608

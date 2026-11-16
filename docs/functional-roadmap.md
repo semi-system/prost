@@ -6,6 +6,9 @@ kết luận và giới hạn đã ghi, không dùng để xác nhận chức n�
 
 | Phần | Trạng thái | Công việc tiếp theo |
 |---|---|---|
+| Static files | Đã bổ sung | GET/HEAD, index/MIME/conditional/range, disk demand cache, RAM preload có budget và cgroup fail-closed; xem [static-files.md](static-files.md) |
+| UDP | Đã bổ sung | Datagram/peer session, bounded buffers/queue/IP limits, TTL/SRV, rolling giữ mapping; xem [udp.md](udp.md) |
+| HTTP/3 | Đã bổ sung, cần soak | QUIC/TLS1.3, pipeline HTTP chung, bounded windows/streams, cancellation, GOAWAY/rolling; xem [http3.md](http3.md) |
 | TLS passthrough chọn upstream theo SNI | Đã bổ sung | Exact/wildcard, strict/default, PROXY/mTLS, hot apply và restart đã test |
 | Quản trị native rate table | Đã bổ sung | list/show/clear với generation, giữ phiên đang chạy |
 | Routing HTTP theo method/header | Đã bổ sung | Method list, literal/prefix/regex/presence, thứ tự match và hot update |
@@ -32,8 +35,10 @@ Các mục này không có nghĩa phải triển khai mọi directive/module c�
 chạy được MVP. Mỗi phần cần có schema rõ, hot apply/persistence tương ứng và
 test lỗi/streaming để tránh làm hỏng các giao thức đang chạy.
 
-UDP, HTTP/3, STARTTLS offload và control plane phân tán nằm ngoài v1 ban đầu;
-cache disk chưa được đưa vào đợt hoàn thiện này. TLS passthrough có SNI chỉ xử lý TLS ngay từ đầu kết nối;
+HTTP/3 và UDP đã được bổ sung sau phạm vi v1 ban đầu. Các phần còn thiếu so với
+phạm vi Nginx rộng hơn gồm HTTP proxy response cache trên disk và gateway
+FastCGI/uWSGI/SCGI; static demand cache ở đây không thay thế proxy disk cache.
+STARTTLS offload và control plane phân tán chưa triển khai. TLS passthrough có SNI chỉ xử lý TLS ngay từ đầu kết nối;
 không phải STARTTLS. Các phần authentication hoặc session affinity bằng cookie
 có thể chốt phạm vi riêng khi cần.
 

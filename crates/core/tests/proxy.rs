@@ -38,6 +38,8 @@ mod edge;
 mod health_local;
 #[path = "support/http1.rs"]
 mod http1;
+#[path = "support/http3.rs"]
+mod http3;
 #[path = "support/http_routing.rs"]
 mod http_routing;
 #[path = "support/limits.rs"]
@@ -56,6 +58,8 @@ mod rate_tables;
 mod rolling;
 #[path = "support/rolling_unlimited.rs"]
 mod rolling_unlimited;
+#[path = "support/static_files.rs"]
+mod static_files;
 #[path = "support/timeouts.rs"]
 mod timeouts;
 #[path = "support/tls_batch.rs"]
@@ -64,6 +68,8 @@ mod tls_batch;
 mod tls_reload;
 #[path = "support/tls_uri.rs"]
 mod tls_uri;
+#[path = "support/udp.rs"]
+mod udp;
 
 struct Server {
     address: SocketAddr,
@@ -1412,6 +1418,7 @@ async fn compiled_routes_preserve_precedence_and_refresh_upstream_bindings() -> 
         .insert("other".into(), fixture.config.upstreams["main"].clone());
     fixture.config.upstreams.get_mut("other").unwrap().endpoints[0].address = b.address.to_string();
     let route = |host: Option<&str>, prefix: &str, priority, upstream: &str| prost_config::Route {
+        static_files: None,
         methods: vec![],
         headers: vec![],
         access_log: None,
@@ -1525,6 +1532,7 @@ async fn plugin_end_hook_waits_for_body_and_survives_fast_path_changes() -> Resu
     let backend = http_server("body").await;
     let mut fixture = Fixture::new(Protocol::Http, backend.address);
     fixture.config.listeners[0].routes = vec![prost_config::Route {
+        static_files: None,
         methods: vec![],
         headers: vec![],
         access_log: None,

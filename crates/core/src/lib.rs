@@ -11,6 +11,7 @@ mod proxy_clients;
 mod rate_tables;
 pub use prost_plugin::rate_table::{KeyEncoding, TableKey, TableQuery};
 pub use rate_tables::RateTableTarget;
+mod http3;
 mod rolling;
 mod route_index;
 mod route_match;
@@ -18,6 +19,7 @@ mod storage;
 #[cfg(test)]
 mod storage_tests;
 mod tls_reload;
+mod udp;
 mod workers;
 
 use anyhow::{ensure, Context, Result};
@@ -29,7 +31,7 @@ use hyper_util::{
     server::conn::auto,
 };
 use prost_config::{Config, Listener, Protocol, Upstream};
-use prost_http::{Body, ClientPool};
+use prost_http::{Body, ClientPool, IncomingBody};
 use prost_plugin::{
     Event, FilterCall, FilterDecision, FilterHook, HeaderContext, PluginRegistry, PreparedPlugin,
 };
@@ -57,6 +59,8 @@ pub use prost_plugin;
 pub use storage::{GcOptions, GcReport};
 
 pub struct Metrics {
+    pub udp_datagrams: prometheus::IntCounterVec,
+    pub udp_dropped: prometheus::IntCounterVec,
     pub registry: prometheus::Registry,
     pub connections: prometheus::IntGauge,
     pub requests: prometheus::IntCounter,
@@ -83,6 +87,20 @@ impl Metrics {
         )?;
         registry.register(Box::new(transaction_latency.clone()))?;
         let m = Self {
+            udp_datagrams: prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "prost_udp_datagrams_total",
+                    "UDP datagrams received and returned",
+                ),
+                &["direction"],
+            )?,
+            udp_dropped: prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "prost_udp_dropped_total",
+                    "UDP datagrams rejected or discarded",
+                ),
+                &["reason"],
+            )?,
             registry,
             gc_runs: prometheus::IntCounterVec::new(
                 prometheus::Opts::new(
@@ -115,7 +133,10 @@ impl Metrics {
             )?,
             requests: prometheus::IntCounter::new("prost_requests_total", "HTTP requests")?,
             errors: prometheus::IntCounter::new("prost_errors_total", "Traffic and plugin errors")?,
-            bytes: prometheus::IntCounter::new("prost_stream_bytes_total", "TCP bytes relayed")?,
+            bytes: prometheus::IntCounter::new(
+                "prost_stream_bytes_total",
+                "TCP/UDP bytes relayed",
+            )?,
             commits: prometheus::IntCounter::new(
                 "prost_config_commits_total",
                 "Configuration commits",
@@ -126,6 +147,8 @@ impl Metrics {
             ))?,
         };
         m.registry.register(Box::new(m.connections.clone()))?;
+        m.registry.register(Box::new(m.udp_datagrams.clone()))?;
+        m.registry.register(Box::new(m.udp_dropped.clone()))?;
         m.registry.register(Box::new(m.requests.clone()))?;
         m.registry.register(Box::new(m.errors.clone()))?;
         m.registry.register(Box::new(m.bytes.clone()))?;
@@ -140,6 +163,7 @@ impl Metrics {
     }
 }
 pub struct Snapshot {
+    static_ram: Arc<prost_http::static_files::RamBudget>,
     pub config: Config,
     pub hash: String,
     upstreams: BTreeMap<String, Arc<PreparedUpstream>>,
@@ -181,6 +205,7 @@ impl PreparedUpstream {
     }
 }
 struct PreparedListener {
+    http3: Option<http3::Prepared>,
     certificate_expirations: Vec<(String, i64)>,
     connection_admission: Vec<usize>,
     ip_capacity: Arc<ip_connections::IpConnections>,
@@ -194,7 +219,8 @@ struct PreparedListener {
     route_index: route_index::RouteIndex,
     route_matches: Vec<route_match::RouteMatch>,
     default_upstream: Option<Arc<PreparedUpstream>>,
-    route_upstreams: Vec<Arc<PreparedUpstream>>,
+    route_upstreams: Vec<Option<Arc<PreparedUpstream>>>,
+    static_files: Vec<Option<Arc<prost_http::static_files::StaticService>>>,
     has_hooks: bool,
     uri_filter: bool,
     route_uri_filters: Vec<bool>,
@@ -233,7 +259,9 @@ impl HttpMode for PlainHttp {
         request: Request<Incoming>,
         guard: bool,
     ) -> std::result::Result<Response<Body>, Infallible> {
-        let mut response = proxy.handle_http(id, info, request, None).await;
+        let mut response = proxy
+            .handle_http(id, info, request.map(IncomingBody::from), None)
+            .await;
         if guard {
             prost_http::h2_deadline::observe_response(&mut response);
         }
@@ -248,7 +276,9 @@ impl HttpMode for LoggedHttp {
         request: Request<Incoming>,
         guard: bool,
     ) -> std::result::Result<Response<Body>, Infallible> {
-        Ok(proxy.handle_http_logged(id, info, request, guard).await)
+        Ok(proxy
+            .handle_http_logged(id, info, request.map(IncomingBody::from), guard)
+            .await)
     }
 }
 struct ConnectionLease {
@@ -268,9 +298,11 @@ impl Drop for ConnectionLease {
 }
 struct Binding {
     cancel: CancellationToken,
-    masters: Vec<std::net::TcpListener>,
+    masters: workers::Masters,
 }
 pub struct RunningProxy {
+    quic_receive: Arc<Semaphore>,
+    udp_buffers: Arc<Semaphore>,
     proxy_connections: Arc<Semaphore>,
     access_log: Option<Arc<access_log::Logger>>,
     current: ArcSwap<Snapshot>,
@@ -286,6 +318,7 @@ pub struct RunningProxy {
     handshakes: Arc<Semaphore>,
     health_capacity: Arc<Semaphore>,
     tasks: TaskTracker,
+    quic_background: TaskTracker,
     shutdown: CancellationToken,
     force: CancellationToken,
     generations: Mutex<Vec<Weak<Snapshot>>>,
@@ -389,10 +422,11 @@ impl ProxyBuilder {
         })
         .await??;
         let mut sockets = Vec::new();
+        let quic_background = TaskTracker::new();
         for l in &snapshot.config.listeners {
             sockets.push((
                 l.id.clone(),
-                workers::bind(l.address, workers.as_deref()).await?,
+                workers::bind(l.address, l.protocol, workers.as_deref(), &quic_background).await?,
             ));
         }
         let metrics_socket = match snapshot.config.runtime.metrics_address {
@@ -416,6 +450,8 @@ impl ProxyBuilder {
             snapshot.clone(),
         );
         let p = Arc::new(RunningProxy {
+            quic_receive: Arc::new(Semaphore::new(runtime.max_quic_receive_bytes)),
+            udp_buffers: Arc::new(Semaphore::new(runtime.max_udp_buffer_bytes)),
             proxy_connections: Arc::new(Semaphore::new(runtime.max_proxy_connections)),
             access_log,
             current: ArcSwap::from(snapshot.clone()),
@@ -431,6 +467,7 @@ impl ProxyBuilder {
             handshakes: Arc::new(Semaphore::new(256)),
             health_capacity: Arc::new(Semaphore::new(32)),
             tasks: TaskTracker::new(),
+            quic_background,
             shutdown: CancellationToken::new(),
             force: CancellationToken::new(),
             generations: Mutex::new(vec![Arc::downgrade(&snapshot)]),
@@ -470,6 +507,11 @@ fn prepare_with_clients(
     reuse_clients: bool,
 ) -> Result<Snapshot> {
     config.validate()?;
+    let static_ram = previous.map(|s| s.static_ram.clone()).unwrap_or_else(|| {
+        Arc::new(prost_http::static_files::RamBudget::new(
+            config.runtime.max_static_ram_bytes,
+        ))
+    });
     let fresh_clients = !reuse_clients
         && previous.is_some()
         && config.runtime.reload_mode == prost_config::ReloadMode::Rolling;
@@ -536,13 +578,7 @@ fn prepare_with_clients(
                         .position(|p| p.id == e.id && p.address == e.address)
                         .map(|i| u.observed[i].clone())
                 })
-                .unwrap_or_else(|| {
-                    Arc::new(observability::Endpoint::new(
-                        worker_count,
-                        config.runtime.worker_local
-                            && config.runtime.reload_mode == prost_config::ReloadMode::Hot,
-                    ))
-                })
+                .unwrap_or_else(|| Arc::new(observability::Endpoint::new(worker_count)))
             })
             .collect();
         upstreams.insert(
@@ -625,7 +661,13 @@ fn prepare_with_clients(
                     .iter()
                     .all(|(name, u)| upstreams.get(name).is_some_and(|new| Arc::ptr_eq(u, new)))
             });
-            if upstreams_unchanged && serde_json::to_value(&old.config)? == serde_json::to_value(l)?
+            if (reuse_clients
+                || !l
+                    .routes
+                    .iter()
+                    .any(|r| r.static_files.as_ref().is_some_and(|f| f.load_to_ram)))
+                && upstreams_unchanged
+                && serde_json::to_value(&old.config)? == serde_json::to_value(l)?
             {
                 listeners.insert(l.id.clone(), old.clone());
                 continue;
@@ -642,7 +684,7 @@ fn prepare_with_clients(
         } else {
             l.tls
                 .as_ref()
-                .map(|t| prost_transport::server_tls(t, l.protocol == Protocol::Http))
+                .map(|t| prost_transport::server_tls(t, l.protocol.is_http()))
                 .transpose()?
         };
         let plugins = prepare_plugins(
@@ -719,11 +761,45 @@ fn prepare_with_clients(
         let route_upstreams = l
             .routes
             .iter()
-            .map(|r| upstreams[&r.upstream].clone())
+            .map(|r| upstreams.get(&r.upstream).cloned())
             .collect();
+        let static_files = l
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(i, route)| {
+                if reuse_clients {
+                    if let Some(old) = previous_l.filter(|old| {
+                        old.config
+                            .routes
+                            .get(i)
+                            .is_some_and(|r| r.static_files == route.static_files)
+                    }) {
+                        return Ok(old.static_files[i].clone());
+                    }
+                }
+                route
+                    .static_files
+                    .as_ref()
+                    .map(|files| {
+                        prost_http::static_files::StaticService::new(files, &static_ram)
+                            .map(Arc::new)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
         listeners.insert(
             l.id.clone(),
             Arc::new(PreparedListener {
+                http3: if l.protocol == Protocol::Http3 {
+                    Some(http3::prepare(
+                        l,
+                        tls.as_ref().context("HTTP/3 requires TLS")?,
+                        previous_l.map(Arc::as_ref),
+                    )?)
+                } else {
+                    None
+                },
                 certificate_expirations,
                 connection_admission: l
                     .plugins
@@ -754,6 +830,7 @@ fn prepare_with_clients(
                 route_order,
                 default_upstream,
                 route_upstreams,
+                static_files,
                 has_hooks,
                 uri_filter,
                 route_uri_filters,
@@ -765,6 +842,7 @@ fn prepare_with_clients(
     let hash = storage::hash(encoded.as_bytes());
     let artifact_hashes = storage::references(&config);
     Ok(Snapshot {
+        static_ram,
         artifact_hashes,
         config,
         hash,
@@ -844,6 +922,7 @@ impl RunningProxy {
             (name, endpoints)
         }).collect();
         let balancers:BTreeMap<_,_>=snapshot.upstreams.iter().map(|(name,u)|(name,serde_json::json!({"algorithm":u.config.balance,"hash_key":if u.config.balance=="consistent_hash" {Some(u.config.hash_key.as_deref().unwrap_or("$remote_addr"))} else {None},"hash_points":u.balancer.points()}))).collect();
+        let static_files:Vec<_>=snapshot.listeners.iter().flat_map(|(id,l)|l.static_files.iter().enumerate().filter_map(move |(i,files)|files.as_ref().map(|files|serde_json::json!({"listener":id,"route":i,"cache":files.stats()})))).collect();
         let worker = self.workers.lock().unwrap().clone();
         let retiring = self
             .retiring
@@ -852,7 +931,7 @@ impl RunningProxy {
             .as_ref()
             .filter(|g| !g.finished.is_cancelled())
             .map(|g| g.id);
-        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": worker.workers.is_some(), "reload_mode":snapshot.config.runtime.reload_mode, "worker_generation":worker.id, "retiring_worker_generation":retiring, "worker_generations":self.worker_status(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers, "artifact_gc":self.last_gc.lock().unwrap().clone(), "access_log": self.access_log.as_ref().map(|log|log.status())})
+        serde_json::json!({"generation": snapshot.config.generation, "hash": snapshot.hash, "live_generations": generations.len(), "connections": self.metrics.connections.get(), "shutting_down": self.shutdown.is_cancelled(), "worker_local": worker.workers.is_some(), "reload_mode":snapshot.config.runtime.reload_mode, "worker_generation":worker.id, "retiring_worker_generation":retiring, "worker_generations":self.worker_status(), "io_workers": self.worker_count, "upstreams": upstreams,"balancers":balancers, "artifact_gc":self.last_gc.lock().unwrap().clone(), "access_log": self.access_log.as_ref().map(|log|log.status()), "static_files":static_files,"static_files_ram":{"reserved_bytes":snapshot.static_ram.used(),"budget_bytes":snapshot.static_ram.limit()},"udp":self.udp_status()})
     }
     pub async fn validate(self: &Arc<Self>, text: String) -> Result<()> {
         let p = self.clone();
@@ -1007,7 +1086,9 @@ impl RunningProxy {
         );
         for l in &config.listeners {
             for previous in &old.config.listeners {
-                if previous.address == l.address {
+                if previous.address == l.address
+                    && previous.protocol.is_udp() == l.protocol.is_udp()
+                {
                     ensure!(
                         previous.id == l.id && previous.protocol == l.protocol,
                         "listener identity/protocol change on same address requires restart"
@@ -1015,6 +1096,10 @@ impl RunningProxy {
                 }
             }
             if let Some(previous) = old.listeners.get(&l.id) {
+                ensure!(
+                    previous.config.protocol == l.protocol,
+                    "listener protocol change requires restart"
+                );
                 ensure!(
                     previous.config.address == l.address,
                     "listener address change requires new id"
@@ -1151,9 +1236,14 @@ impl RunningProxy {
                 };
                 let socket = match attached {
                     Some(socket) => socket,
-                    None => workers::bind(listener.address, next_generation.workers.as_deref())
-                        .await
-                        .with_context(|| format!("bind {}", listener.address))?,
+                    None => workers::bind(
+                        listener.address,
+                        listener.protocol,
+                        next_generation.workers.as_deref(),
+                        &self.quic_background,
+                    )
+                    .await
+                    .with_context(|| format!("bind {}", listener.address))?,
                 };
                 sockets.push((listener.id.clone(), socket));
             }
@@ -1168,6 +1258,7 @@ impl RunningProxy {
             tokio::task::spawn_blocking(move || store.persist(&path, encoded.as_bytes())).await??;
         // No fallible preparation past this point.
         self.current.store(new.clone());
+        self.refresh_quic_tls(&new);
         {
             let mut generations = self.generations.lock().unwrap();
             generations.retain(|generation| generation.strong_count() > 0);
@@ -1265,6 +1356,14 @@ impl RunningProxy {
                 masters: sockets.masters,
             },
         );
+        if let Some((socket, sessions)) = sockets.udp {
+            self.start_udp(id, socket, sessions, generation, cancel);
+            return;
+        }
+        if let Some(endpoint) = sockets.quic {
+            self.start_http3(id, endpoint, generation, cancel, &_pinned);
+            return;
+        }
         for (handle, socket) in sockets.sockets {
             let weak = Arc::downgrade(self);
             let id = id.clone();
@@ -1615,7 +1714,7 @@ impl RunningProxy {
         self: Arc<Self>,
         id: Arc<str>,
         info: Arc<ConnectionInfo>,
-        request: Request<Incoming>,
+        request: Request<IncomingBody>,
         h2_write_guard: bool,
     ) -> Response<Body> {
         use hyper::body::Body as _;
@@ -1681,7 +1780,7 @@ impl RunningProxy {
         self: Arc<Self>,
         id: Arc<str>,
         info: Arc<ConnectionInfo>,
-        mut request: Request<Incoming>,
+        mut request: Request<IncomingBody>,
         context: Option<access_log::RequestContext>,
     ) -> Response<Body> {
         self.metrics.requests.inc();
@@ -1704,7 +1803,8 @@ impl RunningProxy {
             let permit = self.requests.clone().try_acquire_owned().context("request capacity")?;
             let l = snapshot.listeners.get(id.as_ref()).context("listener removed")?;
             let route_index = route_override.unwrap_or_else(|| select_route_index(l,&request));
-            let selected = route_index.map(|i| &l.route_upstreams[i]).or(l.default_upstream.as_ref());
+            let selected = route_index.map(|i| l.route_upstreams[i].as_ref()).unwrap_or(l.default_upstream.as_ref());
+            let static_files = route_index.and_then(|i| l.static_files[i].as_ref());
             selected_route = route_index;
             let route_plugins = route_index.map(|i|l.routes[i].as_slice());
             let overrides = route_plugins.and_then(|ps|ps.iter().find_map(PreparedPlugin::parent_override)).unwrap_or_default();
@@ -1727,7 +1827,7 @@ impl RunningProxy {
             let has_hooks = l.has_hooks || route_plugins.is_some_and(|plugins| plugins.iter().any(PreparedPlugin::has_event_hooks));
             let end_hook = l.plugins.iter().any(|p| p.has_hook("end")) || route_plugins.is_some_and(|plugins| plugins.iter().any(|p| p.has_hook("end")));
             let mut event = if has_hooks {
-                let upstream = route_index.map(|i|l.config.routes[i].upstream.clone()).or_else(||l.config.upstream.clone());
+                let upstream = route_index.map(|i|l.config.routes[i].upstream.clone()).or_else(||l.config.upstream.clone()).filter(|name| !name.is_empty());
                 let event = Event { abi_version:1, hook:"request_headers".into(), peer:info.peer_text.clone(), upstream, headers:BTreeMap::new(),config:serde_json::Value::Null };
                 Some(event)
             } else { None };
@@ -1744,21 +1844,19 @@ impl RunningProxy {
                 invoke_http_plugins(&l.plugins,phase,event.as_mut(),Some(request.headers_mut())).await?;
                 if let Some(plugins)=route_plugins {invoke_http_plugins(plugins,phase.child(),event.as_mut(),Some(request.headers_mut())).await?;}
             }
-            if selected.is_none() {
+            if selected.is_none() && static_files.is_none() {
                 let mut response=prost_http::response(404,"no matching route\n");
                 apply_local_headers(&mut response,&snapshot,&id,selected_route,peer,header_context.as_ref(),(head_request,downstream_version)).await;
                 return Ok(response);
             }
-            if let Some(event) = &mut event {
+            if let Some(event) = event.as_mut().filter(|_| static_files.is_none()) {
                 event.hook = "upstream".into();
                 invoke(&l.plugins,event,None).await?;
                 if let Some(plugins) = route_plugins { invoke(plugins,event,None).await?; }
             }
-            let u = if let Some(event) = &event {
+            let u = if static_files.is_some() { None } else { Some(if let Some(event) = &event {
                 snapshot.upstreams.get(event.upstream.as_ref().context("no upstream")?).context("plugin selected unknown upstream")?
-            } else { selected.context("no matching upstream")? };
-            let upstream_name = event.as_ref().and_then(|e|e.upstream.as_deref()).or_else(||route_index.map(|i|l.config.routes[i].upstream.as_str())).or(l.config.upstream.as_deref());
-            if let Some(audit) = &audit { audit.upstream(upstream_name, None); }
+            } else { selected.context("no matching upstream")? }) };
             // Local protocol rejections must not be counted as backend failures.
             anyhow::ensure!(request.method() != http::Method::CONNECT, "CONNECT unsupported");
             let route = route_index.map(|i| &l.config.routes[i]);
@@ -1768,9 +1866,16 @@ impl RunningProxy {
             };
             request_policy.check(request.body())?;
             let options = prost_http::ForwardOptions { request_policy, notify_completion: end_hook };
-            let compression = u.http.as_ref().filter(|p|p.compression_enabled()).map(|_| (request.method().clone(),request.headers().get_all(header::ACCEPT_ENCODING).iter().filter_map(|v|v.to_str().ok()).collect::<Vec<_>>().join(",")));
+            let compression = u.and_then(|u|u.http.as_ref()).filter(|p|p.compression_enabled()).map(|_| (request.method().clone(),request.headers().get_all(header::ACCEPT_ENCODING).iter().filter_map(|v|v.to_str().ok()).collect::<Vec<_>>().join(",")));
+            let mut outcome = if let Some(files) = static_files {
+                Box::pin(files.serve(&request,&l.config.routes[route_index.unwrap()].path_prefix,permit,http_keepalive(snapshot.clone(),info,None),end_hook)).await?
+            } else {
+            let u=u.context("no matching upstream")?;
+            if let Some(policy)=&u.http {policy.prepare_request(&mut request,&u.config,options).await?;}
+            let upstream_name = event.as_ref().and_then(|e|e.upstream.as_deref()).or_else(||route_index.map(|i|l.config.routes[i].upstream.as_str())).or(l.config.upstream.as_deref());
+            if let Some(audit) = &audit { audit.upstream(upstream_name, None); }
             let selection = u.balancer.select_http(u,peer,&request,header_context.as_ref().map(|c|&c.uri));
-            let mut outcome = match selection {
+            match selection {
             Err(e) => {
                 let cached = if matches!(e.downcast_ref::<balance::Rejection>(),Some(balance::Rejection::Unavailable)) {u.http.as_ref().and_then(|p|p.unavailable(&request))} else {None};
                 cached.ok_or_else(||u.selection_error(e))?.respond(permit,http_keepalive(snapshot.clone(),info,None),options)
@@ -1799,7 +1904,8 @@ impl RunningProxy {
                 u.observed[index].error();u.health[index].passive_failure();
             }
             outcome
-            }};
+            }}
+            };
             if let Some(tunnel) = outcome.tunnel.take() {
                 let audit = audit.clone();
                 if let Some(audit) = &audit { audit.arm_tunnel(); }
@@ -1823,7 +1929,7 @@ impl RunningProxy {
                 prost_http::sanitize(outcome.response.headers_mut(),upgraded,false);
             }
             attach_trailers(&mut outcome.response,&l.plugins,route_plugins,overrides.1,header_context.as_ref(),head_request,downstream_version)?;
-            if let Some((method,accepted))=&compression { u.http.as_ref().unwrap().compress(method,accepted,&mut outcome.response); }
+            if let Some((method,accepted))=&compression { u.unwrap().http.as_ref().unwrap().compress(method,accepted,&mut outcome.response); }
             if let Some(mut event) = event.take() {
                 if let Some(completion)=outcome.completion.take() {
                 let listener=l.clone();
@@ -1928,6 +2034,9 @@ impl RunningProxy {
         let mut probes = self.probes.lock().unwrap();
         probes.retain(|_, weak| weak.strong_count() > 0);
         for upstream in snapshot.upstreams.values() {
+            if !upstream.config.health_check.enabled {
+                continue;
+            }
             let key = Arc::as_ptr(upstream) as usize;
             if probes.contains_key(&key) {
                 continue;
@@ -2000,6 +2109,19 @@ impl RunningProxy {
     pub async fn shutdown(self: &Arc<Self>) {
         let _guard = self.coordinator.lock().await;
         self.shutdown.cancel();
+        let quic_endpoints: Vec<_> = self
+            .bindings
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|binding| {
+                if let workers::Masters::Quic(endpoint) = &binding.masters {
+                    Some(endpoint.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         self.bindings.lock().unwrap().clear();
         self.tasks.close();
         let drain = match self.snapshot().config.runtime.drain_seconds {
@@ -2012,6 +2134,20 @@ impl RunningProxy {
         {
             self.force.cancel();
             self.tasks.wait().await;
+        }
+        // Quinn keeps the UDP socket while closed connections finish their
+        // transport drain. Wait for that cleanup before returning to an embedder
+        // which may immediately start another proxy on the same address.
+        for endpoint in &quic_endpoints {
+            endpoint.close(quinn::VarInt::from_u32(0x100), b"proxy stopped");
+        }
+        drop(quic_endpoints);
+        self.quic_background.close();
+        if tokio::time::timeout(Duration::from_secs(5), self.quic_background.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("QUIC transport cleanup timed out");
         }
         let workers = self.workers.lock().unwrap().workers.clone();
         if let Some(workers) = workers {
@@ -2041,7 +2177,7 @@ fn http_keepalive(
         prost_http::KeepAlive::new(snapshot, info)
     }
 }
-fn request_host(request: &Request<Incoming>) -> &str {
+fn request_host<B>(request: &Request<B>) -> &str {
     let host = request
         .uri()
         .host()
@@ -2058,7 +2194,7 @@ fn request_host(request: &Request<Incoming>) -> &str {
         host.split(':').next().unwrap_or(host)
     }
 }
-fn select_route_index(listener: &PreparedListener, request: &Request<Incoming>) -> Option<usize> {
+fn select_route_index<B>(listener: &PreparedListener, request: &Request<B>) -> Option<usize> {
     if listener.route_order.is_empty() {
         return None;
     }
@@ -2195,7 +2331,7 @@ async fn invoke_uri_plugins(
     child: Option<&[PreparedPlugin]>,
     phase: Phase<'_>,
     mut event: Option<&mut Event>,
-    request: &mut Request<Incoming>,
+    request: &mut Request<IncomingBody>,
 ) -> (http::Uri, Result<()>) {
     let mut uri = request.uri().clone();
     let result = async {

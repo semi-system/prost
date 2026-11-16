@@ -92,6 +92,32 @@ pin_project! {
     }
 }
 impl Body {
+    pub(crate) fn local_stream<B: HttpBody<Data = Bytes, Error = Error> + Send + 'static>(
+        inner: B,
+        permit: OwnedSemaphorePermit,
+        keepalive: KeepAlive,
+        notify: bool,
+    ) -> (Self, Option<oneshot::Receiver<()>>) {
+        let (sender, receiver) = if notify {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        (
+            Self {
+                inner: Kind::Custom {
+                    inner: Box::pin(inner),
+                    guard: Some(Guard {
+                        permit: Some(permit),
+                        keepalive: Some(keepalive),
+                        completion: Completion(sender),
+                    }),
+                },
+            },
+            receiver,
+        )
+    }
     pub(crate) fn custom<B: HttpBody<Data = Bytes, Error = Error> + Send + 'static>(
         mut base: Body,
         wrap: impl FnOnce(Body) -> B,
@@ -154,6 +180,13 @@ impl Body {
         Self {
             inner: Kind::Static {
                 inner: Full::new(Bytes::from_static(text.as_bytes())),
+            },
+        }
+    }
+    pub(crate) fn bytes(data: Bytes) -> Self {
+        Self {
+            inner: Kind::Static {
+                inner: Full::new(data),
             },
         }
     }

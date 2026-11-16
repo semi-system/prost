@@ -31,6 +31,7 @@ pub use h2_headers::H2HeaderDeadline;
 pub use proxy_protocol::{
     read_proxy, read_proxy_addresses, write_proxy_v2, write_proxy_v2_local, ProxyAddresses,
 };
+pub mod quic;
 mod write_timeout;
 pub use tls::{certificate_info, server_tls, CertificateInfo};
 pub use write_timeout::TimedWrite;

@@ -484,6 +484,9 @@ impl Ticket {
     pub fn tcp(logger: Arc<Logger>, peer: &str, listener: &str, generation: u64) -> Arc<Self> {
         Self::new(logger, "tcp", peer, listener, generation, None)
     }
+    pub fn udp(logger: Arc<Logger>, peer: &str, listener: &str, generation: u64) -> Arc<Self> {
+        Self::new(logger, "udp", peer, listener, generation, None)
+    }
     fn new(
         logger: Arc<Logger>,
         protocol: &'static str,

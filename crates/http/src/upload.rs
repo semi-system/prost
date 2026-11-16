@@ -1,6 +1,6 @@
-use crate::Error;
+use crate::{Error, IncomingBody};
 use bytes::Bytes;
-use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::body::{Body, Frame, SizeHint};
 use std::{
     future::Future,
     pin::Pin,
@@ -58,7 +58,7 @@ pub struct RequestPolicy {
 }
 impl RequestPolicy {
     /// Use the decoder's size hint rather than a header that a filter can edit.
-    pub fn check(&self, body: &Incoming) -> Result<(), HttpFailure> {
+    pub fn check<B: Body>(&self, body: &B) -> Result<(), HttpFailure> {
         if self
             .max_bytes
             .filter(|n| *n > 0)
@@ -145,12 +145,12 @@ impl Drop for UploadWatch {
 
 pub enum RequestBody {
     Empty,
-    Plain(Incoming),
-    Guarded(Box<UploadBody<Incoming>>),
+    Plain(IncomingBody),
+    Guarded(Box<UploadBody<IncomingBody>>),
 }
 impl RequestBody {
     pub(crate) fn new(
-        inner: Incoming,
+        inner: IncomingBody,
         policy: RequestPolicy,
         track_eof: bool,
     ) -> (Self, Option<Arc<UploadState>>) {
@@ -220,7 +220,7 @@ pub struct UploadBody<B> {
 }
 impl<B: Body<Data = Bytes> + Unpin> Body for UploadBody<B>
 where
-    B::Error: std::error::Error + Send + Sync + 'static,
+    B::Error: Into<Error>,
 {
     type Data = Bytes;
     type Error = Error;

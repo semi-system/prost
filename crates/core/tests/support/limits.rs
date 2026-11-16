@@ -310,6 +310,7 @@ async fn body_limits_h2_hot_apply_retains_upload_policy_and_reuses_pool() -> Res
     response.into_body().collect().await?;
     let mut next = p.snapshot().config.clone();
     next.listeners[0].routes.push(prost_config::Route {
+        static_files: None,
         methods: vec![],
         headers: vec![],
         access_log: None,

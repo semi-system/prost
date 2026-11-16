@@ -1,7 +1,35 @@
 use anyhow::{Context, Result};
-use std::{net::SocketAddr, os::fd::AsFd, sync::Mutex, thread::JoinHandle, time::Duration};
-use tokio::{net::TcpListener, runtime::Handle};
-use tokio_util::sync::CancellationToken;
+use std::{
+    net::SocketAddr,
+    os::fd::AsFd,
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+    time::Duration,
+};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    runtime::Handle,
+};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+/// Track Quinn's endpoint/connection drivers as well as application handlers.
+/// Waiting for their completion proves that the UDP socket has been released.
+#[derive(Debug)]
+struct QuicRuntime(TaskTracker);
+impl quinn::Runtime for QuicRuntime {
+    fn new_timer(&self, at: std::time::Instant) -> std::pin::Pin<Box<dyn quinn::AsyncTimer>> {
+        quinn::Runtime::new_timer(&quinn::TokioRuntime, at)
+    }
+    fn spawn(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        self.0.spawn(future);
+    }
+    fn wrap_udp_socket(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket)
+    }
+}
 
 pub(crate) struct Workers {
     handles: Vec<Handle>,
@@ -10,7 +38,14 @@ pub(crate) struct Workers {
 }
 pub(crate) struct BoundListener {
     pub sockets: Vec<(Handle, TcpListener)>,
-    pub masters: Vec<std::net::TcpListener>,
+    pub masters: Masters,
+    pub udp: Option<(UdpSocket, Arc<crate::udp::Sessions>)>,
+    pub quic: Option<quinn::Endpoint>,
+}
+pub(crate) enum Masters {
+    Tcp(Vec<std::net::TcpListener>),
+    Udp(std::net::UdpSocket, Arc<crate::udp::Sessions>),
+    Quic(quinn::Endpoint),
 }
 impl BoundListener {
     fn new(sockets: Vec<(Handle, TcpListener)>) -> Result<Self> {
@@ -18,7 +53,12 @@ impl BoundListener {
             .iter()
             .map(|(_, s)| Ok(std::net::TcpListener::from(s.as_fd().try_clone_to_owned()?)))
             .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(Self { sockets, masters })
+        Ok(Self {
+            sockets,
+            masters: Masters::Tcp(masters),
+            udp: None,
+            quic: None,
+        })
     }
 }
 
@@ -72,7 +112,10 @@ impl Workers {
         }
         Ok(())
     }
-    pub fn attach(&self, masters: &[std::net::TcpListener]) -> Result<BoundListener> {
+    pub fn attach(&self, masters: &Masters) -> Result<BoundListener> {
+        let Masters::Tcp(masters) = masters else {
+            return attach_udp(masters);
+        };
         anyhow::ensure!(
             masters.len() == self.handles.len(),
             "listener worker count mismatch"
@@ -121,22 +164,74 @@ impl Drop for Workers {
     }
 }
 
-pub(crate) async fn bind(address: SocketAddr, workers: Option<&Workers>) -> Result<BoundListener> {
+pub(crate) async fn bind(
+    address: SocketAddr,
+    protocol: prost_config::Protocol,
+    workers: Option<&Workers>,
+    quic_background: &TaskTracker,
+) -> Result<BoundListener> {
+    if protocol == prost_config::Protocol::Http3 {
+        let socket = std::net::UdpSocket::bind(address)?;
+        socket.set_nonblocking(true)?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(QuicRuntime(quic_background.clone())),
+        )?;
+        return Ok(BoundListener {
+            sockets: Vec::new(),
+            masters: Masters::Quic(endpoint.clone()),
+            udp: None,
+            quic: Some(endpoint),
+        });
+    }
+    if protocol == prost_config::Protocol::Udp {
+        let socket = UdpSocket::bind(address).await?;
+        let master = std::net::UdpSocket::from(socket.as_fd().try_clone_to_owned()?);
+        let sessions = Arc::new(crate::udp::Sessions::default());
+        return Ok(BoundListener {
+            sockets: Vec::new(),
+            masters: Masters::Udp(master, sessions.clone()),
+            udp: Some((socket, sessions)),
+            quic: None,
+        });
+    }
     match workers {
         Some(workers) => workers.bind(address),
         None => BoundListener::new(vec![(Handle::current(), TcpListener::bind(address).await?)]),
     }
 }
-pub(crate) fn attach(
-    masters: &[std::net::TcpListener],
-    workers: Option<&Workers>,
-) -> Result<BoundListener> {
+pub(crate) fn attach(masters: &Masters, workers: Option<&Workers>) -> Result<BoundListener> {
     if let Some(workers) = workers {
         return workers.attach(masters);
     }
+    let Masters::Tcp(masters) = masters else {
+        return attach_udp(masters);
+    };
     anyhow::ensure!(masters.len() == 1, "shared runtime listener count mismatch");
     BoundListener::new(vec![(
         Handle::current(),
         TcpListener::from_std(masters[0].try_clone()?)?,
     )])
+}
+fn attach_udp(masters: &Masters) -> Result<BoundListener> {
+    if let Masters::Quic(endpoint) = masters {
+        return Ok(BoundListener {
+            sockets: Vec::new(),
+            masters: Masters::Quic(endpoint.clone()),
+            udp: None,
+            quic: Some(endpoint.clone()),
+        });
+    }
+    let Masters::Udp(master, sessions) = masters else {
+        anyhow::bail!("expected UDP socket")
+    };
+    let socket = UdpSocket::from_std(master.try_clone()?)?;
+    Ok(BoundListener {
+        sockets: Vec::new(),
+        masters: Masters::Udp(master.try_clone()?, sessions.clone()),
+        udp: Some((socket, sessions.clone())),
+        quic: None,
+    })
 }

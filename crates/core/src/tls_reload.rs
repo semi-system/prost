@@ -90,6 +90,7 @@ impl RunningProxy {
         if worker.rolling {
             worker.snapshot.store(Some(new.clone()));
         }
+        self.refresh_quic_tls(&new);
         {
             let mut generations = self.generations.lock().unwrap();
             generations.retain(|g| g.strong_count() > 0);

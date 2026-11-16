@@ -22,15 +22,13 @@ struct Slot {
 pub(crate) struct Endpoint {
     pub tcp_retries: AtomicU64,
     slots: Box<[Slot]>,
-    single_writer: bool,
     pub health: Arc<Health>,
 }
 impl Endpoint {
-    pub fn new(workers: usize, single_writer: bool) -> Self {
+    pub fn new(workers: usize) -> Self {
         Self {
             tcp_retries: AtomicU64::new(0),
             slots: (0..workers).map(|_| Slot::default()).collect(),
-            single_writer,
             health: Arc::new(Health::default()),
         }
     }
@@ -44,16 +42,8 @@ impl Endpoint {
     }
     #[inline]
     fn increment(&self, counter: &AtomicU64) {
-        // Hot worker-local runtimes have exactly one writer per slot. Rolling
-        // generations overlap and share endpoint stats, so they use atomic RMW.
-        if self.single_writer {
-            counter.store(
-                counter.load(Ordering::Relaxed).wrapping_add(1),
-                Ordering::Relaxed,
-            );
-        } else {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
+        // QUIC/UDP and worker-local TCP may share a slot, including hot mode.
+        counter.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
     pub fn selected(&self) {
@@ -549,6 +539,42 @@ const DEFINITIONS: &[Definition] = &[
         &[],
     ),
     (
+        "prost_static_ram_reserved_bytes",
+        "Static RAM reservations across active/candidate/retired snapshots and response bytes",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_static_ram_budget_bytes",
+        "Maximum total static RAM reservation",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_quic_receive_reserved_bytes",
+        "QUIC connection receive-window reservations",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_quic_receive_budget_bytes",
+        "Maximum shared QUIC receive-window reservation",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_udp_buffer_reserved_bytes",
+        "UDP response and queued packet byte reservations",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
+        "prost_udp_buffer_budget_bytes",
+        "Maximum shared UDP response and queue byte reservation",
+        MetricType::GAUGE,
+        &[],
+    ),
+    (
         "prost_worker_retiring_connections",
         "Connections retained by the draining generation",
         MetricType::GAUGE,
@@ -1027,6 +1053,44 @@ impl Collector for Exporter {
             snapshot.config.generation as f64,
         );
         emit("prost_live_generations", &[], live.len() as f64);
+        emit(
+            "prost_static_ram_reserved_bytes",
+            &[],
+            snapshot.static_ram.used() as f64,
+        );
+        emit(
+            "prost_static_ram_budget_bytes",
+            &[],
+            snapshot.static_ram.limit() as f64,
+        );
+        emit(
+            "prost_quic_receive_reserved_bytes",
+            &[],
+            snapshot
+                .config
+                .runtime
+                .max_quic_receive_bytes
+                .saturating_sub(p.quic_receive.available_permits()) as f64,
+        );
+        emit(
+            "prost_quic_receive_budget_bytes",
+            &[],
+            snapshot.config.runtime.max_quic_receive_bytes as f64,
+        );
+        emit(
+            "prost_udp_buffer_reserved_bytes",
+            &[],
+            snapshot
+                .config
+                .runtime
+                .max_udp_buffer_bytes
+                .saturating_sub(p.udp_buffers.available_permits()) as f64,
+        );
+        emit(
+            "prost_udp_buffer_budget_bytes",
+            &[],
+            snapshot.config.runtime.max_udp_buffer_bytes as f64,
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1148,7 +1212,6 @@ mod tests {
         let old = &first.upstreams["main"].observed[0];
         let new = &next.upstreams["main"].observed[0];
         assert!(Arc::ptr_eq(old, new));
-        assert!(!old.single_writer);
         std::thread::scope(|scope| {
             for index in 0..8 {
                 let endpoint = if index % 2 == 0 { old } else { new };
@@ -1170,7 +1233,7 @@ mod tests {
     }
     #[test]
     fn worker_local_and_shared_counters_are_exact() {
-        let local = Arc::new(Endpoint::new(2, true));
+        let local = Arc::new(Endpoint::new(2));
         std::thread::scope(|scope| {
             for slot in 0..2 {
                 let local = local.clone();
@@ -1199,7 +1262,7 @@ mod tests {
                 .sum::<u64>(),
             20000
         );
-        let shared = Arc::new(Endpoint::new(1, false));
+        let shared = Arc::new(Endpoint::new(1));
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 let shared = shared.clone();

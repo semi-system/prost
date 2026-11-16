@@ -1,5 +1,12 @@
 # Prost
 
+Static files có disk demand cache hoặc preload toàn bộ RAM với budget và kiểm
+tra fail closed khi thiếu bộ nhớ: [docs/static-files.md](docs/static-files.md).
+UDP session proxy, queue/buffer budget và rolling giữ peer mapping:
+[docs/udp.md](docs/udp.md).
+HTTP/3/QUIC dùng chung routing/filter/cache/static và rolling giữ stream:
+[docs/http3.md](docs/http3.md).
+
 Mail edge 7 cổng, ACME HTTP-01/DNS-01 tự cấp/gia hạn và cấu hình Docker trung lập:
 [docs/mail-edge.md](docs/mail-edge.md), [docs/acme.md](docs/acme.md).
 Wildcard, readiness và xác nhận backend đã nạp đúng cert bằng TLS fingerprint:

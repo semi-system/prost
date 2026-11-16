@@ -1,0 +1,26 @@
+schema_version = 1
+
+[runtime]
+max_udp_buffer_bytes = 67108864
+
+[upstreams.datagrams]
+balance = "round_robin"
+[upstreams.datagrams.health_check]
+enabled = false
+[[upstreams.datagrams.endpoints]]
+id = "one"
+address = "127.0.0.1:5353"
+
+[[listeners]]
+id = "udp"
+address = "0.0.0.0:1053"
+protocol = "udp"
+upstream = "datagrams"
+max_connections = 1024
+max_connections_per_ip = 32
+[listeners.udp]
+idle_timeout_ms = 30000
+max_datagram_bytes = 4096
+session_queue_packets = 8
+session_requests = 1
+session_responses = 1

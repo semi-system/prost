@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::Result;
 use http::{Request, Response};
-use hyper::body::{Body as _, Incoming};
+use hyper::body::Body as _;
 use prost_config::{HttpPolicy, Upstream};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -74,13 +74,34 @@ impl HttpResources {
     pub fn compression_enabled(&self) -> bool {
         self.compression.is_some()
     }
+    pub async fn prepare_request(
+        &self,
+        request: &mut Request<crate::IncomingBody>,
+        upstream: &Upstream,
+        options: ForwardOptions,
+    ) -> Result<()> {
+        if self.cache.is_some()
+            && request.method() == http::Method::GET
+            && request.body().size_hint().exact().is_none_or(|n| n == 0)
+        {
+            let timeout = options
+                .request_policy
+                .idle_timeout_ms
+                .unwrap_or(upstream.idle_timeout_ms);
+            request.body_mut().prepare_empty(timeout).await?;
+        }
+        Ok(())
+    }
     pub fn compress(&self, method: &http::Method, accepted: &str, response: &mut Response<Body>) {
         if let Some(c) = &self.compression {
             c.apply(method, accepted, response);
         }
     }
     /// Called only when endpoints are unavailable, never for capacity rejection.
-    pub fn unavailable(&self, request: &Request<Incoming>) -> Option<CachedResponse> {
+    pub fn unavailable<B: hyper::body::Body>(
+        &self,
+        request: &Request<B>,
+    ) -> Option<CachedResponse> {
         if !request.body().is_end_stream() {
             return None;
         }
@@ -92,9 +113,9 @@ impl HttpResources {
             .map(CachedResponse)
     }
     #[allow(clippy::too_many_arguments)]
-    pub async fn forward(
+    pub async fn forward<B: Into<crate::IncomingBody>>(
         &self,
-        mut request: Request<Incoming>,
+        request: Request<B>,
         target: &Target,
         upstream: &Upstream,
         client: &HttpClient,
@@ -102,6 +123,9 @@ impl HttpResources {
         keepalive: KeepAlive,
         options: ForwardOptions,
     ) -> Result<Outcome> {
+        let mut request = request.map(Into::into);
+        self.prepare_request(&mut request, upstream, options)
+            .await?;
         let keepalive = keepalive.with_admission(permit);
         let empty = request.body().is_end_stream();
         let key = self

@@ -15,6 +15,8 @@ mod policy;
 pub use policy::{CachedResponse, HttpResources, PolicyStats};
 mod pool_stats;
 pub use observe::{BodyEnd, BodyObserver};
+mod incoming;
+pub mod static_files;
 mod upload;
 pub use body::{Body, KeepAlive};
 use body::{Completion, Guard};
@@ -25,6 +27,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioIo,
 };
+pub use incoming::IncomingBody;
 pub use pool_stats::{PoolSnapshot, PoolStats};
 use prost_config::{Route, Upstream};
 use std::{sync::Arc, time::Duration};
@@ -440,8 +443,8 @@ impl Target {
         })
     }
 }
-pub async fn forward(
-    request: Request<Incoming>,
+pub async fn forward<B: Into<IncomingBody>>(
+    request: Request<B>,
     target: &Target,
     upstream: &Upstream,
     client: &HttpClient,
@@ -450,7 +453,7 @@ pub async fn forward(
     options: ForwardOptions,
 ) -> Result<Outcome> {
     forward_inner(
-        request.map(Some),
+        request.map(|body| Some(body.into())),
         target,
         upstream,
         client,
@@ -461,7 +464,7 @@ pub async fn forward(
     .await
 }
 async fn forward_inner(
-    mut request: Request<Option<Incoming>>,
+    mut request: Request<Option<IncomingBody>>,
     target: &Target,
     upstream: &Upstream,
     client: &HttpClient,

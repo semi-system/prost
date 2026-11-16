@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
+quinn.workspace = true
+h3.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
 hickory-resolver.workspace = true
 anyhow.workspace = true
 prost-config = { path = "../config" }

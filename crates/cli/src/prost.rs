@@ -40,7 +40,7 @@ async fn run() -> Result<()> {
         Command::Check { config } => {
             prost_config::Config::parse(&std::fs::read_to_string(config)?)?;
             println!(
-                "configuration valid (schema only; use prostctl validate for TLS/WASM checks)"
+                "configuration valid (schema only; use prostctl validate for TLS/WASM/static RAM preparation checks)"
             );
         }
         Command::Run { config, seed } => {
