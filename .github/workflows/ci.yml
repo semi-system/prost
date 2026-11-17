@@ -32,7 +32,8 @@ jobs:
         run: sh scripts/docker-dev.sh cargo test --workspace --all-features --locked
       - name: Demo
         run: |
-          docker compose up -d --build
+          docker compose build --pull
+          docker compose up -d --no-build
           python3 scripts/smoke.py
       - name: Advanced protocol smoke
         run: |
@@ -83,6 +84,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Resolve latest Baseless runtime
+        id: runtime
+        env:
+          RUNTIME_IMAGE: ghcr.io/semi-system/baseless-static:latest
+        run: |
+          set -euo pipefail
+          docker pull "$RUNTIME_IMAGE"
+          resolved=$(docker image inspect "$RUNTIME_IMAGE" --format '{{index .RepoDigests 0}}')
+          [[ "$resolved" =~ ^ghcr.io/semi-system/baseless-static@sha256:[a-f0-9]{64}$ ]]
+          echo "image=$resolved" >> "$GITHUB_OUTPUT"
+          printf 'Baseless runtime resolved from latest: `%s`\n' "$resolved" >> "$GITHUB_STEP_SUMMARY"
       - name: Build and scan image
         id: image
         uses: abxst/actions/strict@670736025c229e0c308fc9a488cd5f008a96ca74 # v5
@@ -96,6 +108,7 @@ jobs:
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           build-args: |
+            RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
             CARGO_PROFILE=release
             CARGO_FEATURES=
           tags: |

@@ -1,6 +1,9 @@
 # Image Baseless và gate publish
 
-Runtime dùng `ghcr.io/semi-system/baseless-static`, pin digest trong Dockerfile.
+Runtime mặc định dùng `ghcr.io/semi-system/baseless-static:latest` để nhận các
+bản cập nhật base. Mỗi build release trên CI pull `latest`, ghi digest vào
+workflow summary và truyền digest đó qua build arg `RUNTIME_IMAGE`; build và
+scan dùng cùng bản base vừa lấy. Không cần sửa Dockerfile khi base cập nhật.
 Bốn executable `prost`, `prostctl`, `prost-entrypoint`, `prost-certd` được build cho
 `x86_64-unknown-linux-musl`. Image không thêm shell, package manager hay thư viện
 Debian. UID/GID vẫn là 10001 để giữ tương thích volume đã tạo từ bản trước.
@@ -36,8 +39,9 @@ Luồng publish:
 Report Semgrep/Trivy nằm trong artifact `image-security-reports`; report của
 base trong `baseless-security-report`. Có thể lấy tag theo commit hoặc digest
 từ workflow summary. Các action trực tiếp của workflow được pin bằng commit.
-Thay base cần cập nhật digest và phiên bản scanner/metadata tương ứng, rồi chạy
-lại gates và kiểm thử.
+Thay base vẫn phải qua các gate và kiểm thử; giữ scanner/metadata tương thích.
+Build local dùng `docker build --pull -t prost:mvp .` để lấy tag mới nhất.
+Triển khai vẫn dùng digest của image Prost đã scan để giữ đúng bản đang chạy.
 
 Các annotation `nosemgrep` trong benchmark/smoke chỉ áp dụng từng rule tại fixture
 đã rà soát: HTTP loopback do CLI/operator kiểm soát, payload JSON/text/binary
